@@ -1,38 +1,99 @@
+# =========================
+# Python
+# =========================
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.pyd
 *.pyo
-*.log
 
+# Virtual Environments
 .venv/
 venv/
 env/
 
+# Environment Variables
 .env
+.env.*
 
-node_modules/
-
-dist/
-build/
-
-*.db
-
-.faiss
-*.index
-
-.cache/
-
+# IDE
 .vscode/
-
 .idea/
 
-*.mp3
-*.wav
+# Logs
+*.log
+logs/
+archive/*.log
 
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Cache
+.cache/
+.pytest_cache/
+.mypy_cache/
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# =========================
+# AI Models
+# =========================
 models/
-
-*.pth
-*.bin
-
 *.gguf
-
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
 *.onnx
+
+# =========================
+# Embeddings / Indexes
+# =========================
+*.faiss
+*.index
+*.npy
+
+# =========================
+# Wikipedia / Knowledge
+# =========================
+*.zim
+
+# =========================
+# Audio
+# =========================
+*.wav
+*.mp3
+*.flac
+
+# Keep sample audio if needed
+!samples/
+!samples/**
+
+# =========================
+# Images generated at runtime
+# =========================
+generated/
+captures/
+
+# =========================
+# Temporary files
+# =========================
+*.tmp
+*.bak
+*.old
+
+# Backup Python files
+*.bak.*
+
+# =========================
+# OS
+# =========================
+Thumbs.db
+Desktop.ini
+.DS_Store
