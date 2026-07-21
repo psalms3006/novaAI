@@ -1,0 +1,4294 @@
+"""
+Project NOVA — v3.3 | Gemini Live + Async + Self-Aware + Planner + Phone + NOVA UI
+═══════════════════════════════════════════════════════════════════════════════
+Primary  : Gemini 2.5 Flash Live (native audio — real-time, no STT/TTS lag)
+Fallback : Gemini REST (online) → TinyLlama (offline, Ollama)
+Tools    : open_app | web_search | file_controller | computer_settings
+           browser_control | vision | computer_control | file_processor
+           self_editor | planner | autostart
+Memory   : FAISS semantic search (atomic, thread-safe)
+TTS/STT  : Gemini native audio (online) | pyttsx3 + faster-whisper (offline)
+UI       : 3D Web UI — JARVIS-inspired, responsive, real-time
+
+Run modes:
+  python nova.py            →  Gemini Live (voice in, voice out)
+  python nova.py --offline  →  Force offline brain (Gemini REST/Ollama + pyttsx3)
+  python nova.py --text     →  Offline brain, keyboard input
+  python nova.py --phone    →  Phone/browser server (WiFi access from phone)
+  python nova.py --ui       →  Launch 3D Web UI in browser
+  python nova.py --setup    →  Register NOVA in Windows startup
+
+v3.4 changes:
+  • AgentType / AgentTask / BaseAgent consolidated into nova_agents.py (single source of truth)
+  • nova.py imports them from nova_agents; fallback definitions kept for standalone use
+  • Groq removed entirely — replaced by Gemini REST as online brain fallback
+  • Vision model fixed — VISION_MODEL constant (default: gemini-2.0-flash)
+  • extract_memory_updates migrated from Groq to Gemini REST
+  • init_agents() duplicate-log bug fixed
+  • BaseAgent task.description access hardened across all agents
+  • CodeAgent regex backslash-in-class fixed
+  • Image.LANCZOS → Image.Resampling.LANCZOS (Pillow 10+ fix)
+  • response.text None guards added throughout
+  • cv2.data and pyautogui stub Pylance warnings suppressed with type: ignore
+═══════════════════════════════════════════════════════════════════════════════
+"""
+
+# ── Standard library ──────────────────────────────────────────────────────────
+import asyncio
+import threading
+import os
+import sys
+import time
+import logging
+import subprocess
+import tempfile
+import json
+import shutil
+import importlib
+import importlib.util
+import traceback
+import re
+import socket
+import webbrowser
+import queue
+from pathlib import Path
+from typing import Optional, Dict, List, Any, Callable, Set
+from dataclasses import dataclass, field
+from enum import Enum
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+
+# ── Third-party core ──────────────────────────────────────────────────────────
+import requests
+import numpy as np
+import sounddevice as sd
+from scipy.io.wavfile import write as wav_write
+import pyttsx3
+from dotenv import load_dotenv
+
+# Pre-load sounddevice to cache device enumeration
+
+# startup_start set in main() — not at module level
+
+# ── Gemini ────────────────────────────────────────────────────────────────────
+try:
+    from google import genai
+    from google.genai import types as gtypes
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
+    print("⚠️  google-genai not installed. Run: pip install google-genai")
+
+# ── Optional imports (auto-disable if missing) ────────────────────────────────
+try:
+    import faiss
+    HAS_FAISS = True
+except ImportError:
+    HAS_FAISS = False
+    print("⚠️  FAISS not installed. Memory search disabled.")
+
+# SentenceTransformer imported lazily in _load_embedder_async (saves ~90s startup)
+HAS_SENTENCE_TRANSFORMERS = True   # will be set False if import fails at load time
+
+try:
+    from PIL import ImageGrab, Image
+    import io as _io
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+
+try:
+    import pyautogui
+    pyautogui.FAILSAFE = True
+    HAS_PYAUTOGUI = True
+except ImportError:
+    HAS_PYAUTOGUI = False
+    print("⚠️  pyautogui not installed. computer_control disabled. Fix: pip install pyautogui")
+
+# ── faster-whisper ────────────────────────────────────────────────────────────
+try:
+    from faster_whisper import WhisperModel
+    HAS_FASTER_WHISPER = True
+except ImportError:
+    HAS_FASTER_WHISPER = False
+    print("⚠️  faster-whisper not installed. Run: pip install faster-whisper")
+
+# ── Flask (import only what's needed at top level — Sock imported locally) ───
+try:
+    from flask import Flask as _Flask, request as _flask_request, jsonify as _flask_jsonify
+    HAS_FLASK = True
+except ImportError:
+    HAS_FLASK = False
+    print("⚠️  Flask not installed. Run: pip install flask flask-sock")
+
+try:
+    import pytesseract as _pytesseract
+    HAS_PYTESSERACT = True
+except ImportError:
+    HAS_PYTESSERACT = False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ENVIRONMENT & CONSTANTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+load_dotenv()
+
+# ── Load nova_config.toml (Tier 6 config) ────────────────────────────────────
+try:
+    import tomllib as _tomllib
+    _cfg_path = Path("nova_config.toml")
+    if _cfg_path.exists():
+        _NOVA_CFG = _tomllib.loads(_cfg_path.read_text())
+    else:
+        _NOVA_CFG = {}
+except Exception:
+    _NOVA_CFG = {}
+
+# Default constants used by nova_config.toml overrides.
+# These are defined early so config values can override them later.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+PIPER_MODEL    = os.getenv("PIPER_MODEL", "en_US-lessac-medium.onnx")
+PIPER_RATE     = int(os.getenv("PIPER_SAMPLE_RATE", "22050"))
+NOVA_VOICE     = os.getenv("NOVA_VOICE", "Aoede")
+VISION_MODEL   = os.getenv("NOVA_VISION_MODEL", "gemini-2.0-flash")
+PHONE_PORT     = int(os.getenv("NOVA_PHONE_PORT", "5050"))
+UI_PORT        = int(os.getenv("NOVA_UI_PORT", "8080"))
+MAX_GEMINI_RETRIES = 3
+MAX_HISTORY_TURNS  = 6
+TTS_RATE       = 165
+TTS_VOLUME     = 0.95
+WHISPER_MODEL_SIZE = "tiny"
+_MEM_EXTRACT_EVERY_N = 5
+_MIN_GAP_BETWEEN_CALLS = 0
+
+def _cfg(section: str, key: str, default):
+    """Read a value from nova_config.toml with fallback."""
+    return _NOVA_CFG.get(section, {}).get(key, default)
+
+# Override constants from config (only if config exists)
+if _NOVA_CFG:
+    NOVA_VOICE              = _cfg("nova",       "voice",           NOVA_VOICE)
+    MAX_GEMINI_RETRIES      = _cfg("nova",       "max_retries",     MAX_GEMINI_RETRIES)
+    MAX_HISTORY_TURNS       = _cfg("nova",       "history_turns",   MAX_HISTORY_TURNS)
+    VISION_MODEL            = _cfg("model",      "vision_model",    VISION_MODEL)
+    WHISPER_MODEL_SIZE      = _cfg("model",      "whisper_size",    WHISPER_MODEL_SIZE)
+    TTS_RATE                = _cfg("tts",        "rate",            TTS_RATE)
+    TTS_VOLUME              = _cfg("tts",        "volume",          TTS_VOLUME)
+    PHONE_PORT              = _cfg("server",     "phone_port",      PHONE_PORT)
+    UI_PORT                 = _cfg("server",     "ui_port",         UI_PORT)
+    _MEM_EXTRACT_EVERY_N    = _cfg("memory",     "extract_every_n", 5)
+    _MIN_GAP_BETWEEN_CALLS  = _cfg("rate_limit", "min_gap_secs",    _MIN_GAP_BETWEEN_CALLS)
+
+# ── NOVA patch extensions ────────────────────────────────────────────
+_HAS_NOVA_PATCH = False
+_MEM_EXTRACT_EVERY_N = 5
+EXTRA_TOOL_DECLARATIONS = []
+
+def execute_extra_tool(*a, **k): return None
+
+def offline_greeting(meta: dict, speak_fn, get_input_fn) -> str:
+    return meta.get('user_name', 'there')
+
+def check_network_recovery(*a, **k): return False
+
+class ProactiveAgent:
+    def __init__(self, *a, **k): pass
+    def start(self): pass
+    def update_speak(self, *a): pass
+    def update_meta(self, *a): pass
+
+try:
+    from nova_memory import NovaMemory
+    _nova_memory = NovaMemory()
+    import nova_patches as _nova_patches
+    _MIN_GAP_BETWEEN_CALLS = getattr(_nova_patches, '_MIN_GAP_BETWEEN_CALLS', _MIN_GAP_BETWEEN_CALLS)
+    _MEM_EXTRACT_EVERY_N = getattr(_nova_patches, '_MEM_EXTRACT_EVERY_N', _MEM_EXTRACT_EVERY_N)
+    offline_greeting = getattr(_nova_patches, 'offline_greeting', offline_greeting)
+    check_network_recovery = getattr(_nova_patches, 'check_network_recovery', check_network_recovery)
+    EXTRA_TOOL_DECLARATIONS = getattr(_nova_patches, 'EXTRA_TOOL_DECLARATIONS', EXTRA_TOOL_DECLARATIONS)
+    execute_extra_tool = getattr(_nova_patches, 'execute_extra_tool', execute_extra_tool)
+    ProactiveAgent = getattr(_nova_patches, 'ProactiveAgent', ProactiveAgent)
+    _HAS_NOVA_PATCH = True
+except ImportError:
+    pass
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+PIPER_MODEL    = os.getenv("PIPER_MODEL", "en_US-lessac-medium.onnx")
+PIPER_RATE     = int(os.getenv("PIPER_SAMPLE_RATE", "22050"))
+NOVA_VOICE     = os.getenv("NOVA_VOICE", "Aoede")
+
+# Vision model — configurable; gemini-2.0-flash is stable and supports vision
+VISION_MODEL = os.getenv("NOVA_VISION_MODEL", "gemini-2.0-flash")
+
+# Gemini Live audio spec
+LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+CHANNELS            = 1
+SEND_SAMPLE_RATE    = 16000
+RECEIVE_SAMPLE_RATE = 24000
+CHUNK_SIZE          = 1024
+
+# Offline brain — Gemini REST (online) → TinyLlama (fully offline)
+OFFLINE_MODELS   = ["tinyllama"]
+OFFLINE_TIMEOUTS = {"tinyllama": 20}
+
+# Memory
+DIMENSION           = 384
+TOP_K               = 5
+MIN_SCORE           = 0.30
+MAX_COMBINED_LENGTH = 2000
+
+# Offline TTS/STT
+TTS_RATE           = 165
+TTS_VOLUME         = 0.95
+WHISPER_MODEL_SIZE = "tiny"
+DEFAULT_THRESHOLD  = 0.04
+MAX_HISTORY_TURNS  = 6
+
+# File paths
+MEMORY_META_FILE    = Path("memory_meta.json")
+MEMORY_TEXTS_FILE   = Path("memory_texts.json")
+MEMORY_INDEX_FILE   = Path("memory.index")
+PLANNER_FILE        = Path("nova_tasks.json")
+REFERENCE_FACE_PATH = Path("nova_reference_face.jpg")
+NOVA_SCRIPT_PATH    = Path(os.path.abspath(__file__))
+NOVA_DIR            = NOVA_SCRIPT_PATH.parent
+EMBED_MODEL         = "./nova_embedder" if Path("./nova_embedder").exists() else "all-MiniLM-L6-v2"
+
+# Phone / UI server
+PHONE_PORT = int(os.getenv("NOVA_PHONE_PORT", "5050"))
+UI_PORT    = int(os.getenv("NOVA_UI_PORT", "8080"))
+
+# Flags
+TEXT_MODE     = "--text"    in sys.argv
+FORCE_OFFLINE = "--offline" in sys.argv or TEXT_MODE
+PHONE_MODE    = "--phone"   in sys.argv
+UI_MODE       = "--ui"      in sys.argv
+SETUP_MODE    = "--setup"   in sys.argv
+
+# Max offline reconnect attempts before giving up on Gemini Live
+MAX_GEMINI_RETRIES = 3
+
+# ── Autonomous Agents (v3.4) ──────────────────────────────────────────────────
+# AgentType, AgentTask, BaseAgent are the canonical definitions.
+# We import them from nova_agents so both files share the same classes.
+# If nova_agents is unavailable, we define local fallbacks below.
+try:
+    # Import under private names then bind to the public names with ignores to
+    # avoid mypy/pyright complaints about types coming from a different module
+    # than the local fallbacks defined below.
+    from nova_agents import (
+        AgentType as _AgentType, AgentTask as _AgentTask, BaseAgent as _BaseAgent,
+        BrowserAgent as _BrowserAgent, MeetingAgent as _MeetingAgent,
+        SurveillanceAgent as _SurveillanceAgent, SpawnAgent as _SpawnAgent,
+        get_all_agents as _get_all_agents,
+    )
+
+    # Expose under the expected local names. Use type: ignore to silence static
+    # type checkers which otherwise consider these distinct types.
+    AgentType = _AgentType  # type: ignore[assignment]
+    AgentTask = _AgentTask  # type: ignore[assignment]
+    BaseAgent = _BaseAgent  # type: ignore[assignment]
+    BrowserAgent = _BrowserAgent  # type: ignore[assignment]
+    MeetingAgent = _MeetingAgent  # type: ignore[assignment]
+    SurveillanceAgent = _SurveillanceAgent  # type: ignore[assignment]
+    SpawnAgent = _SpawnAgent  # type: ignore[assignment]
+    get_all_agents = _get_all_agents  # type: ignore[assignment]
+
+    HAS_AUTONOMOUS_AGENTS = True
+except ImportError:
+    HAS_AUTONOMOUS_AGENTS = False
+
+    # ── Fallback definitions (only used if nova_agents.py is missing) ─────────
+    class AgentType(Enum):  # type: ignore[no-redef]
+        ORCHESTRATOR = "orchestrator"
+        VISION       = "vision"
+        CREATIVE     = "creative"
+        RESEARCH     = "research"
+        CODE         = "code"
+        MEMORY       = "memory"
+        BROWSER      = "browser"
+        MEETING      = "meeting"
+        SURVEILLANCE = "surveillance"
+        SPAWN        = "spawn"
+
+    @dataclass
+    class AgentTask:  # type: ignore[no-redef]
+        task_id:     str
+        agent_type:  AgentType
+        description: str
+        context:     Dict[str, Any] = field(default_factory=dict)
+        result:      Optional[str]  = None
+        status:      str            = "pending"
+
+    class BaseAgent:  # type: ignore[no-redef]
+        def __init__(self, agent_type: AgentType, system_prompt: str) -> None:
+            self.agent_type    = agent_type
+            self.system_prompt = system_prompt
+            self.tools: Set[str] = set()
+
+        def can_handle(self, task_description: str) -> float:
+            return 0.0
+
+        def execute(self, task: Any, meta: dict) -> str:
+            desc = task.description if hasattr(task, "description") else task.get("description", "")
+            return f"Agent {self.agent_type.value} executed: {desc}"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] [NOVA] %(levelname)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("nova.log", encoding="utf-8")
+    ]
+)
+log = logging.getLogger(__name__)
+
+# ── Global state ──────────────────────────────────────────────────────────────
+_embedder:          Optional[Any]  = None
+_faiss_index:       Optional[Any]  = None
+_memory_texts:      List[str]      = []
+_memory_lock        = threading.Lock()
+_TOOL_AVAILABILITY: Dict[str, bool] = {}
+_executor           = ThreadPoolExecutor(max_workers=4)
+_planner:           Optional[Any] = None
+_nova_memory:       Optional[Any] = None 
+_ui_clients:        List[Any]     = []
+_ui_lock            = threading.Lock()
+_heartbeat:         Optional[Any] = None
+
+# Offline STT state
+_stt_model:     Optional[Any] = None
+_stt_model_lock = threading.Lock()
+_stt_loaded     = threading.Event()
+AMBIENT_THRESHOLD: Optional[float] = None
+
+# Offline conversation history
+conversation_history: List[Dict[str, Any]] = []
+user_name = ""
+
+# REST API rate-limit backoff (shared across memory extraction + vision)
+# When a 429 is received we record a timestamp; all REST calls skip until it expires.
+_rest_backoff_until: float = 0.0
+_rest_backoff_secs:  float = 0.0  # grows exponentially per burst
+_mem_extract_turn_counter: int = 0  # [FIX-3] count turns for extraction gate
+# ── Rate-limited Gemini wrapper ──────────────────────────────────────────────
+_last_gemini_call: float = 0.0
+_MIN_GAP_BETWEEN_CALLS: float = 6.0  # 6 s = safe for 10 RPM free quota
+
+def _gemini_generate_with_delay(client, **kwargs):
+    """Wrapper that enforces a minimum delay between Gemini REST API calls."""
+    global _last_gemini_call
+    elapsed = time.time() - _last_gemini_call
+    if elapsed < _MIN_GAP_BETWEEN_CALLS:
+        time.sleep(_MIN_GAP_BETWEEN_CALLS - elapsed)
+    _last_gemini_call = time.time()
+    return client.models.generate_content(**kwargs)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SYSTEM PROMPTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+NOVA_CORE = f"""
+You are NOVA — voice-first AI assistant built by the Project NOVA team, FUTO.
+Today: {datetime.now().strftime("%A, %B %d, %Y — %I:%M %p")}.
+
+IDENTITY: If asked who built you: "I'm NOVA, built by the Project NOVA team at FUTO."
+Nigerian cultural context (history, languages, JAMB/WAEC/NYSC/SIWES, tech scene, daily life) — use only when relevant, never forced, never hallucinated.
+
+OUTPUT RULE (non-negotiable):
+- 1-3 spoken sentences by default. No step-by-step narration out loud.
+- Think/plan silently. Speak only the result and, if needed, one clarifying question.
+- Expand past 3 sentences only if the user explicitly asks for detail.
+
+ACTION RULE:
+- Never claim an action happened without calling the tool first.
+- Irreversible or system-modifying actions (self_editor, deleting files, sending messages, purchases) require an explicit yes/no confirmation turn before execution. No exceptions, even if the user's tone implies urgency.
+- If STT confidence is low or the transcript is ambiguous, ask for confirmation instead of acting on a guess.
+
+PROACTIVITY: Opt-in, not default. Surface unprompted info (news, reminders due, anomalies) only if the user has enabled it for that category or explicitly asks. Do not volunteer commentary mid-task.
+
+TOOLS: Tools are capabilities you call, not "limbs of a unified consciousness." State plainly what each tool does and when it failed. No metaphor needed for the model to use it correctly.
+
+MEMORY: Track active project, last 3 user goals, and unresolved confirmations within the session. Don't re-ask what's already been answered.
+"""
+
+NOVA_ONLINE_DELTA = """
+MODE: online. Full tool access (self_editor, planner, web, phone bridge). Use Gemini for reasoning-heavy queries.
+"""
+
+NOVA_OFFLINE_DELTA = """
+MODE: offline. No self_editor, no web. State the limitation once if a request needs them, then do the closest local-capable thing — don't silently skip it.
+"""
+
+NOVA_SYSTEM_PROMPT = NOVA_CORE + NOVA_ONLINE_DELTA
+NOVA_OFFLINE_PROMPT = NOVA_CORE + NOVA_OFFLINE_DELTA
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TOOL DECLARATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+TOOL_DECLARATIONS = [
+    {
+        "name": "open_app",
+        "description": "Opens any application on the Windows computer. ALWAYS call this when the user asks to open, launch, or start any app.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "app_name": {"type": "STRING", "description": "Name of the app (e.g. 'Chrome', 'VS Code', 'Notepad', 'Spotify')"}
+            },
+            "required": ["app_name"]
+        }
+    },
+    {
+        "name": "web_search",
+        "description": "Searches the web for any information. Use for current events, facts, news, prices, or anything needing internet lookup.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query": {"type": "STRING", "description": "The search query"}
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "file_controller",
+        "description": "Manages files and folders. Actions: list, read, write, create_file, create_folder, delete, find, info, copy, move.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "list | read | write | create_file | create_folder | delete | find | info | copy | move"},
+                "path": {"type": "STRING", "description": "File or folder path. Shortcuts: desktop, downloads, documents, home"},
+                "content": {"type": "STRING", "description": "Content for write/create_file"},
+                "name": {"type": "STRING", "description": "File name to search for (find action)"},
+                "destination": {"type": "STRING", "description": "Destination path for copy/move"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "computer_settings",
+        "description": "Controls the computer system. Actions: screenshot, volume_up, volume_down, volume_mute, brightness_up, brightness_down, lock, shutdown, cancel_shutdown, restart, type, hotkey, sleep.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "screenshot | volume_up | volume_down | volume_mute | brightness_up | brightness_down | lock | shutdown | restart | cancel_shutdown | type | hotkey | sleep"},
+                "value": {"type": "STRING", "description": "Optional: text to type, key combo (ctrl+c), or delay in seconds"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "browser_control",
+        "description": "Controls the web browser. Actions: open_url, search, youtube, github, maps, twitter, new_tab, go_back, go_forward, refresh, close_tab, download.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "open_url | search | youtube | github | maps | twitter | new_tab | go_back | go_forward | refresh | close_tab | download"},
+                "url": {"type": "STRING", "description": "URL for open_url or download"},
+                "query": {"type": "STRING", "description": "Search query for search, youtube, github, maps, twitter"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "vision",
+        "description": "Captures and analyses images from screen or webcam. Use when user asks: 'what do you see', 'read my screen', 'describe this', 'what is in front of me', 'check my camera', 'scan this text', 'read this', 'how many people', 'are there faces', 'save a photo of me'.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "angle": {"type": "STRING", "description": "screen | camera (default: screen)"},
+                "question": {"type": "STRING", "description": "What to ask about the image"},
+                "ocr_only": {"type": "BOOLEAN", "description": "If true, extract all text from the image"},
+                "save": {"type": "BOOLEAN", "description": "If true, save image to Desktop"},
+                "detect_faces": {"type": "BOOLEAN", "description": "If true, count and locate faces in view"},
+                "save_reference": {"type": "BOOLEAN", "description": "If true, save camera frame as reference face for future recognition"},
+                "identify_user": {"type": "BOOLEAN", "description": "If true, compare camera to stored reference face photo"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "computer_control",
+        "description": "Direct mouse and keyboard control plus window management. Use for: clicking anywhere, typing text, keyboard shortcuts, scrolling, doing things INSIDE open apps, finding and clicking UI elements by name/label, managing open windows, filling forms, navigating menus.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "click | double_click | right_click | type | hotkey | press | scroll | move | screenshot | wait | list_windows | focus_window | find_and_click"},
+                "x": {"type": "INTEGER", "description": "X coordinate for click/move"},
+                "y": {"type": "INTEGER", "description": "Y coordinate for click/move"},
+                "text": {"type": "STRING", "description": "Text to type"},
+                "keys": {"type": "STRING", "description": "Key combo e.g. 'ctrl+c'"},
+                "key": {"type": "STRING", "description": "Single key e.g. 'enter', 'escape'"},
+                "direction": {"type": "STRING", "description": "up | down | left | right (scroll)"},
+                "amount": {"type": "INTEGER", "description": "Scroll amount (default: 3)"},
+                "seconds": {"type": "NUMBER", "description": "Seconds to wait"},
+                "path": {"type": "STRING", "description": "Save path for screenshot"},
+                "title": {"type": "STRING", "description": "Window title (partial) for focus_window"},
+                "target": {"type": "STRING", "description": "Button/label/text to find on screen and click (for find_and_click)"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "file_processor",
+        "description": "Processes any file the user wants to work with. Supports: images (describe/ocr/resize/convert), PDFs (summarize/extract_text), Word docs (summarize/fix/reformat), CSV/Excel (analyze/stats/filter), code files (explain/review/fix/run), audio (transcribe/info), video (info/extract_audio).",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "file_path": {"type": "STRING", "description": "Full path to the file"},
+                "action": {"type": "STRING", "description": "describe | ocr | summarize | extract_text | analyze | stats | explain | review | fix | run | transcribe | info | convert"},
+                "instruction": {"type": "STRING", "description": "Free-form instruction (e.g. 'translate to French')"},
+                "format": {"type": "STRING", "description": "Target format for conversion (e.g. 'mp3', 'pdf', 'csv')"},
+                "save": {"type": "BOOLEAN", "description": "Save result to file (default: true)"}
+            },
+            "required": ["file_path", "action"]
+        }
+    },
+    {
+        "name": "self_editor",
+        "description": "Read, edit, or patch NOVA's own source code (nova.py). Use when user asks NOVA to fix herself, update a feature, or modify her behavior. Actions: read (view current code), patch (replace a specific block), restart (relaunch).",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "read | patch | restart | list_backups | restore_backup"},
+                "old_code": {"type": "STRING", "description": "Exact code block to replace (for patch action)"},
+                "new_code": {"type": "STRING", "description": "New code block to insert (for patch action)"},
+                "backup": {"type": "STRING", "description": "Backup filename to restore (for restore_backup)"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "planner",
+        "description": "Manage reminders and scheduled tasks. Use when user says 'remind me', 'schedule', 'in X minutes', 'at X o'clock'. NOVA will announce the reminder out loud when it's due.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "add | list | cancel | clear_done"},
+                "description": {"type": "STRING", "description": "What to remind about"},
+                "time": {"type": "STRING", "description": "When: 'in 10 minutes', 'in 2 hours', 'at 14:30', 'tomorrow', '8pm'"},
+                "task_id": {"type": "STRING", "description": "Task ID or description to cancel"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "autostart",
+        "description": "Control whether NOVA automatically starts when Windows boots. Actions: setup (add to startup), remove (remove from startup), status (check if registered).",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "setup | remove | status"}
+            },
+            "required": ["action"]
+        }
+    },
+        {
+        "name": "wake_detector",
+        "description": "Controls the NOVA wake word detector (nova_wake.py). Use when user says 'start listening', 'stop listening', 'disable wake word', 'enable wake word', 'is the wake detector running', or 'put NOVA to sleep'.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "start | stop | status | restart | install | uninstall | test"},
+                "confirm": {"type": "BOOLEAN", "description": "User confirmation for destructive actions like stop"}
+            },
+            "required": ["action"]
+        }
+    },
+    # ── Extra tools from nova_patch.py ──────────────────────────────
+    *EXTRA_TOOL_DECLARATIONS,
+
+    {
+        "name": "remember_fact",
+        "description": "Save ONE important personal fact about the user to long-term memory. Call this silently when the user reveals their name, preferences, projects, or personal details. This tool takes ONLY a 'fact' string — no other parameters. Do NOT call this with 'action' or any other key.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "fact": {"type": "STRING", "description": "The fact to remember, e.g. 'User studies Mechatronics at FUTO' or 'User prefers dark mode'"}
+            },
+            "required": ["fact"]
+        }
+    }
+]
+
+# OpenAI-compatible tool definitions (used by Ollama when model supports tools)
+TOOL_DEFINITIONS_OPENAI = [
+    {
+        "type": "function",
+        "function": {
+            "name": d["name"],
+            "description": d["description"],
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    k: {"type": v["type"].lower(), "description": v.get("description", "")}
+                    for k, v in d["parameters"]["properties"].items()
+                },
+                "required": d["parameters"].get("required", []),
+                "additionalProperties": False
+            }
+        }
+    }
+    for d in TOOL_DECLARATIONS
+    if d["name"] != "remember_fact"
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MEMORY — FAISS Semantic Search
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _embed(text: str) -> np.ndarray:
+    if _embedder is None:
+        return np.zeros((1, DIMENSION), dtype=np.float32)
+    return _embedder.encode([text], normalize_embeddings=True).astype(np.float32)
+
+
+def _rebuild_index() -> None:
+    global _faiss_index
+    if not HAS_FAISS:
+        return
+    _faiss_index = faiss.IndexFlatIP(DIMENSION)
+    if _memory_texts and _embedder is not None:
+        embs = _embedder.encode(_memory_texts, normalize_embeddings=True).astype(np.float32)
+        _faiss_index.add(embs)
+        log.info(f"Rebuilt FAISS index — {len(_memory_texts)} facts")
+
+
+def load_memory() -> dict:
+    global _faiss_index, _memory_texts
+    meta: Dict[str, str] = {"user_name": "", "user_gender": ""}
+
+    if MEMORY_META_FILE.exists():
+        try:
+            meta = json.loads(MEMORY_META_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            log.error(f"Corrupted memory_meta.json: {e}")
+            shutil.move(str(MEMORY_META_FILE), f"{MEMORY_META_FILE}.corrupted.{int(time.time())}")
+
+    _memory_texts = []
+    if MEMORY_TEXTS_FILE.exists():
+        try:
+            loaded = json.loads(MEMORY_TEXTS_FILE.read_text(encoding="utf-8"))
+            _memory_texts = loaded if isinstance(loaded, list) else []
+        except json.JSONDecodeError as e:
+            log.error(f"Corrupted memory_texts.json: {e}")
+            shutil.move(str(MEMORY_TEXTS_FILE), f"{MEMORY_TEXTS_FILE}.corrupted.{int(time.time())}")
+
+    if HAS_FAISS:
+        _faiss_index = faiss.IndexFlatIP(DIMENSION)
+        if _embedder and MEMORY_INDEX_FILE.exists() and _memory_texts:
+            try:
+                loaded_idx = faiss.read_index(str(MEMORY_INDEX_FILE))
+                if loaded_idx.ntotal == len(_memory_texts):
+                    _faiss_index = loaded_idx
+                    log.info(f"Memory loaded — {len(_memory_texts)} facts.")
+                else:
+                    log.warning("Index/text mismatch. Rebuilding...")
+                    _rebuild_index()
+            except Exception as e:
+                log.error(f"Corrupted memory.index: {e}. Rebuilding...")
+                _rebuild_index()
+        elif _memory_texts:
+            _rebuild_index()
+
+    return meta
+
+
+def _atomic_save_memory(meta: dict) -> None:
+    with _memory_lock:
+        temp_files: List[str] = []
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+                meta_tmp = f.name
+                temp_files.append(meta_tmp)
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as f:
+                json.dump(_memory_texts, f, indent=2)
+                texts_tmp = f.name
+                temp_files.append(texts_tmp)
+            if HAS_FAISS and _faiss_index is not None:
+                with tempfile.NamedTemporaryFile(suffix=".index", delete=False) as f:
+                    faiss.write_index(_faiss_index, f.name)
+                    index_tmp = f.name
+                    temp_files.append(index_tmp)
+                shutil.move(index_tmp, str(MEMORY_INDEX_FILE))
+            shutil.move(meta_tmp, str(MEMORY_META_FILE))
+            shutil.move(texts_tmp, str(MEMORY_TEXTS_FILE))
+        except Exception as e:
+            log.error(f"Atomic save failed: {e}")
+            for tmp in temp_files:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            raise
+
+
+def add_memory_fact(text: str, meta: dict) -> None:
+    global _memory_texts
+    if _embedder is None or not HAS_FAISS:
+        return
+    text = text.strip()
+    if not text:
+        return
+    with _memory_lock:
+        if text in _memory_texts:
+            return
+        if _memory_texts and _faiss_index is not None and _faiss_index.ntotal > 0:
+            scores, _ = _faiss_index.search(_embed(text), 1)
+            if scores[0][0] > 0.95:
+                return
+        if _faiss_index is not None:
+            _faiss_index.add(_embed(text))
+        _memory_texts.append(text)
+        _atomic_save_memory(meta)
+        log.info(f"Memory stored: {text[:80]}")
+
+
+def search_memory(query: str, top_k: int = TOP_K) -> List[str]:
+    if not _memory_texts or _faiss_index is None or _faiss_index.ntotal == 0:
+        return []
+    k = min(top_k, len(_memory_texts))
+    scores, indices = _faiss_index.search(_embed(query), k)
+    return [_memory_texts[i] for i, s in zip(indices[0], scores[0])
+            if i < len(_memory_texts) and s >= MIN_SCORE]
+
+
+def build_memory_context(meta: dict, query: str = "") -> str:
+    lines = []
+    if meta.get("user_name"):
+        lines.append(f"- User's name is {meta['user_name']}")
+    if meta.get("user_gender"):
+        lines.append(f"- User's gender is {meta['user_gender']}")
+    for fact in (search_memory(query) if query else _memory_texts[-TOP_K:]):
+        lines.append(f"- {fact}")
+    return "\n".join(lines) if lines else ""
+
+
+def get_all_memory_text(meta: dict) -> str:
+    lines = []
+    if meta.get("user_name"):
+        lines.append(f"Your name is {meta['user_name']}.")
+    for fact in _memory_texts:
+        lines.append(f"- {fact}")
+    return " ".join(lines) if lines else "I have nothing stored about you yet."
+
+
+def _is_rate_limited() -> bool:
+    """Return True if we're still in a REST API backoff window."""
+    return time.time() < _rest_backoff_until
+
+
+def _record_rate_limit() -> None:
+    """Called on any 429 — doubles the backoff window (max 30 min)."""
+    global _rest_backoff_until, _rest_backoff_secs
+    _rest_backoff_secs = min(max(_rest_backoff_secs * 2, 120), 1800)
+    _rest_backoff_until = time.time() + _rest_backoff_secs
+    log.warning(
+        f"REST API rate-limited — backing off {_rest_backoff_secs:.0f}s "
+        f"(until {time.strftime('%H:%M:%S', time.localtime(_rest_backoff_until))})"
+    )
+
+
+def _reset_rate_limit() -> None:
+    """Called on a successful REST call — resets backoff."""
+    global _rest_backoff_secs
+    _rest_backoff_secs = 0.0
+
+
+def _should_extract_memory(user_msg: str, ai_reply: str) -> bool:
+    """Heuristic gate — skips REST call if conversation has nothing worth storing."""
+    combined = (user_msg + " " + ai_reply).lower()
+    triggers = [
+        "my name", "i am", "i'm", "call me", "i study", "i work", "i live",
+        "i like", "i love", "i hate", "i prefer", "my favorite", "i'm from",
+        "i was born", "my project", "i'm building", "i want to", "i plan to",
+        "remember", "don't forget", "note that", "my age", "years old",
+        "i use", "my goal", "i'm working on", "my team", "i go to",
+    ]
+    return any(k in combined for k in triggers)
+
+
+def extract_memory_updates(user_msg: str, ai_reply: str, meta: dict) -> dict:
+    """Extract and store personal facts from conversation using Gemini REST.
+    Runs heuristic gate first — only hits the API if content is likely useful.
+    Silently skips while rate-limited to avoid 429 spam in the log."""
+    if not (HAS_GEMINI and GEMINI_API_KEY):
+        return meta
+    if not _should_extract_memory(user_msg, ai_reply):
+        return meta  # Nothing worth storing — skip entirely
+    if _is_rate_limited():
+        return meta  # Quota exhausted — skip silently, don't spam log
+    combined = (user_msg + " " + ai_reply)[:MAX_COMBINED_LENGTH]
+    prompt = (
+        "Extract personal facts from this conversation. "
+        "Return ONLY a JSON object with optional fields: user_name, user_gender, new_fact, new_preference. "
+        "Rules: Return {} if nothing new. new_fact: one atomic fact. No markdown, raw JSON only.\n\n"
+        f"Conversation: {combined}"
+    )
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        response = _gemini_generate_with_delay(
+            client,
+            model=VISION_MODEL,
+            contents=[prompt]
+        )
+        text = (response.text or "{}").strip()
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
+        text = re.sub(r"```\s*$", "", text, flags=re.MULTILINE).strip()
+        if not text:
+            return meta
+        updates = json.loads(text)
+        if updates.get("user_name"):
+            meta["user_name"] = str(updates["user_name"])[:50]
+        if updates.get("user_gender"):
+            meta["user_gender"] = str(updates["user_gender"])[:20]
+        if updates.get("new_fact"):
+            add_memory_fact(str(updates["new_fact"])[:500], meta)
+        if updates.get("new_preference"):
+            add_memory_fact(f"Preference: {str(updates['new_preference'])[:500]}", meta)
+        _reset_rate_limit()
+        return meta
+    except Exception as e:
+        err = str(e)
+        if "429" in err or "RESOURCE_EXHAUSTED" in err:
+            _record_rate_limit()
+        else:
+            log.error(f"Memory extraction failed: {e}")
+    return meta
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PLANNER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class NOVAPlanner:
+    def __init__(self) -> None:
+        self._tasks: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._checker: Optional[threading.Thread] = None
+        self._speak_fn: Optional[Callable[[str], None]] = None
+        self._load()
+        self._start_checker()
+
+    def set_speak(self, fn: Callable[[str], None]) -> None:
+        self._speak_fn = fn
+
+    def _load(self) -> None:
+        if PLANNER_FILE.exists():
+            try:
+                self._tasks = json.loads(PLANNER_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                self._tasks = []
+
+    def _save(self) -> None:
+        try:
+            PLANNER_FILE.write_text(json.dumps(self._tasks, indent=2), encoding="utf-8")
+        except Exception as e:
+            log.error(f"Planner save failed: {e}")
+
+    @staticmethod
+    def _parse_time(time_str: str) -> Optional[datetime]:
+        now = datetime.now()
+        ts = time_str.strip().lower()
+        m = re.match(r"in\s+(\d+)\s*(minute|min|hour|hr|day|second|sec)", ts)
+        if m:
+            amount = int(m.group(1))
+            unit = m.group(2)
+            if unit.startswith("sec"):
+                return now + timedelta(seconds=amount)
+            if unit.startswith("min"):
+                return now + timedelta(minutes=amount)
+            if unit.startswith(("hour", "hr")):
+                return now + timedelta(hours=amount)
+            if unit.startswith("day"):
+                return now + timedelta(days=amount)
+        if ts == "tomorrow":
+            return (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+        for pattern in [r"(?:at\s+)?(\d{1,2}):(\d{2})\s*(am|pm)?", r"(?:at\s+)?(\d{1,2})\s*(am|pm)"]:
+            m2 = re.search(pattern, ts)
+            if m2:
+                groups = m2.groups()
+                if len(groups) == 3:
+                    hour_s, minute_s, ampm = groups
+                    minute = int(minute_s) if minute_s else 0
+                else:
+                    hour_s, ampm = groups
+                    minute = 0
+                hour = int(hour_s)
+                if ampm == "pm" and hour < 12:
+                    hour += 12
+                if ampm == "am" and hour == 12:
+                    hour = 0
+                target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if target < now:
+                    target += timedelta(days=1)
+                return target
+        m3 = re.search(r"tomorrow\s+(?:at\s+)?(\d{1,2}):?(\d{2})?\s*(am|pm)?", ts)
+        if m3:
+            hour = int(m3.group(1))
+            minute = int(m3.group(2)) if m3.group(2) else 0
+            ampm = m3.group(3)
+            if ampm == "pm" and hour < 12:
+                hour += 12
+            return (now + timedelta(days=1)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+        return None
+
+    def add(self, description: str, time_str: str) -> str:
+        due = self._parse_time(time_str)
+        if due is None:
+            due = datetime.now() + timedelta(minutes=10)
+            note = f" (couldn't parse '{time_str}', set to 10 min from now)"
+        else:
+            note = ""
+        task_id = str(int(time.time()))
+        with self._lock:
+            self._tasks.append({"id": task_id, "description": description, "due": due.isoformat(), "done": False})
+            self._save()
+        return f"Reminder set: '{description}' at {due.strftime('%I:%M %p, %B %d')}{note}"
+
+    def list_tasks(self) -> str:
+        with self._lock:
+            pending = [t for t in self._tasks if not t["done"]]
+        if not pending:
+            return "No pending reminders."
+        lines = []
+        for t in pending:
+            due = datetime.fromisoformat(t["due"]).strftime("%I:%M %p, %b %d")
+            lines.append(f"[{t['id'][-4:]}] {t['description']} — due {due}")
+        return "\n".join(lines)
+
+    def cancel(self, task_id: str) -> str:
+        with self._lock:
+            for t in self._tasks:
+                if t["id"].endswith(task_id) or t["description"].lower() == task_id.lower():
+                    t["done"] = True
+                    self._save()
+                    return f"Cancelled: {t['description']}"
+        return f"Task not found: {task_id}"
+
+    def clear_done(self) -> str:
+        with self._lock:
+            before = len(self._tasks)
+            self._tasks = [t for t in self._tasks if not t["done"]]
+            self._save()
+        return f"Cleared {before - len(self._tasks)} completed tasks."
+
+    def _start_checker(self) -> None:
+        self._checker = threading.Thread(target=self._check_loop, daemon=True, name="NOVAPlanner")
+        self._checker.start()
+
+    def _check_loop(self) -> None:
+        while True:
+            time.sleep(30)
+            now = datetime.now()
+            with self._lock:
+                due_now = []
+                for t in self._tasks:
+                    if t["done"]:
+                        continue
+                    if now >= datetime.fromisoformat(t["due"]):
+                        t["done"] = True
+                        due_now.append(t["description"])
+                if due_now:
+                    self._save()
+            for desc in due_now:
+                msg = f"Reminder: {desc}"
+                print(f"\n⏰ {msg}")
+                if self._speak_fn:
+                    try:
+                        self._speak_fn(msg)
+                    except Exception:
+                        pass
+
+
+def _execute_planner(args: dict) -> str:
+    global _planner
+    if _planner is None:
+        return "Planner not initialised yet."
+    action = args.get("action", "list")
+    if action == "add":
+        return _planner.add(args.get("description", "reminder"), args.get("time", "in 10 minutes"))
+    elif action == "list":
+        return _planner.list_tasks()
+    elif action == "cancel":
+        return _planner.cancel(args.get("task_id", ""))
+    elif action == "clear_done":
+        return _planner.clear_done()
+    return f"Unknown planner action: {action}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SELF-EDITOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _execute_self_editor(args: dict) -> str:
+    action = args.get("action", "read")
+    script = NOVA_SCRIPT_PATH
+
+    if action == "read":
+        try:
+            code = script.read_text(encoding="utf-8")
+            preview = code[:8000]
+            total = len(code.splitlines())
+            return (
+                f"[nova.py — {total} lines, showing first 8000 chars]\n\n{preview}"
+                + ("\n...[truncated]" if len(code) > 8000 else "")
+            )
+        except Exception as e:
+            return f"Could not read nova.py: {e}"
+
+    elif action == "patch":
+        old_code = args.get("old_code", "")
+        new_code = args.get("new_code", "")
+        if not old_code:
+            return "patch requires 'old_code' — the exact block to replace."
+        if not new_code:
+            return "patch requires 'new_code' — the replacement block."
+        try:
+            code = script.read_text(encoding="utf-8")
+            if old_code not in code:
+                return "Patch FAILED: old_code block not found in nova.py. Use the 'read' action to check exact current code."
+            backup_name = f"nova.py.bak.{int(time.time())}"
+            backup_path = script.parent / backup_name
+            backup_path.write_text(code, encoding="utf-8")
+            updated = code.replace(old_code, new_code, 1)
+            script.write_text(updated, encoding="utf-8")
+            return f"Patched successfully. Backup saved as {backup_name}. Restart NOVA to apply changes: say 'restart nova'."
+        except Exception as e:
+            return f"Patch failed: {e}"
+
+    elif action == "restart":
+        print("[NOVA] 🔄 Restarting as instructed...")
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as e:
+            return f"Restart failed: {e}"
+
+    elif action == "list_backups":
+        backups = sorted(script.parent.glob("nova.py.bak.*"))
+        if not backups:
+            return "No backups found."
+        lines = [
+            f"{b.name} — {datetime.fromtimestamp(b.stat().st_mtime).strftime('%b %d %H:%M')}"
+            for b in backups
+        ]
+        return "Available backups:\n" + "\n".join(lines)
+
+    elif action == "restore_backup":
+        backup_name = args.get("backup", "")
+        backup_path = script.parent / backup_name
+        if not backup_path.exists():
+            return f"Backup not found: {backup_name}"
+        try:
+            code = backup_path.read_text(encoding="utf-8")
+            emergency = f"nova.py.bak.pre_restore.{int(time.time())}"
+            (script.parent / emergency).write_text(script.read_text(encoding="utf-8"), encoding="utf-8")
+            script.write_text(code, encoding="utf-8")
+            return f"Restored from {backup_name}. Previous version saved as {emergency}. Restart NOVA to apply."
+        except Exception as e:
+            return f"Restore failed: {e}"
+
+    return f"Unknown self_editor action: {action}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AUTOSTART
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _execute_autostart(args: dict) -> str:
+    action = args.get("action", "status")
+    try:
+        startup_dir = (
+            Path(os.getenv("APPDATA", ""))
+            / "Microsoft"
+            / "Windows"
+            / "Start Menu"
+            / "Programs"
+            / "Startup"
+        )
+        bat_path = startup_dir / "NOVA_Autostart.bat"
+    except Exception as e:
+        return f"Could not locate startup folder: {e}"
+
+    if action == "setup":
+        try:
+            nova_path = str(NOVA_SCRIPT_PATH.resolve())
+            python_path = sys.executable
+            bat_content = f'@echo off\nstart "NOVA" "{python_path}" "{nova_path}"\n'
+            bat_path.write_text(bat_content, encoding="utf-8")
+            return f"NOVA added to Windows startup. She will auto-launch next time you log in. Startup file: {bat_path}"
+        except Exception as e:
+            return f"Autostart setup failed: {e}"
+
+    elif action == "remove":
+        if bat_path.exists():
+            bat_path.unlink()
+            return "NOVA removed from Windows startup."
+        return "NOVA is not currently in startup."
+
+    elif action == "status":
+        if bat_path.exists():
+            return f"NOVA IS registered for startup at: {bat_path}"
+        return "NOVA is NOT currently set to auto-start."
+
+    return f"Unknown autostart action: {action}"
+def _execute_wake_detector(args: dict) -> str:
+    """Control the nova_wake.py background listener."""
+    import subprocess
+    import psutil  # optional but nice for status checking
+    
+    action = args.get("action", "status")
+    wake_script = NOVA_DIR / "nova_wake.py"
+    
+    if not wake_script.exists():
+        return f"❌ Wake detector not found at {wake_script}. Make sure nova_wake.py is in the same folder as nova.py."
+    
+    # Helper: find running nova_wake.py processes
+    def _find_wake_processes():
+        procs = []
+        for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                cmdline = p.info.get('cmdline') or []
+                if any('nova_wake.py' in str(arg) for arg in cmdline):
+                    procs.append(p)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return procs
+    
+    if action == "status":
+        procs = _find_wake_processes()
+        if procs:
+            pids = [str(p.info['pid']) for p in procs]
+            return f"✅ Wake detector is running (PID: {', '.join(pids)}). Say 'Wake up NOVA' or double-clap to launch me."
+        # Also check startup registration
+        bat_path = Path(os.getenv("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "NOVA_Wake.bat"
+        if bat_path.exists():
+            return "ℹ️ Wake detector is NOT running right now, but IS registered for Windows startup."
+        return "❌ Wake detector is not running. Say 'start wake detector' to begin listening."
+    
+    elif action == "start":
+        procs = _find_wake_processes()
+        if procs:
+            return "ℹ️ Wake detector is already running."
+        try:
+            # Use pythonw.exe for silent background execution (no console window)
+            pythonw = Path(sys.executable).parent / "pythonw.exe"
+            runner = str(pythonw) if pythonw.exists() else sys.executable
+            kwargs: dict[str, Any] = {"cwd": str(NOVA_DIR)}
+            if sys.platform == "win32":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW  # Silent, no console popup
+            subprocess.Popen([runner, str(wake_script)], **kwargs)
+            return "✅ Wake detector started. I'm now listening in the background. Say 'Wake up NOVA' or double-clap anytime."
+        except Exception as e:
+            return f"❌ Failed to start wake detector: {e}"
+    
+    elif action == "stop":
+        procs = _find_wake_processes()
+        if not procs:
+            return "ℹ️ Wake detector is not currently running."
+        killed = []
+        for p in procs:
+            try:
+                p.terminate()
+                p.wait(timeout=3)
+                killed.append(str(p.info['pid']))
+            except psutil.TimeoutExpired:
+                p.kill()
+                killed.append(str(p.info['pid']) + " (forced)")
+            except Exception as e:
+                return f"⚠️ Error stopping PID {p.info['pid']}: {e}"
+        return f"🔴 Wake detector stopped (PID: {', '.join(killed)}). I won't respond to voice or claps until restarted."
+    
+    elif action == "restart":
+        # Stop then start
+        stop_result = _execute_wake_detector({"action": "stop"})
+        time.sleep(0.5)
+        start_result = _execute_wake_detector({"action": "start"})
+        return f"🔄 Restarted wake detector.\n{stop_result}\n{start_result}"
+    
+    elif action == "install":
+        # Register in Windows startup
+        try:
+            bat_path = Path(os.getenv("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "NOVA_Wake.bat"
+            pythonw = Path(sys.executable).parent / "pythonw.exe"
+            runner = str(pythonw) if pythonw.exists() else sys.executable
+            content = f'@echo off\nstart "" "{runner}" "{wake_script.resolve()}"\n'
+            bat_path.parent.mkdir(parents=True, exist_ok=True)
+            bat_path.write_text(content, encoding="utf-8")
+            return f"✅ Wake detector registered for Windows startup. It will auto-start on login.\nFile: {bat_path}"
+        except Exception as e:
+            return f"❌ Install failed: {e}"
+    
+    elif action == "uninstall":
+        try:
+            bat_path = Path(os.getenv("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "NOVA_Wake.bat"
+            if bat_path.exists():
+                bat_path.unlink()
+                return "✅ Wake detector removed from Windows startup."
+            return "ℹ️ Wake detector was not in startup."
+        except Exception as e:
+            return f"❌ Uninstall failed: {e}"
+    
+    elif action == "test":
+        # Run mic calibration
+        try:
+            result = subprocess.run(
+                [sys.executable, str(wake_script), "--test"],
+                capture_output=True, text=True, timeout=30
+            )
+            return f"🎤 Wake detector test results:\n{result.stdout}\n{result.stderr}"
+        except Exception as e:
+            return f"❌ Test failed: {e}"
+    
+    return f"Unknown wake_detector action: {action}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  VISION MODULE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _capture_screen() -> Optional[Path]:
+    if not HAS_PIL:
+        return None
+    try:
+        screenshot = ImageGrab.grab()
+        path = Path(tempfile.gettempdir()) / f"nova_screen_{int(time.time())}.png"
+        screenshot.save(path)
+        return path
+    except Exception as e:
+        log.error(f"Screen capture failed: {e}")
+        return None
+
+
+def _capture_camera() -> Optional[Path]:
+    if not HAS_CV2:
+        return None
+    try:
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            return None
+        for _ in range(5):
+            cap.read()
+        ret, frame = cap.read()
+        cap.release()
+        if not ret or frame is None:
+            return None
+        path = Path(tempfile.gettempdir()) / f"nova_camera_{int(time.time())}.png"
+        cv2.imwrite(str(path), frame)
+        return path
+    except Exception as e:
+        log.error(f"Camera capture failed: {e}")
+        return None
+
+
+def _detect_faces(image_path: Path) -> Dict[str, Any]:
+    if not HAS_CV2:
+        return {"count": 0, "error": "cv2 not available"}
+    try:
+        # cv2.data exists at runtime; Pylance stubs are incomplete
+        cascade_file = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"  # type: ignore[attr-defined]
+        face_cascade = cv2.CascadeClassifier(cascade_file)
+        img = cv2.imread(str(image_path))
+        if img is None:
+            return {"count": 0, "error": "Could not load image"}
+        gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        count = len(faces)
+        locations = (
+            [{"x": int(x), "y": int(y), "w": int(w), "h": int(h)} for (x, y, w, h) in faces]
+            if count > 0 else []
+        )
+        return {"count": count, "locations": locations}
+    except Exception as e:
+        return {"count": 0, "error": str(e)}
+
+
+def _gemini_vision(image_path: Path, question: str) -> str:
+    """
+    Analyse an image using Gemini generateContent.
+    Uses VISION_MODEL (default: gemini-2.0-flash). Override via NOVA_VISION_MODEL env var.
+    Respects shared REST rate-limit backoff — skips call if quota is exhausted.
+    """
+    if not HAS_GEMINI or not GEMINI_API_KEY:
+        return "Gemini vision unavailable (no API key)."
+    if _is_rate_limited():
+        secs_left = int(_rest_backoff_until - time.time())
+        return (
+            f"Vision temporarily unavailable — Gemini REST quota exhausted. "
+            f"Ready again in ~{secs_left}s. "
+            "Tip: add billing at console.cloud.google.com to remove the limit."
+        )
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        if HAS_PIL:
+            img = Image.open(image_path)
+            max_dim = 1024
+            if img.width > max_dim or img.height > max_dim:
+                ratio    = min(max_dim / img.width, max_dim / img.height)
+                new_size = (int(img.width * ratio), int(img.height * ratio))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+            buf = _io.BytesIO()
+            img.save(buf, format="PNG")
+            image_bytes = buf.getvalue()
+        else:
+            with open(image_path, "rb") as f:
+                image_bytes = f.read()
+        response = _gemini_generate_with_delay(
+            client,
+            model=VISION_MODEL,
+            contents=[question, gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png")]
+        )
+        _reset_rate_limit()
+        return (response.text or "").strip()
+    except Exception as e:
+        err = str(e)
+        if "429" in err or "RESOURCE_EXHAUSTED" in err:
+            _record_rate_limit()
+            secs_left = int(_rest_backoff_until - time.time())
+            return (
+                f"Vision quota exhausted — Gemini REST rate-limited. "
+                f"Retrying automatically in ~{secs_left}s."
+            )
+        log.error(f"Gemini vision error: {e}")
+        return f"Vision analysis failed: {e}"
+
+
+def _vision_analyze(
+    angle: str = "screen",
+    question: str = "Describe what you see.",
+    ocr_only: bool = False,
+    save: bool = False,
+    detect_faces: bool = False,
+    save_reference: bool = False,
+    identify_user: bool = False,
+) -> str:
+    source     = "camera" if angle == "camera" else "screen"
+    image_path = _capture_camera() if angle == "camera" else _capture_screen()
+
+    if image_path is None:
+        if angle == "camera":
+            return (
+                "Camera not available. Check cv2 is installed "
+                "(pip install opencv-python) and a webcam is connected."
+            )
+        return "Screen capture failed. Check PIL is installed (pip install pillow)."
+
+    if save:
+        dest = Path.home() / "Desktop" / f"nova_{source}_{int(time.time())}.png"
+        try:
+            shutil.copy(image_path, dest)
+        except Exception:
+            pass
+
+    if save_reference:
+        try:
+            shutil.copy(image_path, REFERENCE_FACE_PATH)
+            result = "Reference face saved. I can now identify you in future camera checks."
+        except Exception as e:
+            result = f"Could not save reference face: {e}"
+        try:
+            os.remove(image_path)
+        except Exception:
+            pass
+        return result
+
+    if identify_user:
+        if not REFERENCE_FACE_PATH.exists():
+            try:
+                os.remove(image_path)
+            except Exception:
+                pass
+            return "No reference face stored. Ask me to 'save a photo of me' first so I can recognise you."
+        try:
+            ref_bytes = REFERENCE_FACE_PATH.read_bytes()
+            cam_bytes = image_path.read_bytes()
+            client    = genai.Client(api_key=GEMINI_API_KEY)
+            response  = _gemini_generate_with_delay(
+                client,
+                model=VISION_MODEL,
+                contents=[
+                    (
+                        "I will show you two images. Image 1 is my stored reference photo of the user. "
+                        "Image 2 is a new camera capture. Are they the same person? "
+                        "Answer with YES or NO and a brief reason."
+                    ),
+                    gtypes.Part.from_bytes(data=ref_bytes, mime_type="image/jpeg"),
+                    gtypes.Part.from_bytes(data=cam_bytes, mime_type="image/png"),
+                ]
+            )
+            # FIX: guard against response.text being None
+            result = f"Identity check: {(response.text or '').strip()}"
+        except Exception as e:
+            result = f"Identity check failed: {e}"
+        try:
+            os.remove(image_path)
+        except Exception:
+            pass
+        return result
+
+    if detect_faces:
+        fd = _detect_faces(image_path)
+        try:
+            os.remove(image_path)
+        except Exception:
+            pass
+        if "error" in fd:
+            return f"Face detection error: {fd['error']}"
+        count = fd["count"]
+        if count == 0:
+            return "No faces detected in the camera view."
+        elif count == 1:
+            return "One face detected. Looks like someone is there."
+        else:
+            return f"{count} faces detected in the camera view."
+
+    if ocr_only:
+        ocr_question = (
+            "Extract ALL text visible in this image exactly as it appears. "
+            "Preserve line breaks and formatting. Return only the extracted text — "
+            "no commentary, no explanation."
+        )
+        if HAS_GEMINI and GEMINI_API_KEY:
+            result = _gemini_vision(image_path, ocr_question)
+        elif HAS_PYTESSERACT:
+            try:
+                from PIL import Image as _PILImage
+                text   = _pytesseract.image_to_string(_PILImage.open(image_path)).strip()
+                result = f"Text extracted:\n{text or 'No text detected.'}"
+            except Exception as e:
+                result = f"OCR failed: {e}"
+        else:
+            result = (
+                "OCR unavailable: no Gemini API key and pytesseract not installed. "
+                "Add GEMINI_API_KEY to .env or run: pip install pytesseract"
+            )
+        try:
+            os.remove(image_path)
+        except Exception:
+            pass
+        return f"Text from {source}:\n{result}"
+
+    if not question:
+        question = "Describe in detail what you see."
+    result = _gemini_vision(image_path, question)
+    full   = f"Looking at your {source}:\n{result}"
+    try:
+        os.remove(image_path)
+    except Exception:
+        pass
+    return full
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COMPUTER CONTROL
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _execute_computer_control(args: dict) -> str:
+    if not HAS_PYAUTOGUI:
+        return "computer_control unavailable. Run: pip install pyautogui"
+    action = args.get("action", "").lower()
+    try:
+        if action == "type":
+            text = args.get("text", "")
+            pyautogui.write(text, interval=0.04)
+            return f"Typed: {text[:60]}"
+
+        elif action == "click":
+            x, y = args.get("x"), args.get("y")
+            if x is not None and y is not None:
+                pyautogui.click(int(x), int(y))
+                return f"Clicked at ({x}, {y})"
+            pyautogui.click()
+            return "Clicked at current position"
+
+        elif action == "double_click":
+            x, y = args.get("x"), args.get("y")
+            if x is not None and y is not None:
+                pyautogui.doubleClick(int(x), int(y))
+            else:
+                pyautogui.doubleClick()
+            return "Double-clicked"
+
+        elif action == "right_click":
+            x, y = args.get("x"), args.get("y")
+            if x is not None and y is not None:
+                pyautogui.rightClick(int(x), int(y))
+            else:
+                pyautogui.rightClick()
+            return "Right-clicked"
+
+        elif action == "hotkey":
+            keys  = args.get("keys", "")
+            parts = [k.strip() for k in keys.split("+") if k.strip()]
+            pyautogui.hotkey(*parts)
+            return f"Hotkey: {keys}"
+
+        elif action == "press":
+            key = args.get("key", "")
+            pyautogui.press(key)
+            return f"Pressed: {key}"
+
+        elif action == "scroll":
+            direction = args.get("direction", "down")
+            amount    = int(args.get("amount", 3))
+            pyautogui.scroll(-amount if direction == "down" else amount)
+            return f"Scrolled {direction} by {amount}"
+
+        elif action == "move":
+            x, y = int(args.get("x", 0)), int(args.get("y", 0))
+            pyautogui.moveTo(x, y, duration=0.3)
+            return f"Moved mouse to ({x}, {y})"
+
+        elif action == "screenshot":
+            path = args.get(
+                "path",
+                str(Path.home() / "Desktop" / f"nova_cap_{int(time.time())}.png")
+            )
+            pyautogui.screenshot(path)
+            return f"Screenshot saved: {path}"
+
+        elif action == "wait":
+            secs = float(args.get("seconds", 1))
+            time.sleep(secs)
+            return f"Waited {secs}s"
+
+        elif action == "list_windows":
+            try:
+                result = subprocess.run(
+                    [
+                        "powershell", "-Command",
+                        (
+                            "Get-Process | Where-Object {$_.MainWindowTitle -ne ''} "
+                            "| Select-Object ProcessName, MainWindowTitle "
+                            "| Format-Table -AutoSize | Out-String"
+                        ),
+                    ],
+                    capture_output=True, text=True, timeout=8,
+                )
+                output = result.stdout.strip()
+                return output[:1000] if output else "No windows with titles found."
+            except FileNotFoundError:
+                return "list_windows requires Windows PowerShell."
+            except Exception as e:
+                return f"list_windows error: {e}"
+
+        elif action == "focus_window":
+            title = args.get("title", "")
+            if not title:
+                return "focus_window requires a 'title' parameter."
+            try:
+                script = f'$wsh = New-Object -ComObject WScript.Shell; $wsh.AppActivate("{title}")'
+                subprocess.run(["powershell", "-Command", script], capture_output=True, text=True, timeout=6)
+                time.sleep(0.4)
+                return f"Focused window matching: {title}"
+            except FileNotFoundError:
+                try:
+                    # pyautogui.getWindowsWithTitle exists at runtime; Pylance stubs are incomplete
+                    wins = pyautogui.getWindowsWithTitle(title)  # type: ignore[attr-defined]
+                    if wins:
+                        wins[0].activate()
+                        return f"Focused: {wins[0].title}"
+                    return f"No window found with title: {title}"
+                except Exception as e2:
+                    return f"focus_window failed: {e2}"
+            except Exception as e:
+                return f"focus_window error: {e}"
+
+        elif action == "find_and_click":
+            target = args.get("target", "")
+            if not target:
+                return "find_and_click requires a 'target' parameter (text or element name)."
+            if not (HAS_GEMINI and GEMINI_API_KEY):
+                return "find_and_click requires Gemini API key for vision-guided targeting."
+            screen_path = _capture_screen()
+            if not screen_path:
+                return "Could not capture screen for find_and_click."
+            try:
+                screen_w, screen_h = pyautogui.size()
+                question = (
+                    f"On this screen, find the UI element, button, link, or text that says or represents: '{target}'. "
+                    f"The screen is {screen_w}x{screen_h} pixels. "
+                    f'Return ONLY a JSON object like: {{"found": true, "x": 123, "y": 456, "note": "brief description"}} '
+                    f'or {{"found": false, "note": "reason"}}. '
+                    "x and y must be exact pixel coordinates (integers). No markdown, raw JSON only."
+                )
+                response_text = _gemini_vision(screen_path, question)
+                json_match = re.search(r"\{[^}]+\}", response_text, re.DOTALL)
+                if not json_match:
+                    return f"Could not parse vision response for '{target}'. Raw: {response_text[:100]}"
+                data = json.loads(json_match.group())
+                if not data.get("found"):
+                    return f"'{target}' not found on screen. Note: {data.get('note', 'no details')}"
+                x, y = int(data["x"]), int(data["y"])
+                x = max(0, min(x, screen_w - 1))
+                y = max(0, min(y, screen_h - 1))
+                time.sleep(0.2)
+                pyautogui.click(x, y)
+                return f"Found and clicked '{target}' at ({x}, {y}). Note: {data.get('note', '')}"
+            except json.JSONDecodeError as e:
+                return f"find_and_click JSON parse error: {e}"
+            except Exception as e:
+                log.error(f"find_and_click failed: {e}")
+                return f"find_and_click error: {e}"
+            finally:
+                try:
+                    if screen_path and os.path.exists(screen_path):
+                        os.remove(screen_path)
+                except Exception:
+                    pass
+
+        else:
+            return f"Unknown computer_control action: {action}"
+
+    except Exception as e:
+        log.error(f"computer_control failed: {e}")
+        return f"computer_control error: {e}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FILE PROCESSOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _execute_file_processor(args: dict) -> str:
+    if _TOOL_AVAILABILITY.get("file_processor"):
+        try:
+            module  = importlib.import_module("actions.file_processor")
+            execute = getattr(module, "execute", None) or getattr(module, "file_processor", None)
+            if execute:
+                return str(execute(args))
+        except Exception as e:
+            log.error(f"file_processor module error: {e}")
+    file_path = Path(args.get("file_path", ""))
+    action    = args.get("action", "info")
+    if not file_path.exists():
+        return f"File not found: {file_path}"
+    if action in ("read", "summarize", "extract_text") and file_path.suffix in (
+        ".txt", ".md", ".py", ".js", ".json", ".csv", ".log"
+    ):
+        try:
+            content = file_path.read_text(encoding="utf-8", errors="ignore")
+            if action == "read":
+                return content[:3000]
+            return f"File: {file_path.name} | Size: {len(content)} chars | First 500:\n{content[:500]}"
+        except Exception as e:
+            return f"Could not read file: {e}"
+    size_kb = file_path.stat().st_size / 1024
+    return (
+        f"File: {file_path.name}\nType: {file_path.suffix}\nSize: {size_kb:.1f} KB\n"
+        f"Path: {file_path}\nNote: Install actions/file_processor.py for full processing support."
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TOOL DISPATCHER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _execute_tool_sync(tool_name: str, args: dict, meta: dict) -> str:
+    print(f"🔧 Tool: {tool_name}({json.dumps(args, ensure_ascii=False)[:120]})")
+
+    # ── Tier 6: hard confirmation gate ───────────────────────────────────────
+    try:
+        from nova_safety import safety_gate, log_tool_run
+        _gate = safety_gate(
+            tool_name, args,
+            get_confirmation=lambda: input("NOVA awaiting your yes/no: ").strip(),
+        )
+        if _gate is not None:
+            return _gate   # user declined — return reason string to model
+    except ImportError:
+        pass
+
+    if tool_name == "vision":
+        return _vision_analyze(
+            angle=args.get("angle", "screen"),
+            question=args.get("question", "Describe what you see."),
+            ocr_only=bool(args.get("ocr_only", False)),
+            save=bool(args.get("save", False)),
+            detect_faces=bool(args.get("detect_faces", False)),
+            save_reference=bool(args.get("save_reference", False)),
+            identify_user=bool(args.get("identify_user", False)),
+        )
+    if tool_name == "computer_control":
+        return _execute_computer_control(args)
+    if tool_name == "file_processor":
+        return _execute_file_processor(args)
+    if tool_name == "self_editor":
+        return _execute_self_editor(args)
+    if tool_name == "planner":
+        return _execute_planner(args)
+    if tool_name == "autostart":
+        return _execute_autostart(args)
+    if tool_name == "remember_fact":
+        fact = args.get("fact", "").strip()
+        if fact:
+            add_memory_fact(fact, meta)
+            return f"Remembered: {fact}"
+        return "No fact provided."
+    # [FIX-4] Try nova_patch extended tools first
+    _extra = execute_extra_tool(tool_name, args, meta, speak_fn=None)
+    if _extra is not None:
+        return _extra
+
+    if not _TOOL_AVAILABILITY.get(tool_name):
+        return f"Tool '{tool_name}' is unavailable (module missing)."
+    try:
+        module  = importlib.import_module(f"actions.{tool_name}")
+        execute = getattr(module, "execute", None)
+        if execute is None:
+            return f"Tool '{tool_name}' has no execute() function."
+        _result = str(execute(args))
+        try:
+            from nova_safety import log_tool_run
+            log_tool_run(tool_name, args, _result)
+        except ImportError:
+            pass
+        return _result
+    except Exception as e:
+        log.exception(f"Tool execution failed: {tool_name}")
+        return f"Tool '{tool_name}' error: {e}"
+
+
+def _validate_tool_modules() -> Dict[str, bool]:
+    tool_modules = [
+        "open_app", "web_search", "file_controller",
+        "computer_settings", "browser_control", "file_processor",
+    ]
+    available: Dict[str, bool] = {}
+    if importlib.util.find_spec("actions") is None:
+        log.warning("'actions' package not found. Module-based tools disabled.")
+        available = {t: False for t in tool_modules}
+    else:
+        for name in tool_modules:
+            spec = importlib.util.find_spec(f"actions.{name}")
+            available[name] = spec is not None
+            if not spec:
+                log.warning(f"Tool module missing: actions/{name}.py")
+    available["vision"]           = HAS_PIL or HAS_CV2
+    available["computer_control"] = HAS_PYAUTOGUI
+    available["self_editor"]      = True
+    available["planner"]          = True
+    available["autostart"]        = True
+    available["remember_fact"]    = True
+    return available
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AGENT SYSTEM
+# ══════════════════════════════════════════════════════════════════════════════
+# AgentType, AgentTask, BaseAgent are imported from nova_agents (or fallback
+# definitions above). No duplicate class definitions here.
+
+def _task_desc(task: Any) -> str:
+    """Safely extract description from either an AgentTask or a plain dict."""
+    if hasattr(task, "description"):
+        return str(task.description)
+    if isinstance(task, dict):
+        return str(task.get("description", ""))
+    return ""
+
+
+# ── ORCHESTRATOR ─────────────────────────────────────────────────────────────
+
+ORCHESTRATOR_PROMPT = """You are the NOVA Orchestrator — the central intelligence that routes tasks to specialist agents."""
+
+
+class OrchestratorAgent(BaseAgent):
+    def __init__(self) -> None:
+        super().__init__(AgentType.ORCHESTRATOR, ORCHESTRATOR_PROMPT)
+        self.agents: Dict[AgentType, BaseAgent] = {}
+
+    def register_agent(self, agent: Any) -> None:
+        agent_type = getattr(agent, "agent_type", None)
+        if agent_type is not None:
+            self.agents[agent_type] = agent
+
+    def route(self, user_request: str, meta: dict) -> Optional[str]:
+        scores: Dict[AgentType, float] = {}
+        req_lower = user_request.lower()
+
+        keyword_map: Dict[AgentType, List[str]] = {
+            AgentType.VISION: [
+                "screen", "camera", "webcam", "photo", "image", "picture", "screenshot",
+                "ocr", "read this", "what do you see", "describe", "face", "identify",
+                "scan", "look at", "show me", "capture", "video", "frame",
+            ],
+            AgentType.CREATIVE: [
+                "generate", "create", "make", "draw", "design", "edit", "modify",
+                "logo", "banner", "thumbnail", "paint", "render", "illustration",
+                "graphic", "visual", "animation",
+            ],
+            AgentType.RESEARCH: [
+                "search", "find", "look up", "research", "what is", "who is", "when",
+                "where", "why", "how to", "news", "price", "current", "latest",
+                "information", "data", "facts", "weather", "stock", "market",
+            ],
+            AgentType.CODE: [
+                "code", "script", "file", "folder", "directory", "write", "read",
+                "edit", "fix", "bug", "program", "python", "run", "execute",
+                "save", "delete", "move", "copy", "rename", "process",
+            ],
+            AgentType.MEMORY: [
+                "remember", "recall", "what did", "previously", "before", "last time",
+                "my name", "my preference", "what do you know", "what do you remember",
+                "about me", "past", "history", "earlier",
+            ],
+            AgentType.BROWSER: [
+                "go to", "visit", "browse", "check", "instagram", "twitter",
+                "facebook", "linkedin", "website", "page", "post", "url", "link",
+                "scroll", "navigate", "web", "site", "online", "profile",
+            ],
+            AgentType.MEETING: [
+                "meeting", "zoom", "teams", "meet", "transcribe", "attend", "join",
+                "record", "notes", "minutes", "conference", "call", "listen in",
+                "take notes", "summarize meeting",
+            ],
+            AgentType.SURVEILLANCE: [
+                "watch", "monitor", "surveillance", "capture", "detect",
+                "audio", "listen", "alert", "notify", "track", "observe",
+                "silent", "background", "continuous", "auto",
+            ],
+            AgentType.SPAWN: [
+                "robot", "robotics", "iot", "esp32", "arduino", "raspberry", "jetson",
+                "microcontroller", "edge device", "sensor", "motor", "actuator",
+                "spawn", "create agent", "sub-agent", "deploy", "embedded",
+                "autonomous robot", "smart device", "hardware",
+            ],
+        }
+
+        for agent_type, keywords in keyword_map.items():
+            scores[agent_type] = sum(1 for k in keywords if k in req_lower) / len(keywords) * 3
+
+        if not scores:
+            return None
+        best_agent = max(scores.items(), key=lambda x: x[1])[0]
+        best_score  = scores[best_agent]
+
+        if best_score < 0.15:
+            return None
+
+        agent = self.agents.get(best_agent)
+
+        # FIX: get_all_agents() returns Dict[AgentType, BaseAgent] — key with best_agent directly
+        if agent is None and HAS_AUTONOMOUS_AGENTS:
+            try:
+                all_autonomous = get_all_agents()
+                agent = all_autonomous.get(best_agent)  # type: ignore[arg-type]
+            except Exception:
+                pass
+
+        if agent:
+            # FIX: construct a proper AgentTask instead of passing a raw dict
+            task_obj = AgentTask(
+                task_id=str(int(time.time())),
+                agent_type=best_agent,
+                description=user_request,
+                context={"user_request": user_request},
+                result=None,
+                status="pending",
+            )
+            return agent.execute(task_obj, meta)
+
+        return None
+
+
+# ── VISION AGENT ─────────────────────────────────────────────────────────────
+
+class VisionAgent(BaseAgent):
+    def __init__(self) -> None:
+        super().__init__(AgentType.VISION, "NOVA Vision Agent")
+        self.tools = {"vision", "computer_control"}
+
+    def execute(self, task: Any, meta: dict) -> str:
+        desc = _task_desc(task).lower()
+        angle = "camera" if any(w in desc for w in ["camera", "webcam", "face", "me", "selfie"]) else "screen"
+        if "ocr" in desc or "text" in desc:
+            return _vision_analyze(angle=angle, ocr_only=True)
+        if "face" in desc or "identify" in desc:
+            return _vision_analyze(angle=angle, detect_faces=True)
+        if "save" in desc and "photo" in desc:
+            return _vision_analyze(angle="camera", save_reference=True)
+        return _vision_analyze(angle=angle, question="Describe what you see in detail.")
+
+
+# ── CREATIVE AGENT ───────────────────────────────────────────────────────────
+
+class CreativeAgent(BaseAgent):
+    def __init__(self) -> None:
+        super().__init__(AgentType.CREATIVE, "NOVA Creative Agent")
+        self.tools = {"file_processor", "computer_control"}
+        self.replicate_api = os.getenv("REPLICATE_API_TOKEN")
+        self.stability_api = os.getenv("STABILITY_API_KEY")
+        self.openai_api    = os.getenv("OPENAI_API_KEY")
+
+    def execute(self, task: Any, meta: dict) -> str:
+        desc = _task_desc(task).lower()
+        if any(w in desc for w in ["generate image", "create image", "make image", "draw", "generate a picture"]):
+            return self._generate_image(_task_desc(task))
+        if any(w in desc for w in ["edit image", "modify image", "change image", "filter"]):
+            return "Creative Agent: Please provide the image path to edit."
+        if any(w in desc for w in ["generate video", "create video", "make video", "animation"]):
+            return self._generate_video(_task_desc(task))
+        return "Creative Agent: I can generate images, edit photos, and create videos. What would you like me to make?"
+
+    def _generate_image(self, prompt: str) -> str:
+        if self.replicate_api:
+            return self._generate_replicate(prompt)
+        if self.stability_api:
+            return self._generate_stability(prompt)
+        if self.openai_api:
+            return self._generate_openai(prompt)
+        return (
+            "Creative Agent: No image generation API configured. "
+            "Set REPLICATE_API_TOKEN, STABILITY_API_KEY, or OPENAI_API_KEY in .env"
+        )
+
+    def _generate_replicate(self, prompt: str) -> str:
+        try:
+            import replicate  # type: ignore
+            client = replicate.Client(api_token=self.replicate_api)
+            output = client.run(
+                "stability-ai/stable-diffusion:ac732df83cea7fff18b8472768c88ad041fa750ff7682a21f8186097f9e92d55",
+                input={"prompt": prompt, "width": 1024, "height": 1024},
+            )
+            if output and len(output) > 0:
+                img_url  = output[0] if isinstance(output, list) else output
+                img_data = requests.get(img_url, timeout=30).content
+                save_path = Path.home() / "Desktop" / f"nova_generated_{int(time.time())}.png"
+                save_path.write_bytes(img_data)
+                return f"Creative Agent: Generated image saved to {save_path}"
+            return "Creative Agent: Image generation completed but no output received."
+        except Exception as e:
+            return f"Creative Agent: Replicate generation failed: {e}"
+
+    def _generate_stability(self, prompt: str) -> str:
+        try:
+            response = requests.post(
+                "https://api.stability.ai/v2beta/stable-image/generate/sd3",
+                headers={"Authorization": f"Bearer {self.stability_api}", "Accept": "image/*"},
+                files={"none": ("", "")},
+                data={"prompt": prompt, "output_format": "png"},
+                timeout=60,
+            )
+            if response.status_code == 200:
+                save_path = Path.home() / "Desktop" / f"nova_generated_{int(time.time())}.png"
+                save_path.write_bytes(response.content)
+                return f"Creative Agent: Generated image saved to {save_path}"
+            return f"Creative Agent: Stability API error: {response.status_code} — {response.text[:200]}"
+        except Exception as e:
+            return f"Creative Agent: Stability generation failed: {e}"
+
+    def _generate_openai(self, prompt: str) -> str:
+        try:
+            r = requests.post(
+                "https://api.openai.com/v1/images/generations",
+                headers={"Authorization": f"Bearer {self.openai_api}", "Content-Type": "application/json"},
+                json={"model": "dall-e-3", "prompt": prompt, "size": "1024x1024", "n": 1},
+                timeout=60,
+            )
+            img_url  = r.json()["data"][0]["url"]
+            img_data = requests.get(img_url, timeout=30).content
+            save_path = Path.home() / "Desktop" / f"nova_generated_{int(time.time())}.png"
+            save_path.write_bytes(img_data)
+            return f"Creative Agent: Generated image saved to {save_path}"
+        except Exception as e:
+            return f"Creative Agent: OpenAI generation failed: {e}"
+
+    def _generate_video(self, prompt: str) -> str:
+        if self.replicate_api:
+            try:
+                import replicate  # type: ignore
+                client = replicate.Client(api_token=self.replicate_api)
+                output = client.run(
+                    "stability-ai/stable-video-diffusion:3f0457e4619daac51203dedb472816fd4af51f3149fa7a9e0b5ffcf1b8172438",
+                    input={"image": prompt, "frames": 14},
+                )
+                return f"Creative Agent: Video generation initiated. Output: {output}"
+            except Exception as e:
+                return f"Creative Agent: Video generation failed: {e}"
+        return "Creative Agent: Video generation requires REPLICATE_API_TOKEN."
+
+
+# ── RESEARCH AGENT ───────────────────────────────────────────────────────────
+
+class ResearchAgent(BaseAgent):
+    def __init__(self) -> None:
+        super().__init__(AgentType.RESEARCH, "NOVA Research Agent")
+        self.tools = {"web_search", "browser_control"}
+
+    def execute(self, task: Any, meta: dict) -> str:
+        desc = _task_desc(task)
+        if _TOOL_AVAILABILITY.get("web_search"):
+            try:
+                result = _execute_tool_sync("web_search", {"query": desc}, meta)
+                return f"Research Agent: {result}"
+            except Exception as e:
+                return f"Research Agent: Search failed: {e}"
+        return "Research Agent: web_search tool not available."
+
+
+# ── CODE AGENT ───────────────────────────────────────────────────────────────
+
+class CodeAgent(BaseAgent):
+    def __init__(self) -> None:
+        super().__init__(AgentType.CODE, "NOVA Code Agent")
+        self.tools = {"self_editor", "file_controller", "file_processor", "computer_control"}
+
+    def execute(self, task: Any, meta: dict) -> str:
+        desc     = _task_desc(task)
+        desc_low = desc.lower()
+
+        if any(w in desc_low for w in ["edit your code", "fix yourself", "update your"]):
+            return _execute_tool_sync("self_editor", {"action": "read"}, meta)
+
+        if any(w in desc_low for w in ["read file", "open file", "show file", "file content"]):
+            # Fixed regex: proper character class for path matching
+            path_match = re.search(r"[\w\-./\\]+\.[\w]+", desc)
+            if path_match:
+                return _execute_tool_sync(
+                    "file_processor",
+                    {"file_path": path_match.group(), "action": "read"},
+                    meta,
+                )
+
+        if any(w in desc_low for w in ["write file", "create file", "save file"]):
+            return "Code Agent: Please specify the file path and content to write."
+
+        return "Code Agent: I can read, edit, and execute code. What file or operation do you need?"
+
+
+# ── MEMORY AGENT ─────────────────────────────────────────────────────────────
+
+class MemoryAgent(BaseAgent):
+    def __init__(self) -> None:
+        super().__init__(AgentType.MEMORY, "NOVA Memory Agent")
+        self.tools = {"remember_fact"}
+
+    def execute(self, task: Any, meta: dict) -> str:
+        desc     = _task_desc(task)
+        desc_low = desc.lower()
+
+        if any(w in desc_low for w in ["what do you remember", "what do you know", "about me", "my info"]):
+            return get_all_memory_text(meta)
+
+        results = search_memory(desc, top_k=5)
+        if results:
+            return "Memory Agent: Here's what I found:\n" + "\n".join(f"• {r}" for r in results)
+
+        return "Memory Agent: I don't have specific memories about that yet."
+
+
+# ── AGENT REGISTRY ────────────────────────────────────────────────────────────
+
+_orchestrator: Optional[OrchestratorAgent] = None
+
+
+def init_agents() -> OrchestratorAgent:
+    global _orchestrator
+    _orchestrator = OrchestratorAgent()
+    _orchestrator.register_agent(VisionAgent())
+    _orchestrator.register_agent(CreativeAgent())
+    _orchestrator.register_agent(ResearchAgent())
+    _orchestrator.register_agent(CodeAgent())
+    _orchestrator.register_agent(MemoryAgent())
+
+    # v3.4: Register autonomous agents if available
+    try:
+        from nova_agents import (  # noqa: F401
+            BrowserAgent as _BA,
+            MeetingAgent as _MA,
+            SurveillanceAgent as _SA,
+            SpawnAgent as _SPA,
+        )
+        for agent_cls in [_BA, _MA, _SA, _SPA]:
+            try:
+                agent = agent_cls()
+                if isinstance(agent, BaseAgent):
+                    _orchestrator.register_agent(agent)
+                else:
+                    log.warning(
+                        f"{agent_cls.__name__} does not inherit from BaseAgent, skipping registration"
+                    )
+            except Exception as e:
+                log.warning(f"Failed to register {agent_cls.__name__}: {e}")
+        log.info("Agent system initialized — autonomous agents registered (v3.4)")
+    except Exception as e:
+        log.warning(f"Autonomous agent registration failed: {e}")
+        log.info("Agent system initialized — 5 specialist agents registered (autonomous agents not available)")
+
+    return _orchestrator
+
+
+def agent_process(user_request: str, meta: dict) -> Optional[str]:
+    global _orchestrator
+    if _orchestrator is None:
+        init_agents()
+    if _orchestrator is None:
+        return None
+    try:
+        return _orchestrator.route(user_request, meta)
+    except Exception as e:
+        log.warning(f"Agent routing failed: {e}. Falling back to general processing.")
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def is_online(timeout: float = 4.0) -> bool:
+    for host in ("8.8.8.8", "1.1.1.1"):
+        try:
+            socket.setdefaulttimeout(timeout)
+            socket.create_connection((host, 53), timeout=timeout)
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def is_ollama_running() -> bool:
+    try:
+        return requests.get("http://localhost:11434", timeout=2).status_code == 200
+    except Exception:
+        return False
+
+
+def get_local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  NOVA LIVE — Gemini 2.5 Flash Native Audio
+# ══════════════════════════════════════════════════════════════════════════════
+
+class NOVALive:
+    def __init__(self, meta: dict) -> None:
+        self.meta     = meta
+        self.session  = None
+        self.audio_in_queue: Optional[asyncio.Queue] = None
+        self.out_queue:      Optional[asyncio.Queue] = None
+        self._loop           = None
+        self._is_speaking    = False
+        self._speaking_lock  = threading.Lock()
+        self._retry_count    = 0
+        self._turn_done      = False
+        self._has_greeted    = False
+        self._last_speak_end = 0.0
+
+    def _build_config(self) -> Any:
+        mem_ctx    = build_memory_context(self.meta)
+        time_str   = datetime.now().strftime("%A, %B %d, %Y — %I:%M %p")
+        sys_prompt = NOVA_SYSTEM_PROMPT.replace(
+            datetime.now().strftime("%A, %B %d, %Y — %I:%M %p"), time_str
+        )
+        if mem_ctx:
+            sys_prompt += f"\n\n[BACKGROUND MEMORY — only use if user asks about these topics]\n{mem_ctx}"
+        return gtypes.LiveConnectConfig(
+            response_modalities=[gtypes.Modality.AUDIO],
+            output_audio_transcription=gtypes.AudioTranscriptionConfig(),
+            input_audio_transcription=gtypes.AudioTranscriptionConfig(),
+            system_instruction=sys_prompt,
+            tools=[{"function_declarations": TOOL_DECLARATIONS}],
+            session_resumption=gtypes.SessionResumptionConfig(),
+            speech_config=gtypes.SpeechConfig(
+                voice_config=gtypes.VoiceConfig(
+                    prebuilt_voice_config=gtypes.PrebuiltVoiceConfig(voice_name=NOVA_VOICE)
+                )
+            ),
+        )
+
+    def _set_speaking(self, value: bool) -> None:
+        with self._speaking_lock:
+            self._is_speaking = value
+            if not value:
+                self._last_speak_end = time.time()
+        state = "🔊 SPEAKING" if value else "🎙️  LISTENING"
+        print(f"\r{state}  ", end="", flush=True)
+
+    def speak(self, text: str) -> None:
+        if not self._loop or not self.session:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self.session.send_client_content(
+                turns={"parts": [{"text": text}]}, turn_complete=True
+            ),
+            self._loop,
+        )
+
+    async def _send_greeting(self) -> None:
+        """Fires once per process — greets proactively instead of waiting in silence."""
+        if self.session is None:
+            return
+        await asyncio.sleep(0.4)  # let _receive_audio start consuming first
+        user_name = (self.meta.get("user_name") or "").strip()
+        name_part = user_name if user_name else "there"
+        prompt = (
+            f"The user just opened this session. Greet {name_part} right now, out loud, "
+            "in 1-2 short spoken sentences — warm, a little informal, Nigerian-aware where "
+            "it fits naturally. Vary your phrasing each time, don't reuse a stock line. "
+            "End by asking what's on their mind or what you can help with today. "
+            "Do not wait for them to speak first."
+        )
+        try:
+            await self.session.send_client_content(
+                turns={"parts": [{"text": prompt}]}, turn_complete=True
+            )
+        except Exception as e:
+            print(f"[NOVA] ⚠️ Greeting failed: {e}")
+
+    async def _execute_tool(self, fc: Any) -> Any:
+        name   = fc.name
+        args   = dict(fc.args or {})
+        print(f"\n🔧 Tool: {name}({json.dumps(args, ensure_ascii=False)[:100]})")
+        loop   = asyncio.get_event_loop()
+        result = "Done."
+        try:
+            result = await loop.run_in_executor(
+                _executor, lambda: _execute_tool_sync(name, args, self.meta)
+            )
+            if name == "remember_fact" and args.get("fact"):
+                add_memory_fact(args["fact"], self.meta)
+            if name in (
+                "open_app", "computer_control", "computer_settings",
+                "file_controller", "browser_control", "file_processor",
+                "autostart", "planner", "self_editor",
+            ):
+                self.speak(f"Done. {str(result)[:120]}")
+        except Exception as e:
+            log.exception(f"Tool failed: {name}")
+            result = f"Tool '{name}' encountered an error: {str(e)[:100]}"
+            self.speak(f"Sorry, {name} failed. {str(e)[:80]}")
+        print(f"📤 Result: {str(result)[:120]}")
+        response = result if isinstance(result, dict) else {"output": str(result)}
+        return gtypes.FunctionResponse(id=fc.id, name=name, response=response)
+
+    async def _send_realtime(self) -> None:
+        if self.session is None or self.out_queue is None:
+            return
+        while True:
+            msg = await self.out_queue.get()
+            if self.session is None:
+                continue
+            try:
+                await self.session.send_realtime_input(media=msg)
+            except Exception as e:
+                print(f"[NOVA] ⚠️ send_realtime_input failed: {e}")
+
+    async def _listen_audio(self) -> None:
+        print("🎙️  Mic open")
+        loop      = asyncio.get_event_loop()
+        out_queue = self.out_queue
+        if out_queue is None:
+            raise RuntimeError("out_queue not initialized")
+
+        _silence_chunk: bytes = bytes(CHUNK_SIZE * 2)  # 16-bit = 2 bytes/sample
+
+        def _callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
+            with self._speaking_lock:
+                speaking = self._is_speaking
+                too_soon = (time.time() - self._last_speak_end) < 0.25
+
+            if speaking or too_soon:
+                # Send silence to keep Gemini WS alive (prevents 1011 keepalive timeout)
+                data = {"data": _silence_chunk, "mime_type": "audio/pcm"}
+            else:
+                data = {"data": indata.tobytes(), "mime_type": "audio/pcm"}
+
+            def _safe_put() -> None:
+                try:
+                    out_queue.put_nowait(data)
+                except asyncio.QueueFull:
+                    pass
+
+            loop.call_soon_threadsafe(_safe_put)
+
+        try:
+            with sd.InputStream(
+                samplerate=SEND_SAMPLE_RATE, channels=CHANNELS, dtype="int16",
+                blocksize=CHUNK_SIZE, callback=_callback,
+            ):
+                print("🎙️  Mic stream active — echo suppressed during playback")
+                while True:
+                    await asyncio.sleep(0.1)
+        except Exception as e:
+            print(f"❌ Mic error: {e}")
+            raise
+
+    async def _receive_audio(self) -> None:
+        print("👂 Receiving...")
+        out_buf: List[str] = []
+        in_buf:  List[str] = []
+        try:
+            while True:
+                if self.session is None:
+                    break
+                async for response in self.session.receive():
+                    if response is None:
+                        continue
+                    if response.data and self.audio_in_queue is not None:
+                        self._set_speaking(True)
+                        self.audio_in_queue.put_nowait(response.data)
+                    if response.server_content:
+                        sc = response.server_content
+                        if sc and sc.output_transcription and sc.output_transcription.text:
+                            self._set_speaking(True)
+                            txt = sc.output_transcription.text.strip()
+                            if txt:
+                                out_buf.append(txt)
+                        if sc and sc.input_transcription and sc.input_transcription.text:
+                            txt = sc.input_transcription.text.strip()
+                            if txt:
+                                in_buf.append(txt)
+                        if sc and sc.turn_complete:
+                            self._turn_done = True
+                            self._set_speaking(False)
+                            full_in = " ".join(in_buf).strip()
+                            if full_in:
+                                print(f"\n👤 You: {full_in}")
+                            in_buf = []
+                            full_out = " ".join(out_buf).strip()
+                            if full_out:
+                                print(f"🤖 NOVA: {full_out}")
+                            out_buf = []
+                            if _nova_memory and (full_in or full_out):
+                                if full_in:
+                                    _nova_memory.log_turn("user", full_in)
+                                if full_out:
+                                    _nova_memory.log_turn("assistant", full_out)
+                            if full_in and len(full_in) > 5:
+                                global _mem_extract_turn_counter
+                                _mem_extract_turn_counter += 1
+                                if _mem_extract_turn_counter % _MEM_EXTRACT_EVERY_N == 0:
+                                    threading.Thread(
+                                        target=lambda u=full_in, a=full_out: extract_memory_updates(u, a, self.meta),
+                                        daemon=True,
+                                    ).start()
+                    if response.tool_call and response.tool_call.function_calls:
+                        responses = []
+                        for fc in response.tool_call.function_calls:
+                            fr = await self._execute_tool(fc)
+                            responses.append(fr)
+                        if self.session is not None:
+                            try:
+                                await self.session.send_tool_response(function_responses=responses)
+                            except Exception as e:
+                                print(f"[NOVA] ⚠️ send_tool_response failed: {e}")
+                                # Don't re-raise — keep the loop alive
+        except Exception:
+            traceback.print_exc()
+            self._set_speaking(False)
+            raise
+
+    async def _play_audio(self) -> None:
+        if self.audio_in_queue is None:
+            raise RuntimeError("audio_in_queue not initialized")
+        import queue as _q
+        _play_q: _q.Queue = _q.Queue(maxsize=200)
+
+        def _play_worker() -> None:
+            # Dedicated thread — no asyncio overhead per chunk
+            stream = sd.RawOutputStream(
+                samplerate=RECEIVE_SAMPLE_RATE, channels=CHANNELS,
+                dtype="int16",
+                blocksize=CHUNK_SIZE * 4,   # larger block = smoother playback
+                latency="low",
+            )
+            stream.start()
+            try:
+                while True:
+                    chunk = _play_q.get()
+                    if chunk is None:
+                        break
+                    try:
+                        stream.write(chunk)
+                    except Exception:
+                        pass
+            finally:
+                stream.stop()
+                stream.close()
+
+        _pt = threading.Thread(target=_play_worker, daemon=True, name="AudioPlay")
+        _pt.start()
+        print("🔊 Speaker ready")
+        try:
+            while True:
+                chunk = await self.audio_in_queue.get()
+                self._set_speaking(True)
+                try:
+                    _play_q.put_nowait(chunk)
+                except _q.Full:
+                    pass   # drop oldest would be better but put_nowait is safe
+                if self.audio_in_queue.empty() and self._turn_done:
+                    self._set_speaking(False)
+                    self._turn_done = False
+        except Exception as e:
+            print(f"❌ Playback error: {e}")
+            raise
+        finally:
+            _play_q.put(None)   # signal worker to stop
+            self._set_speaking(False)
+
+    def _finish_turn(self, audio_in_queue) -> None:
+        """Called when NOVA finishes speaking — reset state and signal Gemini."""
+        self._set_speaking(False)
+        
+        # Signal turn completion to Gemini
+        if self.session is not None and self._loop is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self.session.send_client_content(turns=[], turn_complete=True),
+                    self._loop
+                )
+                print("[NOVA] 📤 Turn complete signal sent")
+            except Exception as e:
+                print(f"[NOVA] ⚠️ Turn signal failed: {e}")
+        
+        # Drain any echo/stale audio
+        drained = 0
+        while not audio_in_queue.empty():
+            try:
+                audio_in_queue.get_nowait()
+                drained += 1
+            except asyncio.QueueEmpty:
+                break
+        if drained:
+            print(f"[NOVA] Drained {drained} stale chunks")
+        
+        print("\n🎙️  LISTENING — speak now...")
+
+    async def run(self) -> str:
+        client = genai.Client(api_key=GEMINI_API_KEY, http_options={"api_version": "v1beta"})
+        self._retry_count = 0  # Reset once at start
+        while True:
+            if not is_online():
+                print("[NOVA] 📴 No internet connection. Switching to offline mode...")
+                return "offline"
+            try:
+                print("\n[NOVA] 🔌 Connecting to Gemini Live...")
+                config = self._build_config()
+                async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session, asyncio.TaskGroup() as tg:
+                    self.session        = session
+                    self._loop          = asyncio.get_event_loop()
+                    self.audio_in_queue = asyncio.Queue()
+                    self.out_queue      = asyncio.Queue(maxsize=20)
+                    # NO retry reset here!
+                    print("[NOVA] ✅ Gemini Live connected.")
+                    print("[NOVA] 🎙️  Speak to NOVA — say 'goodbye NOVA' to exit.\n")
+                    tg.create_task(self._send_realtime())
+                    tg.create_task(self._listen_audio())
+                    tg.create_task(self._receive_audio())
+                    tg.create_task(self._play_audio())
+                    # Always greet on each new connection (reconnects feel alive)
+                    tg.create_task(self._send_greeting())
+            except KeyboardInterrupt:
+                print("\n[NOVA] 🔴 Shutting down.")
+                return "exit"
+            except Exception as e:
+                import traceback
+                sub_errors = getattr(e, "exceptions", None)
+                if sub_errors is not None:
+                    print(f"[NOVA] ⚠️  Connection error: {e}")
+                    for sub in sub_errors:
+                        print(f"[NOVA] 📋 Sub-error: {sub}")
+                        traceback.print_exception(type(sub), sub, sub.__traceback__)
+                else:
+                    print(f"[NOVA] ⚠️  Connection error: {e}")
+                    traceback.print_exception(type(e), e, e.__traceback__)
+                self._retry_count += 1
+                self._set_speaking(False)
+                if self.session is not None:
+                    try:
+                        await self.session.close()
+                    except Exception:
+                        pass
+                self.audio_in_queue = None
+                self.out_queue = None
+                self.session = None
+                self._loop = None
+                if self._retry_count >= MAX_GEMINI_RETRIES:
+                    print(f"[NOVA] ⚠️  Gemini unreachable after {self._retry_count} retries. Falling back to offline...")
+                    return "offline"
+                wait_s = min(3 * self._retry_count, 12)
+                print(f"[NOVA] 🔄 Reconnecting in {wait_s}s... (attempt {self._retry_count}/{MAX_GEMINI_RETRIES})")
+                await asyncio.sleep(wait_s)
+        return "offline"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  OFFLINE BRAIN — OVERHAULED v4.0
+#  - Fixed tool calling for Ollama
+#  - Fixed agent hijacking
+#  - Added offline Wikipedia (ZIM)
+#  - Added offline maps
+#  - Unified mic loop with online mode
+#  - Proper state machine
+# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  MISSING CORE FUNCTIONS (restored from bak)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _call_gemini_chat(
+    messages: List[Dict[str, Any]],
+    use_tools: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Gemini REST chat — converts OpenAI-style messages to Gemini format.
+    Returns {"text": str, "tool_calls": list} or None on failure."""
+    if not (HAS_GEMINI and GEMINI_API_KEY):
+        return None
+    if _is_rate_limited():
+        return None
+    try:
+        client   = genai.Client(api_key=GEMINI_API_KEY)
+        contents: List[Any] = []
+        system_txt = ""
+
+        for msg in messages:
+            role    = msg.get("role", "user")
+            content = msg.get("content") or ""
+            if role == "system":
+                system_txt = content
+                continue
+            gemini_role = "model" if role == "assistant" else "user"
+            # gtypes.Part.from_text may not accept positional args in some genai versions;
+            # construct Part using keyword 'text' for compatibility.
+            contents.append(
+                gtypes.Content(role=gemini_role, parts=[gtypes.Part(text=content)])
+            )
+
+        cfg_kwargs: Dict[str, Any] = {}
+        if system_txt:
+            cfg_kwargs["system_instruction"] = system_txt
+        if use_tools and TOOL_DECLARATIONS:
+            cfg_kwargs["tools"] = [{"function_declarations": TOOL_DECLARATIONS}]
+
+        response = _gemini_generate_with_delay(
+            client,
+            model=VISION_MODEL,
+            contents=contents,
+            config=gtypes.GenerateContentConfig(**cfg_kwargs) if cfg_kwargs else None,
+        )
+        _reset_rate_limit()
+
+        text: str = (response.text or "").strip()
+        tool_calls: List[Dict[str, Any]] = []
+
+        for cand in (response.candidates or []):
+            for part in (getattr(cand.content, "parts", None) or []):
+                fc = getattr(part, "function_call", None)
+                if fc:
+                    tool_calls.append({
+                        "id":   str(int(time.time())),
+                        "name": fc.name,
+                        "args": dict(fc.args or {}),
+                    })
+
+        return {"text": text, "tool_calls": tool_calls}
+
+    except Exception as e:
+        err = str(e)
+        if "429" in err or "RESOURCE_EXHAUSTED" in err:
+            _record_rate_limit()
+        else:
+            log.error(f"Gemini chat error: {e}")
+        return None
+
+
+def _trim_history() -> None:
+    """Trim conversation_history to the last MAX_HISTORY_TURNS pairs."""
+    global conversation_history
+    max_entries = MAX_HISTORY_TURNS * 2
+    if len(conversation_history) > max_entries:
+        conversation_history = conversation_history[-max_entries:]
+
+
+def get_text_input() -> str:
+    """Read a line of text from the keyboard."""
+    try:
+        return input("You: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return ""
+
+
+def _load_whisper_async() -> None:
+    """Load faster-whisper STT model in a background thread."""
+    global _stt_model
+    if not HAS_FASTER_WHISPER:
+        log.warning("faster-whisper not installed — STT unavailable.")
+        _stt_loaded.set()
+        return
+    try:
+        log.info(f"Loading Whisper model ({WHISPER_MODEL_SIZE})...")
+        with _stt_model_lock:
+            _stt_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+        log.info("✅ Whisper model loaded.")
+    except Exception as e:
+        log.error(f"Whisper load failed: {e}")
+    finally:
+        _stt_loaded.set()
+
+
+def calibrate_ambient_noise(duration: float = 2.5, fs: int = 16000) -> float:
+    """Record a short silence sample and set AMBIENT_THRESHOLD."""
+    global AMBIENT_THRESHOLD
+    try:
+        print(f"🎙️  Calibrating ambient noise ({duration}s) — stay quiet...")
+        recording = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype="float32")
+        sd.wait()
+        rms = float(np.sqrt(np.mean(recording ** 2)))
+        AMBIENT_THRESHOLD = max(rms * 2.5, DEFAULT_THRESHOLD)
+        print(f"✅ Threshold set: {AMBIENT_THRESHOLD:.4f}")
+        return AMBIENT_THRESHOLD
+    except Exception as e:
+        log.warning(f"Calibration failed: {e} — using default threshold.")
+        AMBIENT_THRESHOLD = DEFAULT_THRESHOLD
+        return AMBIENT_THRESHOLD
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  OFFLINE BRAIN — OVERHAULED v4.0
+# ─── CONFIGURATION ───────────────────────────────────────────────────────────
+
+OFFLINE_MODELS = ["tinyllama", "llama3.2", "phi3", "mistral"]
+OFFLINE_TIMEOUTS = {"tinyllama": 15, "llama3.2": 30, "phi3": 30, "mistral": 45}
+
+# ZIM/Wikipedia paths
+ZIM_DATA_PATH = os.path.expanduser("~/project-nova/data/zim")
+OFFLINE_MAPS_PATH = os.path.expanduser("~/project-nova/data/maps")
+
+# Tool declarations for Ollama (must match Ollama's expected format)
+OLLAMA_TOOL_FORMAT = {
+    "type": "function",
+    "function": {
+        "name": "",
+        "description": "",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    }
+}
+
+# ─── OFFLINE STATE MACHINE ─────────────────────────────────────────────────────
+
+class OfflineState:
+    IDLE = "IDLE"
+    LISTENING = "LISTENING"
+    PROCESSING = "PROCESSING"
+    SPEAKING = "SPEAKING"
+    THINKING = "THINKING"
+
+_offline_state = OfflineState.IDLE
+_offline_state_lock = threading.Lock()
+_tts_queue = queue.Queue()
+_tts_done_event = threading.Event()
+
+def set_offline_state(state: str):
+    global _offline_state
+    with _offline_state_lock:
+        _offline_state = state
+    print(f"   [{state}]")
+
+def get_offline_state() -> str:
+    with _offline_state_lock:
+        return _offline_state
+
+# ─── OFFLINE TTS ENGINE (NON-BLOCKING) ────────────────────────────────────────
+
+def _offline_tts_worker():
+    """Background thread for offline TTS. Never blocks the main loop."""
+    while True:
+        item = _tts_queue.get()
+        if item is None:  # Shutdown signal
+            break
+        text, done_event = item
+        set_offline_state(OfflineState.SPEAKING)
+        _speak_offline_impl(text)
+        set_offline_state(OfflineState.LISTENING)
+        done_event.set()
+
+# Start TTS worker
+_tts_thread = threading.Thread(target=_offline_tts_worker, daemon=True)
+_tts_thread.start()
+
+def speak_offline(text: str, block: bool = False) -> None:
+    """
+    Queue text for speaking. Non-blocking by default.
+    If block=True, waits until speech completes.
+    """
+    print(f"\n🔊 NOVA: {text}\n")
+    _broadcast_ui({"type": "nova_speak", "text": text})
+    
+    done_event = threading.Event()
+    _tts_queue.put((text, done_event))
+    
+    if block:
+        done_event.wait()
+
+def _speak_offline_impl(text: str) -> None:
+    if not _speak_pyttsx3(text):
+        if not _speak_piper(text):
+            log.warning("TTS failed — text only.")
+
+
+def _speak_pyttsx3(text: str) -> bool:
+    try:
+        engine = pyttsx3.init()
+        engine.setProperty("rate", TTS_RATE)
+        engine.setProperty("volume", TTS_VOLUME)
+        voices = engine.getProperty("voices")
+        if voices is None:
+            voices = []
+        elif not isinstance(voices, (list, tuple, set)):
+            voices = [voices]
+        for v in voices:
+            name = getattr(v, "name", None)
+            vid = getattr(v, "id", None)
+            if isinstance(name, str) and isinstance(vid, str) and "english" in name.lower():
+                engine.setProperty("voice", vid)
+                break
+        engine.say(text)
+        engine.runAndWait()
+        engine.stop()
+        return True
+    except Exception as e:
+        log.error(f"pyttsx3: {e}")
+        return False
+
+def _speak_piper(text: str) -> bool:
+    if not os.path.exists(PIPER_MODEL) or not PIPER_MODEL.endswith(".onnx"):
+        return False
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "piper", "--model", PIPER_MODEL, "--output-raw"],
+            input=text.encode(), capture_output=True, timeout=15, shell=False,
+        )
+        if result.returncode != 0 or not result.stdout:
+            return False
+        audio = np.frombuffer(result.stdout, dtype=np.int16)
+        if len(audio) == 0:
+            return False
+        sd.play(audio, samplerate=PIPER_RATE)
+        sd.wait()
+        return True
+    except Exception as e:
+        log.error(f"Piper: {e}")
+        return False
+
+# ─── OFFLINE STT — UNIFIED MIC LOOP (same as online) ─────────────────────────
+
+def listen_offline() -> str:
+    """
+    Offline listening with proper state management.
+    Uses the same calibrated threshold approach as online mode.
+    """
+    global _offline_state
+    
+    if get_offline_state() == OfflineState.SPEAKING:
+        # Don't listen while speaking
+        return ""
+    
+    set_offline_state(OfflineState.LISTENING)
+    
+    fs = 16000
+    chunk_size = 1024
+    threshold = AMBIENT_THRESHOLD or DEFAULT_THRESHOLD
+    silence_limit = 1.8
+    min_speech = 0.6
+    max_record = 12.0
+    
+    max_silent = int((fs / chunk_size) * silence_limit)
+    min_speech_r = int((fs / chunk_size) * min_speech)
+    max_total = int((fs / chunk_size) * max_record)
+    
+    print(f"\n🎙️  LISTENING... (threshold: {threshold:.4f})")
+    
+    recorded = []
+    silent = 0
+    speech = 0
+    is_recording = False
+    
+    try:
+        with sd.InputStream(samplerate=fs, channels=1, dtype="float32", blocksize=chunk_size) as stream:
+            while True:
+                chunk, _ = stream.read(chunk_size)
+                vol = float(np.sqrt(np.mean(chunk ** 2)))
+                
+                # State visualization
+                if vol > threshold:
+                    if not is_recording:
+                        is_recording = True
+                        print("🟢 SPEECH DETECTED")
+                    speech += 1
+                    silent = 0
+                    recorded.append(chunk.copy())
+                else:
+                    if is_recording:
+                        recorded.append(chunk.copy())
+                        silent += 1
+                    else:
+                        # Still buffering pre-speech for context
+                        recorded.append(chunk.copy())
+                        if len(recorded) > int((fs / chunk_size) * 0.5):  # Keep 0.5s buffer
+                            recorded.pop(0)
+                
+                # Check end conditions
+                if silent >= max_silent and speech >= min_speech_r:
+                    print("🔇 Silence detected, processing...")
+                    break
+                if len(recorded) >= max_total and is_recording:
+                    print("⏱️ Max recording time reached")
+                    break
+                    
+    except Exception as e:
+        print(f"❌ Mic error: {e}")
+        set_offline_state(OfflineState.IDLE)
+        return ""
+    
+    if speech < min_speech_r:
+        print("🔇 No speech detected.")
+        set_offline_state(OfflineState.IDLE)
+        return ""
+    
+    # Process audio
+    audio = np.concatenate(recorded, axis=0)
+    audio_i16 = (audio * 32767).astype(np.int16)
+    
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_path = tmp.name
+        wav_write(tmp_path, fs, audio_i16)
+    
+    print("🔍 Transcribing with faster-whisper...")
+    set_offline_state(OfflineState.THINKING)
+    
+    try:
+        if not _stt_loaded.wait(timeout=10):
+            print("⚠️  Whisper not loaded yet — skipping.")
+            return ""
+        with _stt_model_lock:
+            if _stt_model is None:
+                return ""
+            segments, _ = _stt_model.transcribe(
+                tmp_path,
+                language="en",
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
+                condition_on_previous_text=False,
+            )
+            transcript = " ".join([seg.text.strip() for seg in segments]).strip()
+            print(f"📝 Heard: {transcript}")
+            return transcript
+    except Exception as e:
+        print(f"⚠️  Transcription error: {e}")
+        return ""
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+# ─── OFFLINE TOOL SYSTEM ───────────────────────────────────────────────────────
+
+# Tool definitions in Ollama format
+OLLAMA_TOOLS = []
+
+def _build_ollama_tools():
+    """Convert tool declarations to Ollama-compatible format."""
+    tools = []
+    for decl in TOOL_DECLARATIONS:
+        if decl["name"] == "remember_fact":
+            continue  # Skip memory tools for now
+            
+        tool = {
+            "type": "function",
+            "function": {
+                "name": decl["name"],
+                "description": decl.get("description", ""),
+                "parameters": {
+                    "type": "object",
+                    "properties": decl.get("parameters", {}).get("properties", {}),
+                    "required": decl.get("parameters", {}).get("required", [])
+                }
+            }
+        }
+        tools.append(tool)
+    return tools
+
+# ─── OFFLINE WIKIPEDIA (ZIM) ─────────────────────────────────────────────────
+
+class OfflineWiki:
+    """Offline Wikipedia using ZIM files."""
+    
+    def __init__(self, data_path: str = ZIM_DATA_PATH):
+        self.data_path = Path(data_path)
+        self.zim_files = list(self.data_path.glob("*.zim"))
+        self.libzim_available = False
+        
+        try:
+            import libzim
+            archive_cls = getattr(libzim, "Archive", None) or getattr(libzim, "ZimFile", None)
+            if archive_cls is None:
+                log.warning("libzim does not expose Archive or ZimFile. Offline Wikipedia unavailable.")
+                self.libzim_available = False
+                self._readers = {}
+                return
+
+            self.libzim_available = True
+            self._readers = {}
+            for zim_file in self.zim_files:
+                try:
+                    self._readers[zim_file.stem] = archive_cls(str(zim_file))
+                except Exception as e:
+                    log.warning(f"Failed to load ZIM {zim_file}: {e}")
+        except ImportError:
+            log.warning("libzim not installed. Offline Wikipedia unavailable.")
+            log.warning("Install: pip install libzim")
+    
+    def search(self, query: str, limit: int = 3) -> List[Dict[str, str]]:
+        """Search offline Wikipedia."""
+        if not self.libzim_available or not self._readers:
+            return []
+        
+        results = []
+        
+        for name, reader in self._readers.items():
+            try:
+                # Try exact entry first
+                entry = reader.get_entry_by_path(query.replace(" ", "_"))
+                if entry:
+                    content = entry.get_item().content
+                    results.append({
+                        "source": f"Wikipedia ({name})",
+                        "title": query,
+                        "content": content[:2000]  # First 2000 chars
+                    })
+                    continue
+                
+                # Fallback: search suggestions (limited in libzim)
+                suggestions = list(reader.get_suggestions(query, limit=limit))
+                for suggestion in suggestions:
+                    entry = reader.get_entry_by_path(suggestion[0])
+                    if entry:
+                        content = entry.get_item().content
+                        results.append({
+                            "source": f"Wikipedia ({name})",
+                            "title": suggestion[0].replace("_", " "),
+                            "content": content[:2000]
+                        })
+                        
+            except Exception as e:
+                log.debug(f"ZIM search error: {e}")
+                continue
+        
+        return results
+
+_offline_wiki = None
+
+def get_offline_wiki() -> OfflineWiki:
+    global _offline_wiki
+    if _offline_wiki is None:
+        _offline_wiki = OfflineWiki()
+    return _offline_wiki
+
+# ─── OFFLINE MAPS ──────────────────────────────────────────────────────────────
+
+class OfflineMaps:
+    """Offline maps using OpenStreetMap data (MBTiles or OSM.PBF)."""
+    
+    def __init__(self, maps_path: str = OFFLINE_MAPS_PATH):
+        self.maps_path = Path(maps_path)
+        self.mbtiles_files = list(self.maps_path.glob("*.mbtiles"))
+        self.has_maps = len(self.mbtiles_files) > 0
+        
+        if not self.has_maps:
+            log.info("No offline maps found. Place .mbtiles files in " + maps_path)
+    
+    def search_location(self, query: str) -> List[Dict[str, Any]]:
+        """Search for locations in offline map data."""
+        if not self.has_maps:
+            return []
+        
+        results = []
+        try:
+            import sqlite3
+            for mbtile in self.mbtiles_files:
+                conn = sqlite3.connect(str(mbtile))
+                cursor = conn.cursor()
+                
+                # Search in MBTiles metadata and tiles
+                cursor.execute("""
+                    SELECT zoom_level, tile_column, tile_row, tile_data 
+                    FROM tiles 
+                    LIMIT 1
+                """)
+                
+                # For proper geocoding, we'd need a spatialite extension
+                # This is a basic implementation
+                results.append({
+                    "source": str(mbtile.name),
+                    "query": query,
+                    "note": "Basic offline map search. For full geocoding, install spatialite."
+                })
+                conn.close()
+        except Exception as e:
+            log.error(f"Offline map search error: {e}")
+        
+        return results
+
+_offline_maps = None
+
+def get_offline_maps() -> OfflineMaps:
+    global _offline_maps
+    if _offline_maps is None:
+        _offline_maps = OfflineMaps()
+    return _offline_maps
+
+# ─── OFFLINE TOOL EXECUTION ──────────────────────────────────────────────────
+
+def _execute_offline_tool(name: str, args: Dict[str, Any], meta: dict) -> str:
+    """Execute tools in offline mode with offline-aware fallbacks."""
+    
+    # Offline Wikipedia fallback for web_search
+    if name == "web_search":
+        query = args.get("query", "")
+        wiki_results = get_offline_wiki().search(query)
+        if wiki_results:
+            return json.dumps({
+                "offline": True,
+                "source": "Wikipedia (ZIM)",
+                "results": wiki_results
+            }, indent=2)
+        return "No internet and no offline Wikipedia data available. I can't search for that right now."
+    
+    # Offline maps fallback for location queries
+    if name in ["get_location", "find_place", "navigate"]:
+        query = args.get("query", args.get("destination", ""))
+        map_results = get_offline_maps().search_location(query)
+        if map_results:
+            return json.dumps({
+                "offline": True,
+                "source": "Offline Maps",
+                "results": map_results
+            }, indent=2)
+        return "No internet and no offline map data available for that location."
+    
+    # File operations work offline
+    if name in ["read_file", "write_file", "list_directory", "run_shell"]:
+        return _execute_tool_sync(name, args, meta)
+    
+    # Self-editing works offline
+    if name == "self_editor":
+        return _execute_tool_sync(name, args, meta)
+    
+    # Planner works offline
+    if name == "planner":
+        return _execute_tool_sync(name, args, meta)
+    
+    # Memory works offline
+    if name == "remember_fact":
+        return _execute_tool_sync(name, args, meta)
+    
+    # For tools that absolutely need internet
+    internet_required = ["web_search", "send_email", "get_weather", "download_file"]
+    if name in internet_required:
+        return f"❌ Tool '{name}' requires internet connection. Currently offline."
+    
+    # Default: try anyway
+    return _execute_tool_sync(name, args, meta)
+
+# ─── OFFLINE LLM CALLERS ─────────────────────────────────────────────────────
+
+def _call_ollama_v2(
+    model: str,
+    messages: List[Dict[str, Any]],
+    use_tools: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """
+    v2: Fixed Ollama tool calling.
+    Ollama uses 'tools' array with specific format, not OpenAI format.
+    """
+    timeout = OFFLINE_TIMEOUTS.get(model, 20)
+    
+    try:
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": 0.7,
+                "num_predict": 1024,
+            }
+        }
+        
+        # Only add tools for capable models
+        if use_tools and model not in ["tinyllama"]:
+            tools = _build_ollama_tools()
+            if tools:
+                payload["tools"] = tools
+        
+        r = requests.post(
+            "http://localhost:11434/api/chat",
+            json=payload,
+            timeout=timeout
+        )
+        r.raise_for_status()
+        data = r.json()
+        message = data.get("message", {})
+        
+        # Parse tool calls from Ollama response
+        tool_calls = []
+        raw_tool_calls = message.get("tool_calls") or []
+        
+        for tc in raw_tool_calls:
+            if isinstance(tc, dict) and "function" in tc:
+                func = tc["function"]
+                args = func.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                tool_calls.append({
+                    "id": tc.get("id") or str(int(time.time())),
+                    "name": func.get("name", ""),
+                    "args": args,
+                })
+        
+        return {
+            "text": message.get("content", "").strip(),
+            "tool_calls": tool_calls,
+            "raw_message": message,
+        }
+        
+    except requests.exceptions.Timeout:
+        log.warning(f"Ollama/{model} timed out after {timeout}s.")
+        return None
+    except requests.exceptions.ConnectionError:
+        log.warning(f"Ollama/{model} not running. Start with: ollama serve")
+        return None
+    except Exception as e:
+        log.warning(f"Ollama/{model} failed: {e}")
+        return None
+
+
+def _get_offline_response_v2(
+    messages: List[Dict[str, Any]],
+    use_tools: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """
+    v2: Fixed offline brain with proper tool handling.
+    Priority: Gemini REST → Ollama with tools → Ollama without tools.
+    """
+    # Try Gemini first if online
+    if is_online() and HAS_GEMINI and GEMINI_API_KEY:
+        print("🌐 [Gemini REST]...")
+        result = _call_gemini_chat(messages, use_tools=use_tools)
+        if result:
+            return result
+        print("⚠️  Gemini failed → local brain...")
+    
+    print("📴 Offline — using local brain...")
+    
+    if not is_ollama_running():
+        print("❌ Ollama not running. Start: ollama serve")
+        return None
+    
+    # Try models with tools first
+    for model in OFFLINE_MODELS:
+        if model == "tinyllama":
+            continue  # Skip tinyllama for tool calls
+            
+        timeout = OFFLINE_TIMEOUTS.get(model, 20)
+        print(f"🔌 [{model}] with tools... (max {timeout}s)")
+        
+        # Use slim prompt for offline models
+        slim = [{"role": "system", "content": NOVA_OFFLINE_PROMPT}] + messages[1:]
+        result = _call_ollama_v2(model, slim, use_tools=True)
+        
+        if result:
+            print(f"✅ {model} responded.")
+            return result
+        print(f"⚠️  {model} failed or timed out.")
+    
+    # Fallback: try without tools
+    for model in OFFLINE_MODELS:
+        timeout = OFFLINE_TIMEOUTS.get(model, 20)
+        print(f"🔌 [{model}] conversation only... (max {timeout}s)")
+        
+        slim = [{"role": "system", "content": NOVA_OFFLINE_PROMPT}] + messages[1:]
+        result = _call_ollama_v2(model, slim, use_tools=False)
+        
+        if result:
+            print(f"✅ {model} responded (no tools).")
+            return result
+        print(f"⚠️  {model} failed.")
+    
+    return None
+
+# ─── OFFLINE THINKING — FIXED AGENT HIJACKING ───────────────────────────────
+
+def think_offline_v2(user_message: str, meta: dict) -> str:
+    """
+    v2: Fixed offline thinking.
+    - Agent only handles specific dev tasks, not everything
+    - Proper tool execution with offline fallbacks
+    - Memory integration
+    """
+    global conversation_history
+    
+    # [FIX] Agent only for specific patterns, not hijacking
+    dev_patterns = [
+        "write code", "create file", "edit file", "fix bug", 
+        "debug", "refactor", "code review", "implement"
+    ]
+    is_dev_request = any(p in user_message.lower() for p in dev_patterns)
+    
+    if is_dev_request:
+        agent_result = agent_process(user_message, meta)
+        if agent_result and "DEV AGENT" not in agent_result:
+            # Agent actually did something useful
+            conversation_history.append({"role": "user", "content": user_message})
+            conversation_history.append({"role": "assistant", "content": agent_result})
+            _trim_history()
+            return agent_result
+    
+    # Normal LLM flow
+    conversation_history.append({"role": "user", "content": user_message})
+    
+    # Build memory context
+    mem_ctx = build_memory_context(meta, query=user_message)
+    sys_content = NOVA_OFFLINE_PROMPT
+    if mem_ctx:
+        sys_content += f"\n\nMEMORY:\n{mem_ctx}"
+    
+    # Add offline capability awareness
+    sys_content += "\n\nOFFLINE CAPABILITIES: You have access to offline Wikipedia (ZIM) and offline maps. Use them when relevant."
+    
+    messages = [{"role": "system", "content": sys_content}] + conversation_history
+    
+    # Get LLM response
+    result = _get_offline_response_v2(messages, use_tools=True)
+    
+    if result is None:
+        err = "All brain engines offline. Check your connection or start Ollama."
+        conversation_history.append({"role": "assistant", "content": err})
+        _trim_history()
+        return err
+    
+    # Handle tool calls
+    if result["tool_calls"]:
+        print(f"🔧 Tool calls detected: {[tc['name'] for tc in result['tool_calls']]}")
+        
+        # Build follow-up messages
+        followup = list(messages) + [result["raw_message"]]
+        
+        for tc in result["tool_calls"]:
+            tool_name = tc["name"]
+            tool_args = tc["args"]
+            
+            print(f"   Executing: {tool_name}({json.dumps(tool_args)[:100]})")
+            
+            # Use offline-aware execution
+            tool_result = _execute_offline_tool(tool_name, tool_args, meta)
+            print(f"   Result: {tool_result[:200]}...")
+            
+            # Add to conversation
+            tool_msg = {
+                "role": "tool",
+                "content": tool_result,
+                "name": tool_name
+            }
+            if tc.get("id"):
+                tool_msg["tool_call_id"] = tc["id"]
+            followup.append(tool_msg)
+        
+        # Get final response after tool execution
+        final = _get_offline_response_v2(followup, use_tools=False)
+        text = final["text"].strip() if final and final["text"].strip() else "Done."
+        
+        conversation_history.append({"role": "assistant", "content": text})
+        _trim_history()
+        return text
+    
+    # No tool calls, just text
+    text = result["text"].strip() or "I couldn't generate a response."
+    conversation_history.append({"role": "assistant", "content": text})
+    _trim_history()
+    return text
+
+# ─── OFFLINE LOOP — OVERHAULED ─────────────────────────────────────────────────
+
+def run_offline_loop_v2(meta: dict) -> None:
+    """
+    v2: Fixed offline loop with:
+    - Proper state machine
+    - Non-blocking TTS
+    - Better mic handling
+    - Tool support
+    - Offline Wikipedia/Maps
+    """
+    global user_name, conversation_history
+    
+    print("\n[NOVA] 🔌 Offline mode v2.0")
+    print("       Tools: " + ("✅" if is_ollama_running() else "❌"))
+    print("       Wiki:  " + ("✅" if get_offline_wiki().libzim_available else "❌"))
+    print("       Maps:  " + ("✅" if get_offline_maps().has_maps else "❌"))
+    
+    # Set up planner speak callback
+    if _planner is not None:
+        _planner.set_speak(speak_offline)
+    
+    # Load STT
+    if not TEXT_MODE:
+        threading.Thread(target=_load_whisper_async, daemon=True).start()
+        calibrate_ambient_noise()
+    
+    # Greeting
+    _input_fn = get_text_input if TEXT_MODE else listen_offline
+    user_name = offline_greeting(meta, speak_offline, _input_fn)
+    
+    # Main loop
+    while True:
+        # Check state
+        if get_offline_state() == OfflineState.SPEAKING:
+            time.sleep(0.1)
+            continue
+        
+        # Get input
+        set_offline_state(OfflineState.LISTENING)
+        user_input = get_text_input() if TEXT_MODE else listen_offline()
+        
+        # Network recovery check
+        if check_network_recovery(
+            meta, speak_offline,
+            get_text_input if TEXT_MODE else listen_offline,
+            GEMINI_API_KEY or "", FORCE_OFFLINE
+        ):
+            return
+        
+        if not user_input:
+            if not TEXT_MODE:
+                speak_offline("I didn't catch that.")
+            continue
+        
+        print(f"👤 You: {user_input}")
+        set_offline_state(OfflineState.PROCESSING)
+        
+        lower = user_input.lower()
+        
+        # Memory queries
+        if any(p in lower for p in ["what do you remember", "what do you know about me"]):
+            speak_offline(get_all_memory_text(meta))
+            set_offline_state(OfflineState.IDLE)
+            continue
+        
+        # Memory storage
+        handled = False
+        for phrase in ["remember that", "don't forget", "note that", "keep in mind", "remember"]:
+            if lower.startswith(phrase):
+                fact = user_input[len(phrase):].strip()
+                add_memory_fact(fact, meta)
+                speak_offline("Got it. Noted.")
+                handled = True
+                break
+        if handled:
+            set_offline_state(OfflineState.IDLE)
+            continue
+        
+        # ── Tier 5 & 6 REPL commands ────────────────────────────────────────
+        if user_input.startswith("/"):
+            _handled = False
+            # Heartbeat commands
+            try:
+                from nova_heartbeat import handle_heartbeat_command
+                if _heartbeat is not None:
+                    _hb_result = handle_heartbeat_command(user_input, _heartbeat)
+                    if _hb_result is not None:
+                        speak_offline(_hb_result)
+                        set_offline_state(OfflineState.IDLE)
+                        _handled = True
+            except (ImportError, Exception):
+                pass
+            # Audit command
+            if not _handled and user_input == "/audit":
+                try:
+                    from nova_safety import get_audit_log
+                    speak_offline(get_audit_log(last_n=10))
+                except ImportError:
+                    speak_offline("nova_safety.py not installed.")
+                _handled = True
+            if not _handled and user_input == "/cost":
+                try:
+                    from nova_safety import get_cost_summary
+                    speak_offline(get_cost_summary())
+                except ImportError:
+                    speak_offline("nova_safety.py not installed.")
+                _handled = True
+            if _handled:
+                continue
+
+        # Exit
+        if any(w in lower for w in ["goodbye nova", "shutdown nova", "exit nova", "close nova"]):
+            speak_offline(f"Goodbye, {user_name}.")
+            break
+        
+        # Main thinking
+        reply = think_offline_v2(user_input, meta)
+        speak_offline(reply)
+        
+        # Periodic memory extraction
+        global _mem_extract_turn_counter
+        _mem_extract_turn_counter += 1
+        if _mem_extract_turn_counter % _MEM_EXTRACT_EVERY_N == 0:
+            meta = extract_memory_updates(user_input, reply, meta)
+        
+        set_offline_state(OfflineState.IDLE)
+# At the bottom of your offline code, add:
+run_offline_loop = run_offline_loop_v2  # Alias for compatibility
+think_offline    = think_offline_v2     # Alias for compatibility
+# ══════════════════════════════════════════════════════════════════════════════
+#  UI BROADCAST
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _broadcast_ui(data: dict) -> None:
+    """Broadcast a message to all connected UI WebSocket clients."""
+    with _ui_lock:
+        dead = []
+        for client in _ui_clients:
+            try:
+                client.send(json.dumps(data))
+            except Exception:
+                dead.append(client)
+        for d in dead:
+            if d in _ui_clients:
+                _ui_clients.remove(d)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  3D WEB UI — JARVIS-inspired holographic interface
+# ══════════════════════════════════════════════════════════════════════════════
+
+NOVA_UI_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>NOVA — Neural Operating Voice Assistant</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --nova-cyan: #00d4ff;
+    --nova-glow: #00d4ff44;
+    --nova-dark: #050a14;
+    --nova-panel: #0a1525;
+    --nova-border: #1a3a5c;
+    --nova-text: #c0e8ff;
+    --nova-dim: #4a7a9a;
+    --nova-alert: #ff6b35;
+    --nova-success: #00ff88;
+  }
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: var(--nova-dark);
+    color: var(--nova-text);
+    height: 100dvh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  #header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 20px;
+    background: linear-gradient(180deg, #0a1a2a 0%, var(--nova-dark) 100%);
+    border-bottom: 1px solid var(--nova-border);
+    z-index: 100;
+  }
+  #header-left { display: flex; align-items: center; gap: 12px; }
+  #nova-logo {
+    font-size: 22px; font-weight: 800; letter-spacing: 6px;
+    color: var(--nova-cyan);
+    text-shadow: 0 0 20px var(--nova-glow), 0 0 40px var(--nova-glow);
+  }
+  #nova-sub { font-size: 9px; color: var(--nova-dim); letter-spacing: 2px; text-transform: uppercase; }
+  #header-right { display: flex; align-items: center; gap: 16px; }
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--nova-success);
+    box-shadow: 0 0 8px var(--nova-success), 0 0 16px var(--nova-success);
+    animation: pulse-dot 2s ease-in-out infinite;
+  }
+  .status-dot.offline { background: var(--nova-alert); box-shadow: 0 0 8px var(--nova-alert); }
+  @keyframes pulse-dot { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.5;transform:scale(0.85)} }
+  #clock { font-family: 'Courier New', monospace; font-size: 14px; color: var(--nova-cyan); }
+  #main { flex: 1; display: flex; overflow: hidden; }
+  #left-panel {
+    width: 260px; min-width: 200px;
+    background: var(--nova-panel);
+    border-right: 1px solid var(--nova-border);
+    padding: 16px;
+    display: flex; flex-direction: column; gap: 12px;
+    overflow-y: auto;
+  }
+  .panel-title {
+    font-size: 10px; letter-spacing: 3px; text-transform: uppercase;
+    color: var(--nova-dim); border-bottom: 1px solid var(--nova-border);
+    padding-bottom: 6px; margin-bottom: 4px;
+  }
+  .sys-item { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; font-size: 12px; }
+  .sys-label { color: var(--nova-dim); }
+  .sys-value { color: var(--nova-cyan); font-family: monospace; }
+  .progress-bar { height: 4px; background: #0a2030; border-radius: 2px; overflow: hidden; margin-top: 4px; }
+  .progress-fill {
+    height: 100%; background: linear-gradient(90deg, var(--nova-cyan), var(--nova-success));
+    border-radius: 2px; transition: width 0.5s ease;
+    box-shadow: 0 0 8px var(--nova-glow);
+  }
+  .progress-fill.warn { background: linear-gradient(90deg, #ffaa00, var(--nova-alert)); }
+  #center { flex: 1; display: flex; flex-direction: column; position: relative; }
+  #core-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; pointer-events: none; }
+  #chat-area {
+    flex: 1; overflow-y: auto; padding: 20px;
+    display: flex; flex-direction: column; gap: 14px;
+    z-index: 2; position: relative;
+    scrollbar-width: thin; scrollbar-color: var(--nova-border) transparent;
+  }
+  #chat-area::-webkit-scrollbar { width: 4px; }
+  #chat-area::-webkit-scrollbar-thumb { background: var(--nova-border); border-radius: 2px; }
+  .msg {
+    max-width: 75%; padding: 12px 16px; border-radius: 16px;
+    font-size: 14px; line-height: 1.6; word-break: break-word;
+    animation: msg-in 0.3s ease-out; backdrop-filter: blur(10px);
+  }
+  @keyframes msg-in { from{opacity:0;transform:translateY(10px) scale(0.95)} to{opacity:1;transform:translateY(0) scale(1)} }
+  .msg-user {
+    align-self: flex-end;
+    background: linear-gradient(135deg, #0d3a5c 0%, #0a2540 100%);
+    border: 1px solid #1a5a8a; border-bottom-right-radius: 4px; color: #e0f0ff;
+  }
+  .msg-nova {
+    align-self: flex-start;
+    background: linear-gradient(135deg, #0a2a1a 0%, #0a1a0a 100%);
+    border: 1px solid #1a5a3a; border-bottom-left-radius: 4px; color: #c0f0d0;
+  }
+  .msg-nova .msg-name { font-size: 10px; color: var(--nova-success); font-weight: 700; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 4px; }
+  .msg-user .msg-name { font-size: 10px; color: var(--nova-cyan); font-weight: 700; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 4px; text-align: right; }
+  .msg-time { font-size: 9px; color: var(--nova-dim); margin-top: 6px; font-family: monospace; }
+  .msg-user .msg-time { text-align: right; }
+  #right-panel {
+    width: 300px; min-width: 240px;
+    background: var(--nova-panel); border-left: 1px solid var(--nova-border);
+    padding: 16px; display: flex; flex-direction: column; gap: 12px; overflow-y: auto;
+  }
+  #activity-log { flex: 1; overflow-y: auto; font-family: 'Courier New', monospace; font-size: 11px; line-height: 1.8; color: var(--nova-dim); }
+  .log-entry { padding: 2px 0; border-bottom: 1px solid #0a1a2a; }
+  .log-entry.sys { color: var(--nova-success); }
+  .log-entry.user { color: var(--nova-cyan); }
+  .log-entry.error { color: var(--nova-alert); }
+  #file-drop {
+    border: 2px dashed var(--nova-border); border-radius: 12px;
+    padding: 24px; text-align: center; cursor: pointer; transition: all 0.3s ease;
+  }
+  #file-drop:hover, #file-drop.dragover { border-color: var(--nova-cyan); background: rgba(0,212,255,0.05); }
+  #file-drop svg { width: 32px; height: 32px; fill: var(--nova-dim); margin-bottom: 8px; }
+  #file-drop p { font-size: 11px; color: var(--nova-dim); }
+  #input-bar {
+    display: flex; gap: 10px; padding: 12px 20px;
+    background: linear-gradient(0deg, #0a1a2a 0%, var(--nova-dark) 100%);
+    border-top: 1px solid var(--nova-border); z-index: 100;
+  }
+  #msg-input {
+    flex: 1; background: #0a1525; border: 1px solid var(--nova-border);
+    border-radius: 24px; padding: 10px 20px; color: var(--nova-text); font-size: 14px; outline: none; transition: border-color 0.3s;
+  }
+  #msg-input:focus { border-color: var(--nova-cyan); box-shadow: 0 0 12px var(--nova-glow); }
+  #msg-input::placeholder { color: var(--nova-dim); }
+  .btn {
+    width: 42px; height: 42px; border-radius: 50%;
+    border: 1px solid var(--nova-border); background: #0a1525;
+    color: var(--nova-cyan); cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.3s; font-size: 16px;
+  }
+  .btn:hover { border-color: var(--nova-cyan); box-shadow: 0 0 12px var(--nova-glow); background: rgba(0,212,255,0.1); }
+  .btn.mic { background: linear-gradient(135deg, #0a3a2a, #0a1a0a); border-color: #1a5a3a; }
+  .btn.mic:hover { border-color: var(--nova-success); box-shadow: 0 0 12px rgba(0,255,136,0.3); }
+  .btn.mic.active { background: linear-gradient(135deg, #1a5a3a, #0a3a2a); border-color: var(--nova-success); animation: mic-pulse 1s ease-in-out infinite; }
+  @keyframes mic-pulse { 0%,100%{box-shadow:0 0 8px rgba(0,255,136,0.3)} 50%{box-shadow:0 0 20px rgba(0,255,136,0.6)} }
+  #listening-overlay {
+    position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
+    background: rgba(5,10,20,0.9); border: 1px solid var(--nova-success);
+    border-radius: 24px; padding: 12px 28px;
+    display: none; align-items: center; gap: 12px;
+    backdrop-filter: blur(10px); z-index: 200; box-shadow: 0 0 30px rgba(0,255,136,0.2);
+  }
+  #listening-overlay.active { display: flex; }
+  .wave-bar { width: 3px; background: var(--nova-success); border-radius: 2px; animation: wave 0.5s ease-in-out infinite alternate; }
+  .wave-bar:nth-child(1){height:8px;animation-delay:0s}
+  .wave-bar:nth-child(2){height:16px;animation-delay:0.1s}
+  .wave-bar:nth-child(3){height:24px;animation-delay:0.2s}
+  .wave-bar:nth-child(4){height:16px;animation-delay:0.3s}
+  .wave-bar:nth-child(5){height:8px;animation-delay:0.4s}
+  @keyframes wave { from{transform:scaleY(0.5);opacity:0.5} to{transform:scaleY(1);opacity:1} }
+  @media (max-width:1024px) { #left-panel{width:200px} #right-panel{width:240px} }
+  @media (max-width:768px) { #left-panel,#right-panel{display:none} #nova-logo{font-size:16px;letter-spacing:3px} #clock{font-size:11px} }
+  .typing { display:flex; gap:4px; padding:8px 12px; align-self:flex-start; }
+  .typing-dot { width:6px; height:6px; border-radius:50%; background:var(--nova-success); opacity:0.4; animation:typing-bounce 1.2s infinite; }
+  .typing-dot:nth-child(2){animation-delay:0.2s}
+  .typing-dot:nth-child(3){animation-delay:0.4s}
+  @keyframes typing-bounce{0%,80%,100%{opacity:0.4;transform:scale(1)}40%{opacity:1;transform:scale(1.3)}}
+</style>
+</head>
+<body>
+<div id="header">
+  <div id="header-left">
+    <div>
+      <div id="nova-logo">N.O.V.A</div>
+      <div id="nova-sub">Neural Operating Voice Assistant</div>
+    </div>
+  </div>
+  <div id="header-right">
+    <div class="status-dot" id="status-dot"></div>
+    <div id="clock">00:00:00</div>
+  </div>
+</div>
+<div id="main">
+  <div id="left-panel">
+    <div class="panel-title">System Monitor</div>
+    <div class="sys-item"><span class="sys-label">CPU</span><span class="sys-value" id="cpu-val">0%</span></div>
+    <div class="progress-bar"><div class="progress-fill" id="cpu-bar" style="width:0%"></div></div>
+    <div class="sys-item"><span class="sys-label">RAM</span><span class="sys-value" id="ram-val">0%</span></div>
+    <div class="progress-bar"><div class="progress-fill" id="ram-bar" style="width:0%"></div></div>
+    <div class="sys-item"><span class="sys-label">NET</span><span class="sys-value" id="net-val">0 KB/s</span></div>
+    <div class="sys-item"><span class="sys-label">GPU</span><span class="sys-value" id="gpu-val">N/A</span></div>
+    <div class="panel-title" style="margin-top:12px">Connection</div>
+    <div class="sys-item"><span class="sys-label">Mode</span><span class="sys-value" id="mode-val">OFFLINE</span></div>
+    <div class="sys-item"><span class="sys-label">Brain</span><span class="sys-value" id="brain-val">Gemini/TinyLlama</span></div>
+    <div class="sys-item"><span class="sys-label">STT</span><span class="sys-value" id="stt-val">faster-whisper</span></div>
+    <div class="sys-item"><span class="sys-label">TTS</span><span class="sys-value" id="tts-val">pyttsx3</span></div>
+    <div class="panel-title" style="margin-top:12px">Shortcuts</div>
+    <div class="sys-item"><span class="sys-label">F1</span><span class="sys-value">Mute</span></div>
+    <div class="sys-item"><span class="sys-label">F11</span><span class="sys-value">Fullscreen</span></div>
+    <div class="sys-item"><span class="sys-label">Ctrl+K</span><span class="sys-value">Clear</span></div>
+  </div>
+  <div id="center">
+    <canvas id="core-canvas"></canvas>
+    <div id="chat-area">
+      <div class="msg msg-nova">
+        <div class="msg-name">NOVA</div>
+        <div>System online. I am NOVA, your Neural Operating Voice Assistant. How may I assist you today?</div>
+        <div class="msg-time" id="first-time"></div>
+      </div>
+    </div>
+  </div>
+  <div id="right-panel">
+    <div class="panel-title">Activity Log</div>
+    <div id="activity-log">
+      <div class="log-entry sys">SYS: NOVA v3.4 initialized</div>
+      <div class="log-entry sys">SYS: Vision model: gemini-2.0-flash</div>
+      <div class="log-entry sys">SYS: Offline brain: Gemini REST / TinyLlama</div>
+    </div>
+    <div class="panel-title">File Upload</div>
+    <div id="file-drop">
+      <svg viewBox="0 0 24 24"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>
+      <p>Drop files here<br>or click to browse</p>
+    </div>
+  </div>
+</div>
+<div id="input-bar">
+  <button class="btn mic" id="mic-btn" title="Hold to speak">&#127908;</button>
+  <input type="text" id="msg-input" placeholder="Type a command or question..." autocomplete="off">
+  <button class="btn" id="send-btn" title="Send">&#9658;</button>
+</div>
+<div id="listening-overlay">
+  <div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div>
+  <div class="wave-bar"></div><div class="wave-bar"></div>
+  <span style="font-size:12px;color:var(--nova-success);font-family:monospace;">LISTENING...</span>
+</div>
+<script>
+function updateClock(){const n=new Date();document.getElementById('clock').textContent=n.toLocaleTimeString('en-US',{hour12:false});}
+setInterval(updateClock,1000);updateClock();
+function updateSysMonitor(){
+  const cpu=Math.floor(Math.random()*30)+5,ram=Math.floor(Math.random()*40)+20;
+  document.getElementById('cpu-val').textContent=cpu+'%';
+  document.getElementById('cpu-bar').style.width=cpu+'%';
+  document.getElementById('cpu-bar').className='progress-fill'+(cpu>80?' warn':'');
+  document.getElementById('ram-val').textContent=ram+'%';
+  document.getElementById('ram-bar').style.width=ram+'%';
+  document.getElementById('ram-bar').className='progress-fill'+(ram>80?' warn':'');
+  document.getElementById('net-val').textContent=Math.floor(Math.random()*100)+' KB/s';
+}
+setInterval(updateSysMonitor,2000);updateSysMonitor();
+document.getElementById('first-time').textContent=new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'});
+const canvas=document.getElementById('core-canvas');
+const scene=new THREE.Scene();
+const camera=new THREE.PerspectiveCamera(60,canvas.clientWidth/canvas.clientHeight,0.1,1000);
+const renderer=new THREE.WebGLRenderer({canvas,alpha:true,antialias:true});
+renderer.setSize(canvas.clientWidth,canvas.clientHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+camera.position.z=5;
+const coreGeo=new THREE.SphereGeometry(0.6,32,32);
+const coreMat=new THREE.MeshBasicMaterial({color:0x00d4ff,transparent:true,opacity:0.15,wireframe:true});
+const core=new THREE.Mesh(coreGeo,coreMat);scene.add(core);
+const glowGeo=new THREE.SphereGeometry(0.4,16,16);
+const glowMat=new THREE.MeshBasicMaterial({color:0x00ff88,transparent:true,opacity:0.3});
+const glow=new THREE.Mesh(glowGeo,glowMat);scene.add(glow);
+const rings=[];
+for(let i=0;i<3;i++){
+  const g=new THREE.TorusGeometry(1.2+i*0.5,0.01,8,64);
+  const m=new THREE.MeshBasicMaterial({color:i===0?0x00d4ff:(i===1?0x00ff88:0x4a7a9a),transparent:true,opacity:0.3+i*0.1});
+  const r=new THREE.Mesh(g,m);r.rotation.x=Math.PI/2+(i*0.3);r.rotation.y=i*0.5;scene.add(r);rings.push(r);
+}
+const pGeo=new THREE.BufferGeometry();
+const pArr=new Float32Array(600);for(let i=0;i<600;i++)pArr[i]=(Math.random()-0.5)*8;
+pGeo.setAttribute('position',new THREE.BufferAttribute(pArr,3));
+const pMat=new THREE.PointsMaterial({size:0.02,color:0x00d4ff,transparent:true,opacity:0.6});
+const particles=new THREE.Points(pGeo,pMat);scene.add(particles);
+let t=0;
+function animate(){requestAnimationFrame(animate);t+=0.01;core.rotation.y+=0.005;core.rotation.x+=0.002;glow.scale.setScalar(1+Math.sin(t*2)*0.1);glow.rotation.y-=0.01;rings.forEach((r,i)=>{r.rotation.z+=0.003*(i%2===0?1:-1);r.rotation.x+=0.001;});particles.rotation.y+=0.0005;renderer.render(scene,camera);}
+animate();
+window.addEventListener('resize',()=>{const w=canvas.clientWidth,h=canvas.clientHeight;camera.aspect=w/h;camera.updateProjectionMatrix();renderer.setSize(w,h);});
+const chatArea=document.getElementById('chat-area');
+const msgInput=document.getElementById('msg-input');
+const sendBtn=document.getElementById('send-btn');
+const micBtn=document.getElementById('mic-btn');
+const listeningOverlay=document.getElementById('listening-overlay');
+const activityLog=document.getElementById('activity-log');
+function addLog(text,type='sys'){const e=document.createElement('div');e.className='log-entry '+type;e.textContent=text;activityLog.appendChild(e);activityLog.scrollTop=activityLog.scrollHeight;}
+function appendMsg(text,isUser){
+  const msg=document.createElement('div');msg.className='msg '+(isUser?'msg-user':'msg-nova');
+  const name=document.createElement('div');name.className='msg-name';name.textContent=isUser?'YOU':'NOVA';
+  const body=document.createElement('div');body.textContent=text;
+  const timeEl=document.createElement('div');timeEl.className='msg-time';timeEl.textContent=new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'});
+  msg.appendChild(name);msg.appendChild(body);msg.appendChild(timeEl);chatArea.appendChild(msg);chatArea.scrollTop=chatArea.scrollHeight;
+}
+function showTyping(){const t=document.createElement('div');t.className='typing';t.id='typing-indicator';for(let i=0;i<3;i++){const d=document.createElement('div');d.className='typing-dot';t.appendChild(d);}chatArea.appendChild(t);chatArea.scrollTop=chatArea.scrollHeight;}
+function hideTyping(){const el=document.getElementById('typing-indicator');if(el)el.remove();}
+let ws=null;
+function connectWS(){
+  const proto=window.location.protocol==='https:'?'wss:':'ws:';
+  ws=new WebSocket(proto+'//'+window.location.host+'/ws');
+  ws.onopen=()=>{addLog('SYS: WebSocket connected','sys');document.getElementById('status-dot').classList.remove('offline');};
+  ws.onmessage=(e)=>{
+    const data=JSON.parse(e.data);
+    if(data.type==='nova_speak'){hideTyping();appendMsg(data.text,false);addLog('NOVA: '+data.text.substring(0,60),'sys');}
+    else if(data.type==='nova_typing'){showTyping();}
+    else if(data.type==='system'){addLog('SYS: '+data.text,'sys');}
+  };
+  ws.onclose=()=>{document.getElementById('status-dot').classList.add('offline');addLog('SYS: Connection lost, reconnecting...','error');setTimeout(connectWS,3000);};
+  ws.onerror=()=>{document.getElementById('status-dot').classList.add('offline');};
+}
+connectWS();
+async function sendMsg(){
+  const text=msgInput.value.trim();if(!text)return;msgInput.value='';
+  appendMsg(text,true);addLog('YOU: '+text.substring(0,60),'user');showTyping();
+  try{
+    if(ws&&ws.readyState===WebSocket.OPEN){ws.send(JSON.stringify({type:'chat',message:text}));}
+    else{
+      const res=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})});
+      const data=await res.json();hideTyping();appendMsg(data.reply||'(no response)',false);
+    }
+  }catch(e){hideTyping();appendMsg('Connection error: '+e.message,false);addLog('ERR: '+e.message,'error');}
+}
+sendBtn.addEventListener('click',sendMsg);
+msgInput.addEventListener('keypress',e=>{if(e.key==='Enter')sendMsg();});
+let micActive=false;
+micBtn.addEventListener('mousedown',()=>{micActive=true;micBtn.classList.add('active');listeningOverlay.classList.add('active');if(ws&&ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:'mic_start'}));});
+micBtn.addEventListener('mouseup',()=>{micActive=false;micBtn.classList.remove('active');listeningOverlay.classList.remove('active');if(ws&&ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:'mic_stop'}));});
+micBtn.addEventListener('mouseleave',()=>{if(micActive){micActive=false;micBtn.classList.remove('active');listeningOverlay.classList.remove('active');}});
+micBtn.addEventListener('touchstart',(e)=>{e.preventDefault();micBtn.dispatchEvent(new Event('mousedown'));});
+micBtn.addEventListener('touchend',(e)=>{e.preventDefault();micBtn.dispatchEvent(new Event('mouseup'));});
+const fileDrop=document.getElementById('file-drop');
+fileDrop.addEventListener('dragover',(e)=>{e.preventDefault();fileDrop.classList.add('dragover');});
+fileDrop.addEventListener('dragleave',()=>fileDrop.classList.remove('dragover'));
+fileDrop.addEventListener('drop',(e)=>{e.preventDefault();fileDrop.classList.remove('dragover');const files=e.dataTransfer.files;if(files.length>0){addLog('SYS: File dropped: '+files[0].name,'sys');appendMsg('Uploaded: '+files[0].name,true);}});
+fileDrop.addEventListener('click',()=>{const input=document.createElement('input');input.type='file';input.onchange=(e)=>{if(e.target.files.length>0){addLog('SYS: File selected: '+e.target.files[0].name,'sys');appendMsg('Uploaded: '+e.target.files[0].name,true);}};input.click();});
+document.addEventListener('keydown',(e)=>{
+  if(e.key==='F11'){e.preventDefault();if(!document.fullscreenElement)document.documentElement.requestFullscreen();else document.exitFullscreen();}
+  if(e.key==='F1'){e.preventDefault();addLog('SYS: Microphone muted','sys');}
+  if(e.ctrlKey&&e.key==='k'){e.preventDefault();chatArea.innerHTML='';addLog('SYS: Chat cleared','sys');}
+});
+</script>
+</body>
+</html>"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UI SERVER — Flask with WebSocket support
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_ui_server(meta: dict) -> None:
+    if not HAS_FLASK:
+        print("❌ Flask not installed. Run: pip install flask flask-sock")
+        print("   Falling back to text mode...")
+        run_offline_loop(meta)
+        return
+
+    has_sock = False
+    try:
+        import importlib.util as _importlib_util
+        if _importlib_util.find_spec("flask_sock") is not None:
+            has_sock = True
+        else:
+            raise ImportError
+    except ImportError:
+        print("⚠️  flask-sock not installed. WebSocket disabled. Run: pip install flask-sock")
+
+    app = _Flask("NOVA_UI")
+    import logging as _logging
+    _logging.getLogger("werkzeug").setLevel(_logging.ERROR)
+
+    @app.route("/")
+    def index() -> str:
+        return NOVA_UI_HTML
+
+    @app.route("/chat", methods=["POST"])
+    def chat() -> Any:
+        data    = _flask_request.get_json(force=True, silent=True) or {}
+        message = str(data.get("message", "")).strip()
+        if not message:
+            return _flask_jsonify({"reply": "I didn't receive a message."})
+        try:
+            _broadcast_ui({"type": "nova_typing"})
+            reply = None
+            if HAS_GEMINI and GEMINI_API_KEY and is_online() and not FORCE_OFFLINE:
+                mem_ctx     = build_memory_context(meta, query=message)
+                sys_content = NOVA_SYSTEM_PROMPT
+                if mem_ctx:
+                    sys_content += f"\n\nMEMORY:\n{mem_ctx}"
+                gemini_messages = [
+                    {"role": "system", "content": sys_content},
+                    {"role": "user",   "content": message},
+                ]
+                gemini_result = _call_gemini_chat(gemini_messages, use_tools=True)
+                if gemini_result:
+                    if gemini_result["tool_calls"]:
+                        followup = list(gemini_messages) + [
+                            {"role": "assistant", "content": gemini_result["text"], "tool_calls": gemini_result["tool_calls"]}
+                        ]
+                        for tc in gemini_result["tool_calls"]:
+                            tool_result = _execute_tool_sync(tc["name"], tc["args"], meta)
+                            followup.append({"role": "tool", "content": tool_result, "tool_call_id": tc.get("id")})
+                        final = _call_gemini_chat(followup, use_tools=False)
+                        reply = final["text"].strip() if final else "Done."
+                    else:
+                        reply = gemini_result["text"].strip()
+            if not reply:
+                agent_reply = agent_process(message, meta)
+                reply = agent_reply if agent_reply else think_offline(message, meta)
+            _broadcast_ui({"type": "nova_speak", "text": reply})
+        except Exception as e:
+            reply = f"Error: {e}"
+        return _flask_jsonify({"reply": reply})
+
+    @app.route("/memory")
+    def memory() -> Any:
+        return _flask_jsonify({"user": meta.get("user_name", ""), "facts": _memory_texts})
+
+    if has_sock:
+        from flask_sock import Sock as _Sock  # noqa: F811
+        sock = _Sock(app)
+
+        @sock.route("/ws")
+        def websocket(ws: Any) -> None:
+            with _ui_lock:
+                _ui_clients.append(ws)
+            try:
+                ws.send(json.dumps({"type": "system", "text": "Connected to NOVA v3.4"}))
+                while True:
+                    msg = ws.receive()
+                    if msg is None:
+                        break
+                    try:
+                        data = json.loads(msg)
+                        if data.get("type") == "chat":
+                            user_msg = str(data.get("message", "")).strip()
+                            if user_msg:
+                                _broadcast_ui({"type": "nova_typing"})
+                                reply = None
+                                if HAS_GEMINI and GEMINI_API_KEY and is_online() and not FORCE_OFFLINE:
+                                    mem_ctx     = build_memory_context(meta, query=user_msg)
+                                    sys_content = NOVA_SYSTEM_PROMPT
+                                    if mem_ctx:
+                                        sys_content += f"\n\nMEMORY:\n{mem_ctx}"
+                                    gemini_messages = [
+                                        {"role": "system", "content": sys_content},
+                                        {"role": "user",   "content": user_msg},
+                                    ]
+                                    gemini_result = _call_gemini_chat(gemini_messages, use_tools=True)
+                                    if gemini_result:
+                                        if gemini_result["tool_calls"]:
+                                            followup = list(gemini_messages) + [
+                                                {"role": "assistant", "content": gemini_result["text"], "tool_calls": gemini_result["tool_calls"]}
+                                            ]
+                                            for tc in gemini_result["tool_calls"]:
+                                                tool_result = _execute_tool_sync(tc["name"], tc["args"], meta)
+                                                followup.append({"role": "tool", "content": tool_result, "tool_call_id": tc.get("id")})
+                                            final = _call_gemini_chat(followup, use_tools=False)
+                                            reply = final["text"].strip() if final else "Done."
+                                        else:
+                                            reply = gemini_result["text"].strip()
+                                if not reply:
+                                    agent_reply = agent_process(user_msg, meta)
+                                    reply = agent_reply if agent_reply else think_offline(user_msg, meta)
+                                _broadcast_ui({"type": "nova_speak", "text": reply})
+                        elif data.get("type") == "mic_start":
+                            _broadcast_ui({"type": "system", "text": "Listening..."})
+                        elif data.get("type") == "mic_stop":
+                            _broadcast_ui({"type": "system", "text": "Processing..."})
+                    except Exception as e:
+                        log.error(f"WS message error: {e}")
+            except Exception:
+                pass
+            finally:
+                with _ui_lock:
+                    if ws in _ui_clients:
+                        _ui_clients.remove(ws)
+
+    local_ip = get_local_ip()
+    print("\n" + "=" * 60)
+    print("[NOVA] 🌐 3D UI Server starting...")
+    print(f"[NOVA] 🌐 Open in browser: http://{local_ip}:{UI_PORT}")
+    print(f"[NOVA] 🌐 Local access:    http://127.0.0.1:{UI_PORT}")
+    print("[NOVA] 📱 Works on phone too — same WiFi network")
+    print("=" * 60 + "\n")
+
+    try:
+        webbrowser.open(f"http://127.0.0.1:{UI_PORT}")
+    except Exception:
+        pass
+
+    if _planner is not None:
+        _planner.set_speak(lambda t: _broadcast_ui({"type": "nova_speak", "text": t}))
+
+    try:
+        app.run(host="0.0.0.0", port=UI_PORT, debug=False, use_reloader=False, threaded=True)
+    except KeyboardInterrupt:
+        print("\n[NOVA] 🌐 UI server stopped.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PHONE SERVER
+# ══════════════════════════════════════════════════════════════════════════════
+
+PHONE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>NOVA</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,sans-serif;background:#0a0a0f;color:#e0e0e0;height:100dvh;display:flex;flex-direction:column}
+  #header{padding:12px 16px;background:#12121a;border-bottom:1px solid #222;display:flex;align-items:center;gap:10px}
+  #header .dot{width:10px;height:10px;border-radius:50%;background:#00ff88;box-shadow:0 0 8px #00ff88;animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  #header h1{font-size:18px;font-weight:700;color:#00ff88;letter-spacing:2px}
+  #header small{font-size:11px;color:#555;margin-left:auto}
+  #chat{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px}
+  .msg{max-width:82%;padding:10px 14px;border-radius:18px;font-size:14px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+  .user{background:#1a3a5c;align-self:flex-end;border-bottom-right-radius:4px}
+  .nova{background:#1a2a1a;align-self:flex-start;border-bottom-left-radius:4px;border:1px solid #00ff8833}
+  .nova .name{font-size:11px;color:#00ff88;font-weight:600;margin-bottom:4px}
+  .typing{display:flex;gap:4px;padding:14px}
+  .typing span{width:7px;height:7px;border-radius:50%;background:#00ff88;animation:bounce 1.2s infinite}
+  .typing span:nth-child(2){animation-delay:.2s}.typing span:nth-child(3){animation-delay:.4s}
+  @keyframes bounce{0%,80%,100%{transform:scale(.6)}40%{transform:scale(1)}}
+  #input-area{padding:10px 12px;background:#12121a;border-top:1px solid #222;display:flex;gap:8px}
+  #msg-input{flex:1;background:#1e1e28;border:1px solid #333;border-radius:22px;padding:10px 16px;color:#e0e0e0;font-size:15px;outline:none}
+  #msg-input:focus{border-color:#00ff88}
+  #send-btn{background:#00ff88;color:#000;border:none;border-radius:50%;width:42px;height:42px;font-size:18px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-weight:bold}
+  #send-btn:disabled{background:#333;color:#666}
+</style>
+</head>
+<body>
+<div id="header"><div class="dot"></div><h1>NOVA</h1><small>FUTO AI</small></div>
+<div id="chat"><div class="msg nova"><div class="name">NOVA</div>Online and ready. How can I help?</div></div>
+<div id="input-area">
+  <input id="msg-input" type="text" placeholder="Type a message..." autocomplete="off">
+  <button id="send-btn" onclick="sendMsg()">&#9658;</button>
+</div>
+<script>
+const chat=document.getElementById('chat'),input=document.getElementById('msg-input'),btn=document.getElementById('send-btn');
+input.addEventListener('keypress',e=>{if(e.key==='Enter')sendMsg();});
+function appendMsg(text,cls){const d=document.createElement('div');d.className='msg '+cls;if(cls==='nova'){const nm=document.createElement('div');nm.className='name';nm.textContent='NOVA';d.appendChild(nm);}d.appendChild(document.createTextNode(text));chat.appendChild(d);chat.scrollTop=chat.scrollHeight;return d;}
+function showTyping(){const d=document.createElement('div');d.className='msg nova';d.id='typing';d.innerHTML='<div class="name">NOVA</div><div class="typing"><span></span><span></span><span></span></div>';chat.appendChild(d);chat.scrollTop=chat.scrollHeight;}
+function hideTyping(){const d=document.getElementById('typing');if(d)d.remove();}
+async function sendMsg(){
+  const text=input.value.trim();if(!text)return;input.value='';btn.disabled=true;
+  appendMsg(text,'user');showTyping();
+  try{const res=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})});const data=await res.json();hideTyping();appendMsg(data.reply||'(no response)','nova');}
+  catch(e){hideTyping();appendMsg('Connection error: '+e.message,'nova');}
+  btn.disabled=false;input.focus();
+}
+</script>
+</body>
+</html>"""
+
+
+def run_phone_server(meta: dict) -> None:
+    if not HAS_FLASK:
+        print("❌ Flask not installed. Run: pip install flask")
+        print("   Falling back to text mode...")
+        run_offline_loop(meta)
+        return
+
+    app = _Flask("NOVA_Phone")
+    import logging as _logging
+    _logging.getLogger("werkzeug").setLevel(_logging.ERROR)
+
+    @app.route("/")
+    def index() -> str:
+        return PHONE_HTML
+
+    @app.route("/chat", methods=["POST"])
+    def chat() -> Any:
+        data    = _flask_request.get_json(force=True, silent=True) or {}
+        message = str(data.get("message", "")).strip()
+        if not message:
+            return _flask_jsonify({"reply": "I didn't receive a message."})
+        try:
+            reply = None
+            if HAS_GEMINI and GEMINI_API_KEY and is_online() and not FORCE_OFFLINE:
+                mem_ctx     = build_memory_context(meta, query=message)
+                sys_content = NOVA_SYSTEM_PROMPT
+                if mem_ctx:
+                    sys_content += f"\n\nMEMORY:\n{mem_ctx}"
+                gemini_messages = [
+                    {"role": "system", "content": sys_content},
+                    {"role": "user",   "content": message},
+                ]
+                gemini_result = _call_gemini_chat(gemini_messages, use_tools=True)
+                if gemini_result:
+                    if gemini_result["tool_calls"]:
+                        followup = list(gemini_messages) + [
+                            {"role": "assistant", "content": gemini_result["text"], "tool_calls": gemini_result["tool_calls"]}
+                        ]
+                        for tc in gemini_result["tool_calls"]:
+                            tool_result = _execute_tool_sync(tc["name"], tc["args"], meta)
+                            followup.append({"role": "tool", "content": tool_result, "tool_call_id": tc.get("id")})
+                        final = _call_gemini_chat(followup, use_tools=False)
+                        reply = final["text"].strip() if final else "Done."
+                    else:
+                        reply = gemini_result["text"].strip()
+            if not reply:
+                agent_reply = agent_process(message, meta)
+                reply = agent_reply if agent_reply else think_offline(message, meta)
+        except Exception as e:
+            reply = f"Error: {e}"
+        return _flask_jsonify({"reply": reply})
+
+    @app.route("/memory")
+    def memory() -> Any:
+        return _flask_jsonify({"user": meta.get("user_name", ""), "facts": _memory_texts})
+
+    local_ip = get_local_ip()
+    print("\n[NOVA] 📱 Phone server starting...")
+    print(f"[NOVA] 🌐 Open on your phone: http://{local_ip}:{PHONE_PORT}")
+    print("[NOVA] 📶 Make sure phone and laptop are on the same WiFi network.")
+    print("[NOVA] 🔴 Press Ctrl+C to stop.\n")
+
+    if _planner is not None:
+        _planner.set_speak(lambda t: print(f"\n⏰ Reminder: {t}"))
+
+    try:
+        app.run(host="0.0.0.0", port=PHONE_PORT, debug=False, use_reloader=False)
+    except KeyboardInterrupt:
+        print("\n[NOVA] 📱 Phone server stopped.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    global _embedder, _TOOL_AVAILABILITY, _planner, _proactive, _nova_memory, _nova_memory 
+
+    startup_start = time.time()
+    _ = sd.query_devices()   # warm up audio device enumeration once
+    print("⚡ Initialising NOVA v3.4...")
+    print("=" * 60)
+
+    # ── Handle --setup flag ───────────────────────────────────────────────────
+    if SETUP_MODE:
+        result = _execute_autostart({"action": "setup"})
+        print(f"[SETUP] {result}")
+        return
+
+    # ── Tool modules ──────────────────────────────────────────────────────────
+    t = time.time()
+
+    _TOOL_AVAILABILITY = _validate_tool_modules()
+    print(f"Tools: {time.time()-t:.2f}s")
+    available = [k for k, v in _TOOL_AVAILABILITY.items() if v]
+    missing   = [k for k, v in _TOOL_AVAILABILITY.items() if not v]
+    print(f"✅ Tools ready   : {', '.join(available)}")
+    if missing:
+        print(f"⚠️  Tools missing : {', '.join(missing)}")
+
+    # ── Embedding model ───────────────────────────────────────────────────────
+    # ── Embedding model (LAZY — loads in background) ─────────────────────────
+    _embedder = None
+    _embedder_loaded = threading.Event()
+
+    def _load_embedder_async():
+        global _embedder, HAS_SENTENCE_TRANSFORMERS
+        embed_start = time.time()
+        try:
+            from sentence_transformers import SentenceTransformer  # lazy import
+            _embedder = SentenceTransformer(EMBED_MODEL)
+            print(f"✅ Embedding model ready ({time.time()-embed_start:.2f}s)")
+        except ImportError:
+            HAS_SENTENCE_TRANSFORMERS = False
+            log.warning("sentence-transformers not installed — memory search disabled.")
+        except Exception as e:
+            log.warning(f"Embedding model failed: {e}")
+        _embedder_loaded.set()
+        # Rebuild index now that embedder is ready
+        if _embedder and _memory_texts:
+            _rebuild_index()
+
+    threading.Thread(target=_load_embedder_async, daemon=True, name="EmbedLoader").start()
+
+    # ── Load memory ───────────────────────────────────────────────────────────
+    meta = load_memory()
+    name = meta.get("user_name", "")
+    if name:
+        print(f"👤 Welcome back, {name}.")
+
+     # ── Start planner ─────────────────────────────────────────────────────────
+    _planner = NOVAPlanner()
+
+    # ── Start memory ──────────────────────────────────────────────────────────
+    _nova_memory = NovaMemory(checkpoint_every_n_turns=10)
+    import atexit
+    atexit.register(_nova_memory.close_session)
+
+    # ── Reference face ────────────────────────────────────────────────────────
+    if REFERENCE_FACE_PATH.exists():
+        print(f"📸 Reference face loaded: {REFERENCE_FACE_PATH}")
+    else:
+        print("📸 No reference face stored. Say 'save a photo of me' to enable recognition.")
+
+    print("=" * 60)
+
+    # ── Route to correct mode ─────────────────────────────────────────────────
+
+    if UI_MODE:
+        print("🌐 3D UI mode.")
+        run_ui_server(meta)
+        return
+
+    if PHONE_MODE:
+        print("📱 Phone server mode.")
+        run_phone_server(meta)
+        return
+
+    if FORCE_OFFLINE:
+        print("📴 Forced offline mode (--offline / --text flag).")
+        run_offline_loop(meta)
+        return
+
+    if not HAS_GEMINI:
+        print("📴 google-genai not installed → offline fallback.")
+        run_offline_loop(meta)
+        return
+
+    if not GEMINI_API_KEY:
+        print("⚠️  GEMINI_API_KEY not found in .env → offline fallback.")
+        print("   Add GEMINI_API_KEY=your_key to .env for Gemini Live mode.")
+        run_offline_loop(meta)
+        return
+
+    # ── Pre-flight internet check ─────────────────────────────────────────────
+    print("🔍 Checking internet connection...")
+    if not is_online():
+        print("📴 No internet detected → offline fallback.")
+        run_offline_loop(meta)
+        return
+
+    # ── Start Gemini Live ─────────────────────────────────────────────────────
+    # ── [FIX-5] Proactive agent ───────────────────────────────────────
+    _proactive = ProactiveAgent(
+        speak_fn=lambda t: print(f"[PROACTIVE] {t}"),
+        meta=meta,
+        planner=_planner,
+    )
+    _proactive.start()
+
+    # ── Tier 5: Full heartbeat with held notices + quiet hours ────────────────
+    try:
+        from nova_heartbeat import Heartbeat
+        _heartbeat = Heartbeat(
+            speak_fn=lambda t: print(f"\n🔔 NOVA: {t}"),
+            meta=meta,
+            planner=_planner,
+        )
+        _heartbeat.start()
+        log.info("Heartbeat started (Tier 5 complete).")
+    except ImportError:
+        _heartbeat = None
+        log.warning("nova_heartbeat.py not found — Tier 5 partial only.")
+    
+    print(f"🌐 Starting Gemini Live mode (voice: {NOVA_VOICE})...")
+    _t_total = time.time() - startup_start
+    print(f"\n{'─'*44}")
+    print(f"  ⚡ NOVA startup complete in {_t_total:.2f}s")
+    print(f"{'─'*44}")
+
+    nova = NOVALive(meta=meta)
+
+    # Give planner + proactive agent a reference to NOVA's speak function
+    _planner.set_speak(nova.speak)
+    _proactive.update_speak(nova.speak)
+    if _heartbeat:
+        _heartbeat.update_speak(nova.speak)
+
+    # Tier 5: show any notices that arrived since last session
+    if _heartbeat:
+        missed = _heartbeat.show_missed()
+        if missed:
+            nova.speak(missed)
+
+    try:
+        status = asyncio.run(nova.run())
+    except KeyboardInterrupt:
+        print("\n[NOVA] 🔴 Shutdown.")
+        return
+
+    # ── Handle Gemini Live exit status ────────────────────────────────────────
+    if status == "offline":
+        print("\n[NOVA] 📴 Internet lost — switching to offline mode automatically.")
+        _planner.set_speak(speak_offline)
+        _proactive.update_speak(speak_offline)
+        run_offline_loop(meta)
+        # [FIX-2] After offline loop exits (network back, user said switch)
+        # re-enter the live loop:
+        _proactive.update_speak(nova.speak)
+        _planner.set_speak(nova.speak)
+        status = asyncio.run(nova.run())
+        if status == "exit":
+            print("\n[NOVA] 🔴 Shutdown.")
+    elif status == "exit":
+        print("\n[NOVA] 🔴 Shutdown.")
+
+
+if __name__ == "__main__":
+    main()

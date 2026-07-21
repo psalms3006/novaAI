@@ -1,0 +1,99 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Project NOVA v4.0 — Python Dependencies
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Install:
+#   pip install -r requirements.txt          # core (CLI + web + voice)
+#   pip install -r requirements.txt -r requirements-gpu.txt  # GPU-accelerated FAISS
+#
+# Run:
+#   python nova.py            → Gemini Live (voice in, voice out)
+#   python nova.py --offline  → Force offline brain (Ollama + pyttsx3)
+#   python nova.py --text     → Offline brain, keyboard input
+#   python nova.py --phone    → Phone/browser server (WiFi access)
+#   python nova.py --ui       → Launch 3D Web UI in browser
+#   python nova.py --setup    → Register NOVA in Windows startup
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Core ───────────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0          # .env file loading
+requests>=2.31.0              # HTTP client (Gemini REST, web search, etc.)
+psutil>=5.9.0                 # Process monitoring, system info
+pyyaml>=6.0                   # YAML config loading
+
+# ── AI / LLM ───────────────────────────────────────────────────────────────────
+google-genai>=1.0.0           # Gemini 2.5 Flash Live + REST API
+
+# ── Memory / Embeddings ───────────────────────────────────────────────────────
+numpy>=1.24.0                 # Array operations (memory vectors, audio)
+faiss-cpu>=1.7.0              # Semantic memory search (use faiss-gpu for CUDA)
+sentence-transformers>=2.2.0   # Embedding model for semantic memory (all-MiniLM-L6-v2)
+
+# ── Voice (STT / TTS) ─────────────────────────────────────────────────────────
+pyttsx3>=2.90                 # Offline TTS fallback
+sounddevice>=0.4.6            # Audio capture/playback (mic + speaker)
+scipy>=1.11.0                 # WAV file I/O (wake word, audio processing)
+
+# ── Vision / Screen ────────────────────────────────────────────────────────────
+Pillow>=10.0.0                # Image handling (screenshots, icons)
+opencv-python>=4.8.0          # Screen capture / image processing
+mss>=9.0.0                    # Multi-platform screenshot capture
+
+# ── System Tray ────────────────────────────────────────────────────────────────
+pystray>=0.19.0               # Windows system tray icon
+
+# ── 3D UI (optional — PyQt6 desktop window) ───────────────────────────────────
+PyQt6>=6.5.0                  # 3D JARVIS-inspired desktop UI
+
+# ── Web Server (phone mode) ────────────────────────────────────────────────────
+# NOTE: Flask is NOT actually imported in the current codebase.
+#       nova.py uses only Gemini Live WebSocket + Gemini REST for networking.
+#       Uncomment below if you add Flask endpoints later.
+flask>=3.0.0
+flask-sock>=0.7.0
+
+# ── Optional — Voice wake-word detection ───────────────────────────────────────
+# Only needed if you run: python nova_wake.py
+faster-whisper>=1.0.0
+
+# ── Optional — Deepgram voice (alternative STT provider) ──────────────────────
+# Only needed if you configure Deepgram as your STT backend.
+deepgram-sdk>=3.0.0
+
+# ── Optional — Whisper (alternative STT provider) ─────────────────────────────
+# Only needed if you use OpenAI Whisper instead of Gemini native audio.
+openai-whisper>=20231117
+
+# ── Optional — PyAudio (alternative audio backend) ────────────────────────────
+# Only needed if sounddevice doesn't work on your system.
+pyaudio>=0.2.13
+
+# ── Optional — Computer automation ────────────────────────────────────────────
+# Only needed for pyautogui-based computer control tools.
+pyautogui>=0.9.54
+
+# ── Optional — OCR ─────────────────────────────────────────────────────────────
+# Only needed for screen text extraction via Tesseract.
+pytesseract>=0.3.10
+# Also requires Tesseract OCR binary installed on your system.
+
+# ── Optional — Knowledge search (ZIM files) ───────────────────────────────────
+# Only needed for offline Wikipedia/Knowledge search via ZIM.
+libzim>=0.0.1
+
+# ── Optional — Media processing ───────────────────────────────────────────────
+moviepy>=1.0.3              # Video processing
+mutagen>=1.47.0             # Audio metadata
+
+# ── Optional — Document generation ─────────────────────────────────────────────
+python-docx>=1.1.0          # Word document creation
+python-pptx>=0.6.23         # PowerPoint creation
+pymupdf>=1.23.0             # PDF reading (fitz)
+
+# ── Optional — Browser automation ─────────────────────────────────────────────
+playwright>=1.40.0           # Browser control
+pandas>=2.0.0               # Data analysis (if using browser tools)
+
+# ── Optional — Alternative LLM providers ───────────────────────────────────────
+# anthropic>=0.25.0           # Claude API (alternative to Gemini)
+# replicate>=0.25.0           # Replicate API (alternative models)

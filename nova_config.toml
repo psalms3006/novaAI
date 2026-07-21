@@ -1,0 +1,61 @@
+# nova_config.toml — Project NOVA configuration
+# All tuneable values live here. Edit this file instead of changing source code.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[nova]
+name        = "NOVA"
+voice       = "Aoede"          # ElevenLabs / Gemini voice name
+max_retries = 3                # Gemini Live reconnect attempts
+history_turns = 6              # max conversation turns kept in-session
+
+[model]
+live_model   = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+vision_model = "gemini-2.0-flash"
+embed_model  = "./nova_embedder"   # local model; falls back to all-MiniLM-L6-v2
+whisper_size = "tiny"              # tiny | base | small | medium
+
+[memory]
+top_k        = 5
+min_score    = 0.30
+max_combined_length = 2000
+extract_every_n = 5            # memory extraction every N turns
+
+[rate_limit]
+min_gap_secs     = 6.0         # minimum gap between Gemini REST calls
+backoff_max_secs = 1800        # max backoff on 429 (30 min)
+
+[audio]
+send_sample_rate    = 16000
+receive_sample_rate = 24000
+chunk_size          = 1024
+
+[tts]
+rate   = 165
+volume = 0.95
+
+[heartbeat]
+interval  = 60       # seconds between ticks
+min_gap   = 300      # minimum seconds between unsolicited messages
+quiet_start = 22     # quiet hours start (10 PM)
+quiet_end   = 7      # quiet hours end   (7 AM)
+
+[safety]
+# Tools that require explicit YES before running.
+# Add tool names here to expand the confirmation list.
+consequential_tools = [
+  "self_editor",
+  "send_message",
+  "autostart",
+  "game_updater",
+]
+# Actions within file_controller that are safe without confirmation
+safe_file_actions   = ["list", "read", "find", "info"]
+audit_max_lines     = 500
+
+[server]
+phone_port = 5050
+ui_port    = 8080
+
+[offline]
+models   = ["tinyllama", "llama3.2", "phi3", "mistral"]
+timeouts = {tinyllama = 15, llama3_2 = 30, phi3 = 30, mistral = 45}
