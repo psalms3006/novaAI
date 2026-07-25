@@ -23,6 +23,9 @@ env/
 # Logs
 *.log
 logs/
+
+# Archive
+archive/
 archive/*.log
 
 # Databases
@@ -71,25 +74,28 @@ models/
 *.mp3
 *.flac
 
-# Keep sample audio if needed
+# Keep sample audio
 !samples/
 !samples/**
 
 # =========================
-# Images generated at runtime
+# Runtime Output
 # =========================
 generated/
 captures/
+nova_memories/
+heartbeat_*.json
+memory.json
+memory_meta.json
+memory_texts.json
 
 # =========================
-# Temporary files
+# Temporary / Backup
 # =========================
 *.tmp
 *.bak
-*.old
-
-# Backup Python files
 *.bak.*
+*.old
 
 # =========================
 # OS
