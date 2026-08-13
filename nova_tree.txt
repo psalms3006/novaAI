@@ -1,4 +1,3 @@
-.env
 .gitignore
 2.jpg
 AGENT.md
@@ -8,7 +7,6 @@ CHANGES.md
 cleanup.py
 config.py
 ENGINEERING_REPORT.md
-en_US-lessac-medium.onnx
 gemini_compat.py
 goals.json
 heartbeat_inbox.json
@@ -95,7 +93,6 @@ archive\test.wav
 archive\test.wav.import
 archive\test_output.wav
 archive\test_output.wav.import
-config\api_keys.json
 core\boot.py
 core\capability_bus.py
 core\connectivity.py
