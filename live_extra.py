@@ -238,9 +238,12 @@ class NOVALive:
                 _diag("SEND", f"⚠️ send FAILED ({consecutive_failures} in a row): {type(e).__name__}: {e} "
                                f"— exception is being swallowed here, task keeps looping on a dead session")
                 if consecutive_failures >= 5:
-                    _diag("SEND", "🔴 5+ consecutive send failures — session is almost certainly dead but "
-                                   "this task will never tell run()'s TaskGroup, because the exception is "
-                                   "caught locally. This is a likely root cause of 'connects but no response'.")
+                    _diag("SEND", "🔴 5+ consecutive send failures — forcing session teardown so "
+                                   "receive_audio fails fast and run()'s TaskGroup reconnects, instead "
+                                   "of looping silently on a dead session.")
+                    raise RuntimeError(
+                        f"send_realtime_input failed {consecutive_failures}x consecutively — session dead"
+                    )
 
     async def _listen_audio(self) -> None:
         print("🎙️  Mic open")

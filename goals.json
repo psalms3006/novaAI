@@ -1,0 +1,116 @@
+{
+  "goals": {
+    "goal_1786479375795": {
+      "goal_id": "goal_1786479375795",
+      "mission": "test mission",
+      "status": "ACTIVE",
+      "plan": [
+        {
+          "step_id": "s1",
+          "description": "test mission",
+          "status": "PENDING",
+          "tool": null,
+          "agent": null,
+          "input": null,
+          "output": null,
+          "error": null,
+          "verification": null,
+          "retry_count": 0,
+          "max_retries": 2,
+          "outcome": null,
+          "created_at": 1786479375.7952657,
+          "updated_at": 1786479375.7952657,
+          "completed_at": null
+        }
+      ],
+      "metadata": {},
+      "created_at": 1786479375.7952657,
+      "updated_at": 1786479375.7952657,
+      "completed_at": null
+    },
+    "goal_1786479580503": {
+      "goal_id": "goal_1786479580503",
+      "mission": "test mission",
+      "status": "ACTIVE",
+      "plan": [
+        {
+          "step_id": "s1",
+          "description": "test mission",
+          "status": "PENDING",
+          "tool": null,
+          "agent": null,
+          "input": null,
+          "output": null,
+          "error": null,
+          "verification": null,
+          "retry_count": 0,
+          "max_retries": 2,
+          "outcome": null,
+          "created_at": 1786479580.503236,
+          "updated_at": 1786479580.503236,
+          "completed_at": null
+        }
+      ],
+      "metadata": {},
+      "created_at": 1786479580.503236,
+      "updated_at": 1786479580.503236,
+      "completed_at": null
+    },
+    "goal_1786479688086": {
+      "goal_id": "goal_1786479688086",
+      "mission": "test mission",
+      "status": "ACTIVE",
+      "plan": [
+        {
+          "step_id": "s1",
+          "description": "test mission",
+          "status": "PENDING",
+          "tool": null,
+          "agent": null,
+          "input": null,
+          "output": null,
+          "error": null,
+          "verification": null,
+          "retry_count": 0,
+          "max_retries": 2,
+          "outcome": null,
+          "created_at": 1786479688.086862,
+          "updated_at": 1786479688.086862,
+          "completed_at": null
+        }
+      ],
+      "metadata": {},
+      "created_at": 1786479688.086862,
+      "updated_at": 1786479688.086862,
+      "completed_at": null
+    },
+    "goal_1786479957652": {
+      "goal_id": "goal_1786479957652",
+      "mission": "temp verification mission",
+      "status": "ACTIVE",
+      "plan": [
+        {
+          "step_id": "s1",
+          "description": "temp verification mission",
+          "status": "PENDING",
+          "tool": null,
+          "agent": null,
+          "input": null,
+          "output": null,
+          "error": null,
+          "verification": null,
+          "retry_count": 0,
+          "max_retries": 2,
+          "outcome": null,
+          "created_at": 1786479957.652395,
+          "updated_at": 1786479957.652395,
+          "completed_at": null
+        }
+      ],
+      "metadata": {},
+      "created_at": 1786479957.652395,
+      "updated_at": 1786479957.652395,
+      "completed_at": null
+    }
+  }
+}

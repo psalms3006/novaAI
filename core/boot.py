@@ -194,3 +194,49 @@ class BootManager:
             }
             for name, svc in self._services.items()
         }
+
+
+class BootState:
+    """
+    Lightweight capability gate for NOVA runtime.
+
+    Tracks which optional capabilities have been initialized so they
+    can be started on demand instead of eagerly at import time.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._ready: Dict[str, bool] = {}
+        self._failures: Dict[str, str] = {}
+
+    def mark_ready(self, capability: str) -> None:
+        with self._lock:
+            self._ready[capability] = True
+
+    def mark_failed(self, capability: str, error: str) -> None:
+        with self._lock:
+            self._ready.pop(capability, None)
+            self._failures[capability] = error
+
+    def is_ready(self, capability: str) -> bool:
+        with self._lock:
+            return bool(self._ready.get(capability))
+
+    def needs_init(self, capability: str) -> bool:
+        with self._lock:
+            return capability not in self._ready and capability not in self._failures
+
+    def failure_reason(self, capability: str) -> Optional[str]:
+        with self._lock:
+            return self._failures.get(capability)
+
+    def status(self) -> Dict[str, Dict[str, Any]]:
+        with self._lock:
+            return {
+                name: {
+                    "ready": name in self._ready,
+                    "failed": name in self._failures,
+                    "error": self._failures.get(name),
+                }
+                for name in set(self._ready) | set(self._failures)
+            }

@@ -8,10 +8,12 @@ importing back into nova.py. Do not import nova.py from here, ever.
 """
 from __future__ import annotations
 from typing import Any, List, Optional
+import threading
 
 _embedder: Optional[Any] = None
+_embedder_loaded = threading.Event()
 _memory_texts: List[str] = []
 _planner: Optional[Any] = None
 _rest_backoff_until: float = 0.0
 _rest_backoff_secs: float = 0.0
-_mcp_bridge: Optional[Any] = None  # nova.mcp.bridge.MCPBridge instance, set in main()
+_mcp_bridge: Optional[Any] = None  # nova_mcp.bridge.MCPBridge instance, set in main()

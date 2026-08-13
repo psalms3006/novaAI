@@ -73,6 +73,15 @@ ui.error("Something went wrong")
 NOVA_DIR    = Path(__file__).parent.resolve()
 NOVA_SCRIPT = NOVA_DIR / "nova.py"
 
+def _get_wake_word() -> str:
+    try:
+        from agent.identity import get_wake_word
+        return get_wake_word()
+    except Exception:
+        return "nova"
+
+WAKE_WORD = _get_wake_word()
+
 # Wake phrases — substring match (case-insensitive).
 # Keep them short so Whisper-tiny transcribes them correctly.
 WAKE_PHRASES: List[str] = [
@@ -102,7 +111,7 @@ WAKE_PHRASES: List[str] = [
 WAKE_COMMAND_WORDS = [
     "wake", "hello", "hey", "hi", "rise", "come", "start",
     "activate", "ok", "okay", "good", "morning", "evening",
-    "night", "yo", "sup", "up", "online",
+    "night", "yo", "sup", "up", "online", WAKE_WORD,
 ]
 
 # ── Audio ──────────────────────────────────────────────────────────────────
@@ -266,13 +275,15 @@ def _check_transcript(text: str) -> bool:
         if phrase in text:
             print(f"[WAKE] 🎤 '{text}' → exact match: '{phrase}'")
             return True
-    # Fuzzy: "nova" + any command word
-    if "nova" in text.split():
-        words = set(text.split())
-        for cmd in WAKE_COMMAND_WORDS:
-            if cmd in words:
-                print(f"[WAKE] 🎤 '{text}' → fuzzy match (nova + {cmd!r})")
-                return True
+    # Fuzzy: wake word or any command word
+    words = set(text.split())
+    if WAKE_WORD in words:
+        print(f"[WAKE] 🎤 '{text}' → wake word match: '{WAKE_WORD}'")
+        return True
+    for cmd in WAKE_COMMAND_WORDS:
+        if cmd in words:
+            print(f"[WAKE] 🎤 '{text}' → fuzzy match ({cmd!r})")
+            return True
     return False
 
 

@@ -353,8 +353,8 @@ class Heartbeat:
 
 def handle_heartbeat_command(cmd: str, hb: Heartbeat) -> Optional[str]:
     """
-    Handle /inbox, /dismiss, /pause, /resume, /heartbeat commands.
-    Returns reply string or None if not a heartbeat command.
+    Handle /inbox, /dismiss, /pause, /resume, /heartbeat, and /goal commands.
+    Returns reply string or None if not a heartbeat/goal command.
     """
     cmd = cmd.strip()
     if cmd == "/inbox":
@@ -377,4 +377,25 @@ def handle_heartbeat_command(cmd: str, hb: Heartbeat) -> Optional[str]:
             f"Quiet hours: {QUIET_HOUR_START}:00–{QUIET_HOUR_END}:00 | "
             f"Unread notices: {len(hb.inbox.unread())}"
         )
+    if cmd in ("/goal", "/goals"):
+        try:
+            from core.goal_engine import GoalEngine
+            engine = GoalEngine()
+            goals = engine.recover_unfinished()
+            if not goals:
+                return "No active goals."
+            lines = [f"• {g.goal_id}: {g.mission} [{g.status}]" for g in goals]
+            return "
+".join(lines)
+        except Exception as e:
+            return f"Goal lookup failed: {e}"
+    if cmd.startswith("/goal create "):
+        mission = cmd.split(maxsplit=2)[2]
+        try:
+            from core.goal_engine import GoalEngine
+            engine = GoalEngine()
+            goal = engine.create_goal(mission)
+            return f"Goal created: {goal.goal_id}"
+        except Exception as e:
+            return f"Goal creation failed: {e}"
     return None

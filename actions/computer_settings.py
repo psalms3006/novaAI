@@ -25,43 +25,71 @@ def execute(args: dict) -> str:
 
         elif action == "volume_up":
             if system == "Windows":
-                subprocess.run(
-                    ["nircmd.exe", "changesysvolume", "2000"], check=False)
+                try:
+                    from actions._audio_win import step_volume
+                    step_volume(+0.05)
+                    return "Volume increased."
+                except Exception as e:
+                    return f"Volume control failed: {e}. Install pycaw: pip install pycaw comtypes"
             elif system == "Linux":
                 subprocess.run(["amixer", "set", "Master", "5%+"], check=False)
-            return "Volume increased."
+                return "Volume increased."
+            return "Volume control not available on this OS."
 
         elif action == "volume_down":
             if system == "Windows":
-                subprocess.run(
-                    ["nircmd.exe", "changesysvolume", "-2000"], check=False)
+                try:
+                    from actions._audio_win import step_volume
+                    step_volume(-0.05)
+                    return "Volume decreased."
+                except Exception as e:
+                    return f"Volume control failed: {e}. Install pycaw: pip install pycaw comtypes"
             elif system == "Linux":
                 subprocess.run(["amixer", "set", "Master", "5%-"], check=False)
-            return "Volume decreased."
+                return "Volume decreased."
+            return "Volume control not available on this OS."
 
         elif action == "volume_mute":
             if system == "Windows":
-                subprocess.run(
-                    ["nircmd.exe", "mutesysvolume", "2"], check=False)
+                try:
+                    from actions._audio_win import set_mute
+                    muted = set_mute()
+                    return "Volume muted." if muted else "Volume unmuted."
+                except Exception as e:
+                    return f"Mute failed: {e}. Install pycaw: pip install pycaw comtypes"
             elif system == "Linux":
                 subprocess.run(
                     ["amixer", "set", "Master", "toggle"], check=False)
-            return "Volume muted/unmuted."
+                return "Volume muted/unmuted."
+            return "Volume control not available on this OS."
 
         elif action == "brightness_up":
             if system == "Windows":
-                # Requires brightness control utility
-                return "Brightness control not implemented for Windows."
+                try:
+                    import screen_brightness_control as sbc
+                    current = sbc.get_brightness(display=0)[0]
+                    sbc.set_brightness(min(100, current + 10))
+                    return "Brightness increased."
+                except Exception as e:
+                    return f"Brightness control failed: {e}. Install: pip install screen-brightness-control"
             elif system == "Linux":
                 subprocess.run(["brightnessctl", "set", "+10%"], check=False)
                 return "Brightness increased."
-            return "Brightness control not available."
+            return "Brightness control not available on this OS."
 
         elif action == "brightness_down":
-            if system == "Linux":
+            if system == "Windows":
+                try:
+                    import screen_brightness_control as sbc
+                    current = sbc.get_brightness(display=0)[0]
+                    sbc.set_brightness(max(0, current - 10))
+                    return "Brightness decreased."
+                except Exception as e:
+                    return f"Brightness control failed: {e}. Install: pip install screen-brightness-control"
+            elif system == "Linux":
                 subprocess.run(["brightnessctl", "set", "10%-"], check=False)
                 return "Brightness decreased."
-            return "Brightness control not available."
+            return "Brightness control not available on this OS."
 
         elif action == "lock":
             if system == "Windows":

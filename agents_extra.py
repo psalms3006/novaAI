@@ -24,12 +24,39 @@ import nova as _nova
 log = _nova.log
 _execute_tool_sync = _nova._execute_tool_sync
 _task_desc = _nova._task_desc
-search_memory = _nova.search_memory
-get_all_memory_text = _nova.get_all_memory_text
-_vision_analyze = _nova._vision_analyze
-_TOOL_AVAILABILITY = _nova._TOOL_AVAILABILITY
-HAS_AUTONOMOUS_AGENTS = _nova.HAS_AUTONOMOUS_AGENTS
-get_all_agents = _nova.get_all_agents
+def _nova_get(name, default=None):
+    try:
+        return getattr(_nova, name, default)
+    except Exception:
+        return default
+
+
+search_memory = _nova_get('search_memory')
+get_all_memory_text = _nova_get('get_all_memory_text')
+_vision_analyze = _nova_get('_vision_analyze')
+_TOOL_AVAILABILITY = _nova_get('_TOOL_AVAILABILITY', {})
+HAS_AUTONOMOUS_AGENTS = _nova_get('HAS_AUTONOMOUS_AGENTS', False)
+get_all_agents = _nova_get('get_all_agents')
+
+
+def _get_search_memory():
+    if search_memory is not None:
+        return search_memory
+    try:
+        from memory_extra import search_memory as _sm
+        return _sm
+    except Exception:
+        return None
+
+
+def _get_get_all_memory_text():
+    if get_all_memory_text is not None:
+        return get_all_memory_text
+    try:
+        from memory_extra import get_all_memory_text as _gm
+        return _gm
+    except Exception:
+        return None
 
 # ── ORCHESTRATOR ─────────────────────────────────────────────────────────────
 
@@ -369,6 +396,26 @@ def agent_process(user_request: str, meta: dict) -> Optional[str]:
     if _orchestrator is None:
         return None
     try:
+        _cmd = user_request.strip()
+        if _cmd in ('/goal', '/goals'):
+            try:
+                from core.goal_engine import GoalEngine
+                engine = GoalEngine()
+                goals = engine.recover_unfinished()
+                if not goals:
+                    return 'No active goals.'
+                return '\n'.join([f"• {g.goal_id}: {g.mission} [{g.status}]" for g in goals])
+            except Exception as _goal_err:
+                return f'Goal lookup failed: {_goal_err}'
+        if _cmd.startswith('/goal create '):
+            _mission = _cmd.split(maxsplit=2)[2]
+            try:
+                from core.goal_engine import GoalEngine
+                engine = GoalEngine()
+                goal = engine.create_goal(_mission)
+                return f'Goal created: {goal.goal_id}'
+            except Exception as _create_err:
+                return f'Goal creation failed: {_create_err}'
         return _orchestrator.route(user_request, meta)
     except Exception as e:
         log.warning(f"Agent routing failed: {e}. Falling back to general processing.")

@@ -76,6 +76,16 @@ class NovaFAISSMemory:
         with self._embedder_lock:
             if self._embedder is not None:
                 return
+
+            # Wait if loading in background
+            if hasattr(nova_state, '_embedder_loaded'):
+                log.info("Waiting for background embedder load...")
+                # Avoid blocking the boot for too long if something is wrong.
+                if nova_state._embedder_loaded.wait(timeout=5.0):
+                    if nova_state._embedder is not None:
+                        self._embedder = nova_state._embedder
+                        return
+
             try:
                 from sentence_transformers import SentenceTransformer
                 local_path = "./nova_embedder"

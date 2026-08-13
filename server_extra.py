@@ -12,26 +12,35 @@ from typing import Any
 import nova_state
 import nova as _nova
 log = _nova.log
-HAS_FLASK = _nova.HAS_FLASK
+
+
+def _nova_get(name, default=None):
+    try:
+        return getattr(_nova, name, default)
+    except Exception:
+        return default
+
+
+HAS_FLASK = _nova_get('HAS_FLASK', False)
 _Flask = _nova._Flask if HAS_FLASK else None
 _flask_request = _nova._flask_request if HAS_FLASK else None
 _flask_jsonify = _nova._flask_jsonify if HAS_FLASK else None
-HAS_GEMINI = _nova.HAS_GEMINI
-GEMINI_API_KEY = _nova.GEMINI_API_KEY
-NOVA_SYSTEM_PROMPT = _nova.NOVA_SYSTEM_PROMPT
-UI_PORT = _nova.UI_PORT
-PHONE_PORT = _nova.PHONE_PORT
-FORCE_OFFLINE = _nova.FORCE_OFFLINE
-_ui_clients = _nova._ui_clients
-_ui_lock = _nova._ui_lock
-_call_gemini_chat = _nova._call_gemini_chat
-_execute_tool_sync = _nova._execute_tool_sync
-agent_process = _nova.agent_process
-build_memory_context = _nova.build_memory_context
-is_online = _nova.is_online
-get_local_ip = _nova.get_local_ip
-run_offline_loop = _nova.run_offline_loop
-think_offline = _nova.think_offline
+HAS_GEMINI = _nova_get('HAS_GEMINI', False)
+GEMINI_API_KEY = _nova_get('GEMINI_API_KEY')
+NOVA_SYSTEM_PROMPT = _nova_get('NOVA_SYSTEM_PROMPT', '')
+UI_PORT = _nova_get('UI_PORT', 8080)
+PHONE_PORT = _nova_get('PHONE_PORT', 5050)
+FORCE_OFFLINE = _nova_get('FORCE_OFFLINE', False)
+_ui_clients = _nova_get('_ui_clients', [])
+_ui_lock = _nova_get('_ui_lock')
+_call_gemini_chat = _nova_get('_call_gemini_chat')
+_execute_tool_sync = _nova_get('_execute_tool_sync')
+agent_process = _nova_get('agent_process')
+build_memory_context = _nova_get('build_memory_context')
+is_online = _nova_get('is_online')
+get_local_ip = _nova_get('get_local_ip')
+run_offline_loop = _nova_get('run_offline_loop')
+think_offline = _nova_get('think_offline')
 
 def _broadcast_ui(data: dict) -> None:
     """Broadcast a message to all connected UI WebSocket clients."""

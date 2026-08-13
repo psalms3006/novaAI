@@ -129,6 +129,14 @@ def _compare(items: list[str], aspect: str) -> str:
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+def execute(args: dict) -> str:
+    """Standard tool entry point — required by nova.py's dispatcher, which calls
+    every actions/*.py module the same way: execute(args) -> str. This module's
+    real logic lives in web_search() below; this is a thin adapter so it follows
+    the same interface as every other tool module instead of being a special case."""
+    return web_search(args)
+
+
 def web_search(
     parameters:     dict,
     response=None,

@@ -147,93 +147,37 @@ try:
 except Exception:
     _NOVA_CFG = {}
 
-# Default constants used by nova_config.toml overrides.
-# These are defined early so config values can override them later.
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-PIPER_MODEL    = os.getenv("PIPER_MODEL", "en_US-lessac-medium.onnx")
-PIPER_RATE     = int(os.getenv("PIPER_SAMPLE_RATE", "22050"))
-NOVA_VOICE     = os.getenv("NOVA_VOICE", "Aoede")
-VISION_MODEL   = os.getenv("NOVA_VISION_MODEL", "gemini-2.0-flash")
-PHONE_PORT     = int(os.getenv("NOVA_PHONE_PORT", "5050"))
-UI_PORT        = int(os.getenv("NOVA_UI_PORT", "8080"))
-MAX_GEMINI_RETRIES = 3
-MAX_HISTORY_TURNS  = 6
-TTS_RATE       = 165
-TTS_VOLUME     = 0.95
-WHISPER_MODEL_SIZE = "tiny"
-_MEM_EXTRACT_EVERY_N = 5
-_MIN_GAP_BETWEEN_CALLS = 0
 
 def _cfg(section: str, key: str, default):
     """Read a value from nova_config.toml with fallback."""
+    if not isinstance(_NOVA_CFG, dict):
+        return default
     return _NOVA_CFG.get(section, {}).get(key, default)
 
-# Override constants from config (only if config exists)
-if _NOVA_CFG:
-    NOVA_VOICE              = _cfg("nova",       "voice",           NOVA_VOICE)
-    MAX_GEMINI_RETRIES      = _cfg("nova",       "max_retries",     MAX_GEMINI_RETRIES)
-    MAX_HISTORY_TURNS       = _cfg("nova",       "history_turns",   MAX_HISTORY_TURNS)
-    VISION_MODEL            = _cfg("model",      "vision_model",    VISION_MODEL)
-    WHISPER_MODEL_SIZE      = _cfg("model",      "whisper_size",    WHISPER_MODEL_SIZE)
-    TTS_RATE                = _cfg("tts",        "rate",            TTS_RATE)
-    TTS_VOLUME              = _cfg("tts",        "volume",          TTS_VOLUME)
-    PHONE_PORT              = _cfg("server",     "phone_port",      PHONE_PORT)
-    UI_PORT                 = _cfg("server",     "ui_port",         UI_PORT)
-    _MEM_EXTRACT_EVERY_N    = _cfg("memory",     "extract_every_n", 5)
-    _MIN_GAP_BETWEEN_CALLS  = _cfg("rate_limit", "min_gap_secs",    _MIN_GAP_BETWEEN_CALLS)
 
-# ── NOVA patch extensions ────────────────────────────────────────────
-_HAS_NOVA_PATCH = False
-_MEM_EXTRACT_EVERY_N = 5
-EXTRA_TOOL_DECLARATIONS = []
+# Default constants — env fallback only.
+NOVA_VOICE       = os.getenv("NOVA_VOICE", "Aoede")
+PIPER_MODEL      = os.getenv("PIPER_MODEL", "en_US-lessac-medium.onnx")
+PIPER_RATE       = int(os.getenv("PIPER_SAMPLE_RATE", "22050"))
+GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY")
 
-def execute_extra_tool(*a, **k): return None
+# Extensions hook — populated by nova_patches or optional extras when present.
+EXTRA_TOOL_DECLARATIONS: list = []
 
-def offline_greeting(meta: dict, speak_fn, get_input_fn) -> str:
-    return meta.get('user_name', 'there')
-
-def check_network_recovery(*a, **k): return False
-
-class ProactiveAgent:
-    def __init__(self, *a, **k): pass
-    def start(self): pass
-    def update_speak(self, *a): pass
-    def update_meta(self, *a): pass
-
-from nova_memory import NovaMemory
-_HAS_NOVA_PATCH = False  # nova_patches.py defines no such attrs; block removed (dead + double-instantiated NovaMemory)
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-PIPER_MODEL    = os.getenv("PIPER_MODEL", "en_US-lessac-medium.onnx")
-PIPER_RATE     = int(os.getenv("PIPER_SAMPLE_RATE", "22050"))
-NOVA_VOICE     = os.getenv("NOVA_VOICE", "Aoede")
-
-# Vision model — configurable; gemini-2.0-flash is stable and supports vision
-VISION_MODEL = os.getenv("NOVA_VISION_MODEL", "gemini-2.0-flash")
-
-# Gemini Live audio spec
-LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
-CHANNELS            = 1
-SEND_SAMPLE_RATE    = 16000
-RECEIVE_SAMPLE_RATE = 24000
-CHUNK_SIZE          = 1024
-
-# Offline brain — Gemini REST (online) → TinyLlama (fully offline)
-OFFLINE_MODELS   = ["tinyllama"]
-OFFLINE_TIMEOUTS = {"tinyllama": 20}
-
-# Memory
-DIMENSION           = 384
-TOP_K               = 5
-MIN_SCORE           = 0.30
-MAX_COMBINED_LENGTH = 2000
-
-# Offline TTS/STT
-TTS_RATE           = 165
-TTS_VOLUME         = 0.95
-WHISPER_MODEL_SIZE = "tiny"
-DEFAULT_THRESHOLD  = 0.04
-MAX_HISTORY_TURNS  = 6
+# Config overrides — single source of truth from nova_config.toml.
+# Always apply; defaults preserve current behavior when config is absent.
+MAX_GEMINI_RETRIES     = _cfg("nova",       "max_retries",     3)
+MAX_HISTORY_TURNS      = _cfg("nova",       "history_turns",   6)
+VISION_MODEL           = _cfg("model",      "vision_model",    "gemini-2.0-flash")
+WHISPER_MODEL_SIZE     = _cfg("model",      "whisper_size",    "tiny")
+TTS_RATE               = _cfg("tts",        "rate",            165)
+TTS_VOLUME             = _cfg("tts",        "volume",          0.95)
+PHONE_PORT             = _cfg("server",     "phone_port",      5050)
+UI_PORT                = _cfg("server",     "ui_port",         8080)
+_MEM_EXTRACT_EVERY_N   = _cfg("memory",     "extract_every_n", 5)
+_MIN_GAP_BETWEEN_CALLS  = _cfg("rate_limit", "min_gap_secs",    0.0)
+OFFLINE_MODELS         = _cfg("offline",    "models",         ["tinyllama"])
+OFFLINE_TIMEOUTS       = _cfg("offline",    "timeouts",       {"tinyllama": 15})
 
 # File paths
 MEMORY_META_FILE    = Path("memory_meta.json")
@@ -245,11 +189,21 @@ NOVA_SCRIPT_PATH    = Path(os.path.abspath(__file__))
 NOVA_DIR            = NOVA_SCRIPT_PATH.parent
 EMBED_MODEL         = "./nova_embedder" if Path("./nova_embedder").exists() else "all-MiniLM-L6-v2"
 
-# Phone / UI server
-PHONE_PORT = int(os.getenv("NOVA_PHONE_PORT", "5050"))
-UI_PORT    = int(os.getenv("NOVA_UI_PORT", "8080"))
+# Gemini Live audio spec
+LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+CHANNELS            = 1
+SEND_SAMPLE_RATE    = 16000
+RECEIVE_SAMPLE_RATE = 24000
+CHUNK_SIZE          = 1024
 
-# Flags
+# Memory/search defaults
+DIMENSION           = 384
+TOP_K               = 5
+MIN_SCORE           = 0.30
+MAX_COMBINED_LENGTH = 2000
+
+# Offline defaults
+DEFAULT_THRESHOLD  = 0.04
 TEXT_MODE     = "--text"    in sys.argv
 FORCE_OFFLINE = "--offline" in sys.argv or TEXT_MODE
 PHONE_MODE    = "--phone"   in sys.argv
@@ -1438,17 +1392,67 @@ OLLAMA_TOOL_FORMAT = {
     }
 }
 
-from offline_extra import (
-    speak_offline, think_offline_v2, run_offline_loop_v2,
-)
-run_offline_loop = run_offline_loop_v2
-think_offline    = think_offline_v2
+_run_offline_loop_impl = None
+_think_offline_impl = None
+_speak_offline_impl = None
+
+
+def _run_offline_loop_lazy(meta):
+    global _run_offline_loop_impl
+    if _run_offline_loop_impl is None:
+        from offline_extra import run_offline_loop_v2
+        _run_offline_loop_impl = run_offline_loop_v2
+    return _run_offline_loop_impl(meta)
+
+
+def _think_offline_lazy(message, meta):
+    global _think_offline_impl
+    if _think_offline_impl is None:
+        from offline_extra import think_offline_v2
+        _think_offline_impl = think_offline_v2
+    return _think_offline_impl(message, meta)
+
+
+def _speak_offline_lazy(text, block=False):
+    global _speak_offline_impl
+    if _speak_offline_impl is None:
+        from offline_extra import speak_offline
+        _speak_offline_impl = speak_offline
+    return _speak_offline_impl(text, block=block)
+
+
+run_offline_loop = _run_offline_loop_lazy
+think_offline    = _think_offline_lazy
+speak_offline    = _speak_offline_lazy
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  UI BROADCAST
 # ══════════════════════════════════════════════════════════════════════════════
 
-from server_extra import run_ui_server, run_phone_server
+_run_ui_server_impl = None
+_run_phone_server_impl = None
+
+
+def _load_server_extras():
+    global _run_ui_server_impl, _run_phone_server_impl
+    if _run_ui_server_impl is None:
+        from server_extra import run_ui_server, run_phone_server
+        _run_ui_server_impl = run_ui_server
+        _run_phone_server_impl = run_phone_server
+
+
+def _run_ui_server_lazy(meta):
+    _load_server_extras()
+    return _run_ui_server_impl(meta)
+
+
+def _run_phone_server_lazy(meta):
+    _load_server_extras()
+    return _run_phone_server_impl(meta)
+
+
+run_ui_server = _run_ui_server_lazy
+run_phone_server = _run_phone_server_lazy
 
 def main() -> None:
     global _TOOL_AVAILABILITY, _proactive, _nova_memory, _nova_memory 
@@ -1549,6 +1553,27 @@ def main() -> None:
     print(f"  NovaMemory........{_t['NovaMemory']:.2f}s")
     import atexit
     atexit.register(_nova_memory.close_session)
+
+    # ── BootState capability gate ─────────────────────────────────────────────
+    from core.boot import BootState
+    boot_state = BootState()
+
+    # ── Goal recovery ──────────────────────────────────────────────────────────
+    def _recover_goals() -> None:
+        try:
+            from core.goal_engine import GoalEngine
+            _goal_engine = GoalEngine()
+            _unfinished = _goal_engine.recover_unfinished()
+            if _unfinished:
+                print("🔁 Recovered unfinished goal(s):")
+                for g in _unfinished:
+                    next_step = _goal_engine.get_next_step(g.goal_id)
+                    next_desc = next_step.description if next_step else "unknown"
+                    print(f"  - {g.goal_id}: {g.mission} [{g.status}] | next: {next_desc}")
+        except Exception as _goal_recover_error:
+            log.warning("Goal recovery failed: %s", _goal_recover_error)
+
+    _recover_goals()
 
     # ── Reference face ────────────────────────────────────────────────────────
     if REFERENCE_FACE_PATH.exists():

@@ -11,40 +11,58 @@ from scipy.io import wavfile as wav_write
 import nova_state
 import nova as _nova
 log = _nova.log
-HAS_GEMINI = _nova.HAS_GEMINI
-GEMINI_API_KEY = _nova.GEMINI_API_KEY
-TOOL_DECLARATIONS = _nova.TOOL_DECLARATIONS
-NOVA_OFFLINE_PROMPT = _nova.NOVA_OFFLINE_PROMPT
-FORCE_OFFLINE = _nova.FORCE_OFFLINE
-TEXT_MODE = _nova.TEXT_MODE
-OFFLINE_MODELS = _nova.OFFLINE_MODELS
-OFFLINE_TIMEOUTS = _nova.OFFLINE_TIMEOUTS
-ZIM_DATA_PATH = _nova.ZIM_DATA_PATH
-OFFLINE_MAPS_PATH = _nova.OFFLINE_MAPS_PATH
-DEFAULT_THRESHOLD = _nova.DEFAULT_THRESHOLD
-TTS_RATE = _nova.TTS_RATE
-TTS_VOLUME = _nova.TTS_VOLUME
-PIPER_MODEL = _nova.PIPER_MODEL
-PIPER_RATE = _nova.PIPER_RATE
-_MEM_EXTRACT_EVERY_N = _nova._MEM_EXTRACT_EVERY_N
-_stt_loaded = _nova._stt_loaded
-_stt_model_lock = _nova._stt_model_lock
-pyttsx3 = _nova.pyttsx3
-is_online = _nova.is_online
-is_ollama_running = _nova.is_ollama_running
-check_network_recovery = _nova.check_network_recovery
-offline_greeting = _nova.offline_greeting
-add_memory_fact = _nova.add_memory_fact
-build_memory_context = _nova.build_memory_context
-get_all_memory_text = _nova.get_all_memory_text
-extract_memory_updates = _nova.extract_memory_updates
-_execute_tool_sync = _nova._execute_tool_sync
-agent_process = _nova.agent_process
-_call_gemini_chat = _nova._call_gemini_chat
-_trim_history = _nova._trim_history
-get_text_input = _nova.get_text_input
-_load_whisper_async = _nova._load_whisper_async
-calibrate_ambient_noise = _nova.calibrate_ambient_noise
+
+
+def _nova_get(name, default=None):
+    try:
+        return getattr(_nova, name, default)
+    except Exception:
+        return default
+
+
+HAS_GEMINI = _nova_get('HAS_GEMINI', False)
+GEMINI_API_KEY = _nova_get('GEMINI_API_KEY')
+TOOL_DECLARATIONS = _nova_get('TOOL_DECLARATIONS', [])
+NOVA_OFFLINE_PROMPT = _nova_get('NOVA_OFFLINE_PROMPT', '')
+FORCE_OFFLINE = _nova_get('FORCE_OFFLINE', False)
+TEXT_MODE = _nova_get('TEXT_MODE', False)
+OFFLINE_MODELS = _nova_get('OFFLINE_MODELS', [])
+OFFLINE_TIMEOUTS = _nova_get('OFFLINE_TIMEOUTS', {})
+ZIM_DATA_PATH = _nova_get('ZIM_DATA_PATH')
+OFFLINE_MAPS_PATH = _nova_get('OFFLINE_MAPS_PATH')
+DEFAULT_THRESHOLD = _nova_get('DEFAULT_THRESHOLD', 0.04)
+TTS_RATE = _nova_get('TTS_RATE', 165)
+TTS_VOLUME = _nova_get('TTS_VOLUME', 0.95)
+PIPER_MODEL = _nova_get('PIPER_MODEL')
+PIPER_RATE = _nova_get('PIPER_RATE', 22050)
+_MEM_EXTRACT_EVERY_N = _nova_get('_MEM_EXTRACT_EVERY_N', 5)
+_stt_loaded = _nova_get('_stt_loaded')
+_stt_model_lock = _nova_get('_stt_model_lock')
+
+
+def _get_pyttsx3():
+    try:
+        return getattr(_nova, 'pyttsx3', None)
+    except Exception:
+        return None
+
+
+pyttsx3 = _get_pyttsx3()
+is_online = _nova_get('is_online')
+is_ollama_running = _nova_get('is_ollama_running')
+check_network_recovery = _nova_get('check_network_recovery')
+offline_greeting = _nova_get('offline_greeting')
+add_memory_fact = _nova_get('add_memory_fact')
+build_memory_context = _nova_get('build_memory_context')
+get_all_memory_text = _nova_get('get_all_memory_text')
+extract_memory_updates = _nova_get('extract_memory_updates')
+_execute_tool_sync = _nova_get('_execute_tool_sync')
+agent_process = _nova_get('agent_process')
+_call_gemini_chat = _nova_get('_call_gemini_chat')
+_trim_history = _nova_get('_trim_history')
+get_text_input = _nova_get('get_text_input')
+_load_whisper_async = _nova_get('_load_whisper_async')
+calibrate_ambient_noise = _nova_get('calibrate_ambient_noise')
 
 class OfflineState:
     IDLE = "IDLE"

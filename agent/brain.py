@@ -5,7 +5,12 @@ from __future__ import annotations
 import sys
 from typing import Callable, TextIO
 
-from agent.prompts import ASSISTANT_NAME, build_system_prompt
+from agent.prompts import build_system_prompt
+from agent.identity import (
+    get_assistant_name,
+    is_identity_query,
+    build_identity_response,
+)
 from agent.provider import LLMProvider, ProviderError, is_mock_provider
 from agent.tools.registry import ToolContext, ToolRegistry, build_default_registry
 from agent.types import GenerateResult, TurnMessage
@@ -24,6 +29,7 @@ class AgentBrain:
         self._ctx = ToolContext()
         self._history: list[TurnMessage] = []
         self._system = build_system_prompt()
+        self._assistant_name = get_assistant_name()
 
     @property
     def history(self) -> list[TurnMessage]:
@@ -100,7 +106,7 @@ class AgentBrain:
             result = self._run_tool_loop(sink)
 
             if result.text:
-                sink.write(f"{ASSISTANT_NAME}: ")
+                sink.write(f"{self._assistant_name}: ")
                 sink.flush()
                 self._stream_text(result.text, sink)
                 sink.write("\n")
@@ -108,7 +114,7 @@ class AgentBrain:
                 reply = result.text.strip()
             else:
                 reply = "I didn't get a response from the model. Try again."
-                sink.write(f"{ASSISTANT_NAME}: {reply}\n")
+                sink.write(f"{self._assistant_name}: {reply}\n")
                 sink.flush()
                 self._history.pop()
                 return reply
@@ -141,7 +147,7 @@ class AgentBrain:
         reader = read_line or (lambda: input("You: "))
 
         tool_names = ", ".join(t["name"] for t in self._registry.schemas())
-        sink.write(f"\n{ASSISTANT_NAME} (text mode — Tier 2)\n")
+        sink.write(f"\n{self._assistant_name} (text mode — Tier 2)\n")
         sink.write(f"Tools: {tool_names}\n")
         sink.write("Type a message and press Enter. Commands: /quit, /clear, /facts\n\n")
 

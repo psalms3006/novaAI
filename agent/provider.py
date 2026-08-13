@@ -211,12 +211,7 @@ class GeminiProvider:
                     )
                 )
             elif role == "assistant":
-        try:
                 parts: list[Any] = []
-        except ImportError as exc:
-            raise ProviderError(
-                "google-generativeai package not installed. Run: pip install google-generativeai"
-            ) from exc
                 if msg.get("content"):
                     parts.append(self._types.Part(text=msg["content"]))
                 for tc in msg.get("tool_calls") or []:

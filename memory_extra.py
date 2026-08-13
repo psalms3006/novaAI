@@ -61,13 +61,20 @@ def _rebuild_index() -> None:
 def load_memory() -> dict:
     global _faiss_index
     meta: Dict[str, str] = {"user_name": "", "user_gender": ""}
-
     if MEMORY_META_FILE.exists():
         try:
             meta = json.loads(MEMORY_META_FILE.read_text(encoding="utf-8"))
         except json.JSONDecodeError as e:
             log.error(f"Corrupted memory_meta.json: {e}")
             shutil.move(str(MEMORY_META_FILE), f"{MEMORY_META_FILE}.corrupted.{int(time.time())}")
+    try:
+        from agent.identity import get_assistant_name, get_product_name, get_company, get_wake_word
+        meta.setdefault("assistant_name", get_assistant_name())
+        meta.setdefault("product_name", get_product_name())
+        meta.setdefault("company", get_company())
+        meta.setdefault("wake_word", get_wake_word())
+    except Exception:
+        pass
 
     nova_state._memory_texts = []
     if MEMORY_TEXTS_FILE.exists():

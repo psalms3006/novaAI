@@ -59,3 +59,8 @@ ui_port    = 8080
 [offline]
 models   = ["tinyllama", "llama3.2", "phi3", "mistral"]
 timeouts = {tinyllama = 15, llama3_2 = 30, phi3 = 30, mistral = 45}
+
+[identity]
+assistant_name = "Nova"
+company = "Omniel"
+aliases = []
