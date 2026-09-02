@@ -69,6 +69,15 @@ class IntelligenceRouter:
         tool network requirements to make intelligent routing decisions.
         """
         state = self._connectivity.state
++        # ---- DEBUG ----
++        # Show whether we have a Gemini provider registered
++        gemini_present = "set" if self._providers.get("gemini") is not None else "None"
++        print(f"[DEBUG] gemini_provider: {gemini_present}")
++        # Show current connectivity state
++        print(f"[DEBUG] connectivity_state: {state.name}")
++        # Show online preference flag
++        print(f"[DEBUG] online_preferred: {self._online_preferred}")
++        # ---- END DEBUG ----
 
         # Classify the task based on tool requirements
         task_class = self._classify_task(tool_names)
@@ -104,36 +113,60 @@ class IntelligenceRouter:
         if task_class == TaskClassification.LOCAL:
             for name, prov in healthy:
                 if "ollama" in name.lower():
+                    debug_branch = "LOCAL -> Ollama"
+                    print(f"[DEBUG] branch: {debug_branch}")
                     return prov
             # If no Ollama, any healthy provider will do
-
+            debug_branch = "LOCAL -> any healthy"
+            print(f"[DEBUG] branch: {debug_branch}")
+            # will fall through to later fallback
+ 
         # ONLINE task: prefer Gemini (cloud capabilities needed)
         if task_class == TaskClassification.ONLINE:
             if state != ConnectivityState.OFFLINE:
                 for name, prov in healthy:
                     if "gemini" in name.lower():
+                        debug_branch = "ONLINE -> Gemini"
+                        print(f"[DEBUG] branch: {debug_branch}")
                         return prov
-
+            # No Gemini found
+            debug_branch = "ONLINE -> any healthy"
+            print(f"[DEBUG] branch: {debug_branch}")
+ 
         # HYBRID or fallback: use connectivity + preference
         if self._online_preferred and state == ConnectivityState.ONLINE:
             for name, prov in healthy:
                 if "gemini" in name.lower():
+                    debug_branch = "HYBRID (online preferred) -> Gemini"
+                    print(f"[DEBUG] branch: {debug_branch}")
                     return prov
-
+            # No Gemini found in HYBRID preference
+            debug_branch = "HYBRID (online preferred) -> any healthy"
+            print(f"[DEBUG] branch: {debug_branch}")
+ 
         if state == ConnectivityState.DEGRADED:
             # Degraded: check if the previously-used online provider is still healthy
             if self._last_provider_used:
                 prev = self._providers.get(self._last_provider_used)
                 if prev and prev.health.is_healthy and prev.is_available():
+                    debug_branch = "DEGRADED -> previous provider"
+                    print(f"[DEBUG] branch: {debug_branch}")
                     return prev
             # Fall through to local preference
-
+ 
         if state in (ConnectivityState.OFFLINE, ConnectivityState.DEGRADED):
             for name, prov in healthy:
                 if "ollama" in name.lower():
+                    debug_branch = "OFFLINE/DEGRADED -> Ollama"
+                    print(f"[DEBUG] branch: {debug_branch}")
                     return prov
-
+            debug_branch = "OFFLINE/DEGRADED -> any healthy"
+            print(f"[DEBUG] branch: {debug_branch}")
+ 
         # Final fallback: first healthy provider
+        debug_branch = "FINAL fallback"
+        print(f"[DEBUG] branch: {debug_branch}")
+        print(f"[DEBUG] final provider: {healthy[0][0] if healthy else 'None'}")
         return healthy[0][1] if healthy else None
 
     def _classify_task(self, tool_names: Optional[List[str]] = None) -> TaskClassification:
