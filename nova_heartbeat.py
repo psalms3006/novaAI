@@ -385,8 +385,7 @@ def handle_heartbeat_command(cmd: str, hb: Heartbeat) -> Optional[str]:
             if not goals:
                 return "No active goals."
             lines = [f"• {g.goal_id}: {g.mission} [{g.status}]" for g in goals]
-            return "
-".join(lines)
+            return "\n".join(lines)
         except Exception as e:
             return f"Goal lookup failed: {e}"
     if cmd.startswith("/goal create "):

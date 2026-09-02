@@ -1,0 +1,18 @@
+[Unit]
+Description=NOVA phone server (Gemini REST, Flask/Waitress)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nova
+Group=nova
+WorkingDirectory=/opt/nova
+EnvironmentFile=/opt/nova/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/nova/venv/bin/python /opt/nova/nova.py --phone
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

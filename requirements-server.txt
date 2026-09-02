@@ -1,0 +1,25 @@
+# ══════════════════════════════════════════════════════════════════════════
+# NOVA cloud phone-server dependencies (Linux VM, headless)
+#
+# Install:  pip install -r requirements-server.txt
+# Run:      python nova.py --phone   (via systemd, binds 0.0.0.0:5050)
+#
+# This is the MINIMAL set the phone/UI server needs. Audio/GUI/local-tools
+# packages are intentionally excluded -- nova.py degrades gracefully without
+# them (sounddevice import is guarded, memory search falls back to keyword).
+# ══════════════════════════════════════════════════════════════════════════
+
+# web + config
+python-dotenv>=1.0.0
+flask>=3.0.0
+waitress>=3.0.0            # production WSGI runner (used automatically)
+
+# LLM
+google-genai>=1.0.0        # Gemini REST API (the phone server uses REST chat)
+
+# system info / misc
+psutil>=5.9.0
+pyyaml>=6.0
+
+# memory (optional but useful on the server)
+numpy>=1.26.0              # word-overlap scoring in living memory search

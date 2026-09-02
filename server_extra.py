@@ -6,7 +6,7 @@ Zero behavior change. _memory_texts / _planner accessed via _nova. (owned
 by nova.py, mutated in main()); everything else here is never reassigned.
 """
 from __future__ import annotations
-import json, webbrowser
+import json, os, webbrowser
 from typing import Any
 
 import nova_state
@@ -21,6 +21,34 @@ def _nova_get(name, default=None):
         return default
 
 
+def _resolve_call(name, *modules, default=None):
+    """Resolve a callable from the given modules; None if absent everywhere."""
+    for mod in modules:
+        if mod is None:
+            continue
+        v = getattr(mod, name, None)
+        if v is not None:
+            return v
+    return default
+
+
+# Owning modules for callables nova.py only re-exports in some versions.
+# They are already loaded in-process once the server starts, so pulling them
+# from sys.modules avoids re-importing their heavy dependency chains.
+import sys as _sys
+
+
+def _loaded_module(name):
+    try:
+        return _sys.modules.get(name) or __import__(name)
+    except Exception:
+        return None
+
+
+_live_extra = _loaded_module('live_extra')
+_agents_extra = _loaded_module('agents_extra')
+
+
 HAS_FLASK = _nova_get('HAS_FLASK', False)
 _Flask = _nova._Flask if HAS_FLASK else None
 _flask_request = _nova._flask_request if HAS_FLASK else None
@@ -33,14 +61,14 @@ PHONE_PORT = _nova_get('PHONE_PORT', 5050)
 FORCE_OFFLINE = _nova_get('FORCE_OFFLINE', False)
 _ui_clients = _nova_get('_ui_clients', [])
 _ui_lock = _nova_get('_ui_lock')
-_call_gemini_chat = _nova_get('_call_gemini_chat')
-_execute_tool_sync = _nova_get('_execute_tool_sync')
-agent_process = _nova_get('agent_process')
-build_memory_context = _nova_get('build_memory_context')
-is_online = _nova_get('is_online')
-get_local_ip = _nova_get('get_local_ip')
-run_offline_loop = _nova_get('run_offline_loop')
-think_offline = _nova_get('think_offline')
+_call_gemini_chat = _resolve_call('_call_gemini_chat', _live_extra, _nova)
+_execute_tool_sync = _resolve_call('_execute_tool_sync', _live_extra, _nova)
+agent_process = _resolve_call('agent_process', _agents_extra, _nova)
+build_memory_context = _resolve_call('build_memory_context', _live_extra, _nova)
+is_online = _resolve_call('is_online', _live_extra, _nova)
+get_local_ip = _resolve_call('get_local_ip', _live_extra, _nova)
+run_offline_loop = _resolve_call('run_offline_loop', _live_extra, _nova)
+think_offline = _resolve_call('think_offline', _live_extra, _nova)
 
 def _broadcast_ui(data: dict) -> None:
     """Broadcast a message to all connected UI WebSocket clients."""
@@ -54,6 +82,60 @@ def _broadcast_ui(data: dict) -> None:
         for d in dead:
             if d in _ui_clients:
                 _ui_clients.remove(d)
+
+
+# ── shared-secret auth for public deployments ─────────────────────────────────
+# Set NOVA_TOKEN in .env to require a token on /chat, /memory and /tasks.
+# The web pages send it automatically once the user opens ?token=... or enters it.
+try:
+    import hmac as _hmac
+    _HAS_HMAC = True
+except Exception:
+    _HAS_HMAC = False
+NOVA_TOKEN = os.environ.get("NOVA_TOKEN", "").strip()
+
+
+def _auth_ok() -> bool:
+    if not NOVA_TOKEN:
+        return True
+    supplied = (_flask_request.headers.get("X-NOVA-Token", "")
+                or _flask_request.args.get("token", "") or "").strip()
+    if not supplied:
+        return False
+    if not _HAS_HMAC:
+        return supplied == NOVA_TOKEN
+    return _hmac.compare_digest(supplied, NOVA_TOKEN)
+
+
+def _inject_auth_script(html: str) -> str:
+    """Add a tiny fetch-wrapper to the page so it sends the token with every call."""
+    if not NOVA_TOKEN:
+        return html
+    snippet = (
+        "<script>\n"
+        "(function(){\n"
+        "var t=new URLSearchParams(location.search).get('token');"
+        "if(t){sessionStorage.setItem('nova_token',t);}\n"
+        "var tok=sessionStorage.getItem('nova_token')||'';\n"
+        "if(!tok){tok=window.prompt('NOVA access token:')||'';sessionStorage.setItem('nova_token',tok);}\n"
+        "var o=window.fetch;\n"
+        "window.fetch=function(u,p){p=p||{};var h=new Headers(p.headers||{});"
+        "if(tok){h.set('X-NOVA-Token',tok);}p.headers=h;return o.call(this,u,p);};\n"
+        "})();\n"
+        "</script>\n"
+    )
+    if "<head>" in html:
+        return html.replace("<head>", "<head>\n" + snippet, 1)
+    return snippet + html
+
+
+def _serve_app(app, host: str, port: int) -> None:
+    """Production-runner: waitress when available, else Flask dev server."""
+    try:
+        import waitress
+        waitress.serve(app, host=host, port=port, threads=8)
+    except ImportError:
+        app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -432,12 +514,14 @@ def run_ui_server(meta: dict) -> None:
 
     @app.route("/")
     def index() -> str:
-        return NOVA_UI_HTML
+        return _inject_auth_script(NOVA_UI_HTML)
 
     @app.route("/chat", methods=["POST"])
     def chat() -> Any:
         data    = _flask_request.get_json(force=True, silent=True) or {}
         message = str(data.get("message", "")).strip()
+        if not _auth_ok():
+            return _flask_jsonify({"reply": "Unauthorized: set a valid token (open with ?token=...)."}), 401
         if not message:
             return _flask_jsonify({"reply": "I didn't receive a message."})
         try:
@@ -475,7 +559,34 @@ def run_ui_server(meta: dict) -> None:
 
     @app.route("/memory")
     def memory() -> Any:
-        return _flask_jsonify({"user": meta.get("user_name", ""), "facts": nova_state._memory_texts})
+        if not _auth_ok():
+            return _flask_jsonify({"error": "unauthorized"}), 401
+        facts = list(nova_state._memory_texts)
+        try:
+            _lm = nova_state._living_memory
+            if _lm is not None:
+                for rec in _lm.all()[-15:]:
+                    txt = (rec or {}).get("text", "").strip()
+                    if txt and txt not in facts:
+                        facts.append(txt)
+        except Exception:
+            pass
+        return _flask_jsonify({"user": meta.get("user_name", ""), "facts": facts})
+
+    @app.route("/tasks")
+    def tasks() -> Any:
+        if not _auth_ok():
+            return _flask_jsonify({"error": "unauthorized"}), 401
+        try:
+            tm = nova_state._task_manager
+            if tm is None:
+                return _flask_jsonify({"error": "task manager not initialized"})
+            return _flask_jsonify({
+                "status": tm.exec_command("status"),
+                "list": tm.exec_command("list"),
+            })
+        except Exception as e:
+            return _flask_jsonify({"error": str(e)})
 
     if has_sock:
         from flask_sock import Sock as _Sock  # noqa: F811
@@ -554,7 +665,7 @@ def run_ui_server(meta: dict) -> None:
         nova_state._planner.set_speak(lambda t: _broadcast_ui({"type": "nova_speak", "text": t}))
 
     try:
-        app.run(host="0.0.0.0", port=UI_PORT, debug=False, use_reloader=False, threaded=True)
+        _serve_app(app, "0.0.0.0", UI_PORT)
     except KeyboardInterrupt:
         print("\n[NOVA] 🌐 UI server stopped.")
 
@@ -631,12 +742,14 @@ def run_phone_server(meta: dict) -> None:
 
     @app.route("/")
     def index() -> str:
-        return PHONE_HTML
+        return _inject_auth_script(PHONE_HTML)
 
     @app.route("/chat", methods=["POST"])
     def chat() -> Any:
         data    = _flask_request.get_json(force=True, silent=True) or {}
         message = str(data.get("message", "")).strip()
+        if not _auth_ok():
+            return _flask_jsonify({"reply": "Unauthorized: set a valid token (open with ?token=...)."}), 401
         if not message:
             return _flask_jsonify({"reply": "I didn't receive a message."})
         try:
@@ -672,7 +785,19 @@ def run_phone_server(meta: dict) -> None:
 
     @app.route("/memory")
     def memory() -> Any:
-        return _flask_jsonify({"user": meta.get("user_name", ""), "facts": nova_state._memory_texts})
+        if not _auth_ok():
+            return _flask_jsonify({"error": "unauthorized"}), 401
+        facts = list(nova_state._memory_texts)
+        try:
+            _lm = nova_state._living_memory
+            if _lm is not None:
+                for rec in _lm.all()[-15:]:
+                    txt = (rec or {}).get("text", "").strip()
+                    if txt and txt not in facts:
+                        facts.append(txt)
+        except Exception:
+            pass
+        return _flask_jsonify({"user": meta.get("user_name", ""), "facts": facts})
 
     local_ip = get_local_ip()
     print("\n[NOVA] 📱 Phone server starting...")
@@ -684,7 +809,7 @@ def run_phone_server(meta: dict) -> None:
         nova_state._planner.set_speak(lambda t: print(f"\n⏰ Reminder: {t}"))
 
     try:
-        app.run(host="0.0.0.0", port=PHONE_PORT, debug=False, use_reloader=False)
+        _serve_app(app, "0.0.0.0", PHONE_PORT)
     except KeyboardInterrupt:
         print("\n[NOVA] 📱 Phone server stopped.")
 

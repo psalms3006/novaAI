@@ -218,7 +218,46 @@ def _inject_context(params: dict, tool: str, step_results: dict, goal: str = "")
 
 # ─── Tool dispatch ────────────────────────────────────────────────────────────
 
+_SHADOW_MONITOR = None
+_GATE_RUNNER = None
+
+
+def _set_shadow(monitor) -> None:
+    """Install a ShadowMonitor (or None) onto the live dispatch path."""
+    global _SHADOW_MONITOR
+    _SHADOW_MONITOR = monitor
+    if monitor is not None:
+        print("[Shadow] live tool dispatch mirrored to orchestrator trust rules.")
+
+
+def _set_gate(runner) -> None:
+    """Install a GatedToolRunner (or None) to enforce orchestrator rules."""
+    global _GATE_RUNNER
+    _GATE_RUNNER = runner
+    if runner is not None:
+        print("[Gate] live tool dispatch now behind orchestrator trust/confirm/verify.")
+
+
 def _call_tool(tool: str, parameters: dict, speak: Callable | None) -> str:
+    """Dispatch a tool, optionally behind the gate and/or through the shadow."""
+    if _GATE_RUNNER is not None:
+        return _GATE_RUNNER.run(
+            tool,
+            parameters,
+            lambda: _dispatch_tool(tool, parameters, speak),
+            speak=speak,
+        )
+    if _SHADOW_MONITOR is not None:
+        return _SHADOW_MONITOR.watch(
+            tool,
+            parameters,
+            lambda: _dispatch_tool(tool, parameters, speak),
+            speak=speak,
+        )
+    return _dispatch_tool(tool, parameters, speak)
+
+
+def _dispatch_tool(tool: str, parameters: dict, speak: Callable | None) -> str:
 
     if tool == "open_app":
         from actions.open_app import open_app
@@ -306,6 +345,34 @@ def _call_tool(tool: str, parameters: dict, speak: Callable | None) -> str:
             f"Unknown tool '{tool}'. "
             "Add it to executor._call_tool or fix the plan to use a known tool."
         )
+
+
+# Opt-in observability: NOVA_SHADOW=1 mirrors every live tool call through the
+# orchestrator's trust/verification rules and writes shadow.compare audit rows.
+if os.environ.get("NOVA_SHADOW", "0").strip() == "1":
+    try:
+        from orchestrator.shadow import default_shadow
+
+        _set_shadow(default_shadow())
+    except Exception as shadow_err:  # noqa: BLE001
+        print(f"[Shadow] setup failed, shadow disabled: {shadow_err}")
+
+# Opt-in enforcement: NOVA_GATED=1 routes every tool call through GatedToolRunner
+# (trust -> confirm -> dispatch -> verify) instead of running it unconditionally.
+# Off by default — enable only after reviewing shadow.compare data.
+if os.environ.get("NOVA_GATED", "0").strip() == "1":
+    try:
+        from orchestrator.gate import GatedToolRunner
+        from trust.confirmation import ConfirmationGate, TextConfirmationRequester
+
+        _set_gate(GatedToolRunner(
+            gate=ConfirmationGate(
+                requester=TextConfirmationRequester(),
+                speak=lambda t: print(f"[NOVA] {t}"),
+            )
+        ))
+    except Exception as gate_err:  # noqa: BLE001
+        print(f"[Gate] setup failed, gate disabled: {gate_err}")
 
 
 # ─── Main executor ────────────────────────────────────────────────────────────

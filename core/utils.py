@@ -1,7 +1,7 @@
 """
 NOVA Core Utilities — Atomic file operations, safe helpers.
 
-Inspired by Hermes' utils.py pattern for atomic file writes with fsync.
+Atomic JSON writes with fsync + os.replace for crash safety.
 """
 from __future__ import annotations
 

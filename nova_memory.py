@@ -1,4 +1,5 @@
 import json
+import os
 import signal
 import sys
 import time
@@ -6,8 +7,23 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+
+def _default_memory_dir() -> Path:
+    """Session files belong with the user's data, not the install directory.
+
+    Frozen (installed) builds write to %APPDATA%\\NOVA\\nova_memories so that
+    uninstalling/upgrade-replacing the install folder never touches session
+    history. Development runs keep the historical ./nova_memories folder.
+    """
+    if getattr(sys, "frozen", False):
+        base = os.getenv("APPDATA")
+        if base:
+            return Path(base) / "NOVA" / "nova_memories"
+    return Path("nova_memories")
+
+
 class NovaMemory:
-    def __init__(self, memory_dir="nova_memories", checkpoint_every_n_turns=10,
+    def __init__(self, memory_dir=None, checkpoint_every_n_turns=10,
                  autosave_seconds=120, summarizer_fn=None):
         """
         checkpoint_every_n_turns: write a snapshot to the archive after this many
@@ -16,8 +32,8 @@ class NovaMemory:
             used instead of the crude truncation summary (e.g. wire in your
             Gemini/Mistral call here for real summaries).
         """
-        self.memory_dir = Path(memory_dir)
-        self.memory_dir.mkdir(exist_ok=True)
+        self.memory_dir = Path(memory_dir) if memory_dir else _default_memory_dir()
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
 
         self.current_session = {
             "started": datetime.now().isoformat(),

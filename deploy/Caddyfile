@@ -1,0 +1,6 @@
+# Caddy reverse proxy: automatic HTTPS for the NOVA phone server.
+# Replace your-domain.duckdns.org with a free subdomain from https://duckdns.org
+# (point it at your server's public IP), then:  sudo caddy reload
+your-domain.duckdns.org {
+    reverse_proxy 127.0.0.1:5050
+}

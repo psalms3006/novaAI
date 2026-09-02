@@ -1,0 +1,1957 @@
+"""desk.bridge - the NOVA Desktop backend: local Flask API + SPA host.
+
+Runs in-process with the full nova stack (started by `python nova.py --desk`),
+bound to 127.0.0.1 only. Reuses the existing pipeline functions via the loaded
+`nova` module (_call_gemini_chat/_execute_tool_sync/build_memory_context/
+_gemini_vision) - no intelligence is duplicated here.
+
+Endpoints (all under /api, guarded by a per-run random token):
+  status, tools, health, bootstrap
+  chat (SSE stream), chat/stop, regenerate
+  conversations (list/create/get/patch/delete/search)
+  memory (get/clear/toggle, search)
+  vision (image + question)
+  voice (start/stop/abort/status)  push-to-talk
+  files (list/save)
+  settings (get/post)
+  tasks
+  confirm (pending/decide)      UI-driven safety gate
+"""
+from __future__ import annotations
+
+import io
+import json
+import os
+import secrets
+import tempfile
+import threading
+import time
+import uuid
+from pathlib import Path
+
+from flask import Flask, Response, jsonify, request
+from flask_sock import Sock
+
+import nova as _nova
+import nova_state
+import nova_safety
+
+from . import chat as desk_chat
+from . import confirm as desk_confirm
+from . import projects as desk_projects
+from . import settings as desk_settings
+from . import store as desk_store
+from . import voice as desk_voice
+from . import live_session as desk_live
+
+log = _nova.log
+APP_VERSION = "1.0.0"
+
+_META: dict = {}
+run_token: str = secrets.token_hex(16)
+_started_at = time.time()
+_stop_events: dict = {}
+_brain_ready: bool = False  # Set by nova_desktop_app after nova.main() completes
+
+_workspace: Path | None = None
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+
+# ── nova resolution helpers (same pattern as server_extra.py) ─────────────────
+
+def _resolve(name, default=None):
+    try:
+        return getattr(_nova, name, default)
+    except Exception:
+        return default
+
+
+def _resolve_call(name, *modules, default=None):
+    for m in modules:
+        if m is None:
+            continue
+        v = getattr(m, name, None)
+        if v is not None:
+            return v
+    return default
+
+
+def _import_mod(name):
+    try:
+        import sys
+        return sys.modules.get(name) or __import__(name)
+    except Exception:
+        return None
+
+
+_live_extra = _import_mod("live_extra")
+_offline_extra = _import_mod("offline_extra")
+_vision_extra = _import_mod("vision_extra")
+_agents_extra = _import_mod("agents_extra")
+
+build_memory_context = _resolve_call("build_memory_context", _live_extra, _nova)
+_gemini_vision = _resolve_call("_gemini_vision", _vision_extra, _nova)
+is_online = _resolve_call("is_online", _live_extra, _nova)
+add_memory_fact = _resolve_call("add_memory_fact", _live_extra, _nova)
+NOVA_SYSTEM_PROMPT = _resolve("NOVA_SYSTEM_PROMPT", "")
+FORCE_OFFLINE = _resolve("FORCE_OFFLINE", False)
+_HAS_GEMINI = _resolve("HAS_GEMINI", False)
+_GEMINI_KEY = _resolve("GEMINI_API_KEY", "")
+_VISION_MODEL = _resolve("VISION_MODEL", "gemini-flash-latest")
+_TOOL_AVAILABILITY = _resolve("_TOOL_AVAILABILITY", {})
+
+
+def _ns(name, default=None):
+    try:
+        return getattr(nova_state, name, default)
+    except Exception:
+        return default
+
+
+def workspace_dir() -> Path:
+    global _workspace
+    if _workspace is None:
+        w = (desk_settings.get("workspace_dir") or "").strip()
+        if w:
+            _workspace = Path(w).expanduser()
+        else:
+            _workspace = desk_settings.app_data_dir() / "workspace"
+        _workspace.mkdir(parents=True, exist_ok=True)
+    return _workspace
+
+
+# ── per-conversation run state ────────────────────────────────────────────────
+
+def stop_event(cid: str):
+    ev = _stop_events.get(cid)
+    if ev is None:
+        ev = threading.Event()
+        _stop_events[cid] = ev
+    return ev
+
+
+# ── Gemini message assembly ───────────────────────────────────────────────────
+
+def _meta_dict() -> dict:
+    m = dict(_META)
+    # The desktop's own identity source is authoritative: default is the neutral
+    # "User" (never an inherited developer name); a name set in Settings persists.
+    m["user_name"] = desk_settings.get("user_name") or "User"
+    m.setdefault("user_gender", "")
+    m.setdefault("channel", "desktop")
+    return m
+
+
+def _history_messages(cid: str, history_turns: int) -> list:
+    convo = desk_store.get_conversation(cid)
+    if not convo:
+        return []
+    turns = []
+    for msg in convo["messages"]:
+        if msg["role"] in ("user", "assistant"):
+            content = (msg.get("content") or "").strip()
+            if content:
+                turns.append({"role": msg["role"], "content": content})
+    if history_turns > 0 and len(turns) > history_turns * 2:
+        turns = turns[-(history_turns * 2):]
+    return turns
+
+
+def _project_for(cid: str | None) -> dict | None:
+    if not cid:
+        return None
+    try:
+        convo = desk_store.get_conversation(cid)
+    except Exception:
+        return None
+    if not convo or not convo.get("project_id"):
+        return None
+    return desk_projects.get_project(convo["project_id"])
+
+
+def _system_prompt(query: str, meta: dict, cid: str | None = None) -> str:
+    parts = [NOVA_SYSTEM_PROMPT]
+
+    proj = _project_for(cid)
+    if proj:
+        parts.append(
+            f"\n\n## Active project: {proj.get('name', 'Untitled')}\n"
+            f"Project context: {proj.get('description') or 'none'}\n"
+            f"Project instructions (follow them for this project):\n"
+            f"{proj.get('instructions') or 'none'}"
+        )
+
+    style = desk_settings.get("response_style", "balanced")
+    if style == "concise":
+        parts.append("\n\n## Response style\n"
+                     "Be concise: short, direct answers. Use lists sparingly. "
+                     "Skip pleasantries.")
+    elif style == "detailed":
+        parts.append("\n\n## Response style\n"
+                     "Be thorough: explain reasoning, include examples and "
+                     "supporting detail where useful.")
+
+    custom = (desk_settings.get("user_system_prompt") or "").strip()
+    if custom:
+        parts.append(
+            "\n\n## User custom instructions\n"
+            "The user has written these instructions and asked you to follow them. "
+            "They add to the directives above but never override the core safety, "
+            "honesty, or user-control rules:\n" + custom
+        )
+
+    if desk_settings.get("memory_enabled", True):
+        try:
+            mem_ctx = build_memory_context(meta, query=query)
+            if mem_ctx:
+                parts.append(f"\n\nMEMORY:\n{mem_ctx}")
+        except Exception as e:
+            log.warning("memory context failed: %s", e)
+    return "\n".join(parts)
+
+
+# ── persistence of a finished turn ────────────────────────────────────────────
+
+def _persist_turn(cid: str, user_text: str, events: list, started: float):
+    """Save the assistant message + tool meta; set an automatic title."""
+    assistant_parts = []
+    tools = []
+    for ev in events:
+        if ev.get("type") == "token":
+            assistant_parts.append(ev.get("text", ""))
+        elif ev.get("type") == "assistant":
+            assistant_parts.append(ev.get("text", ""))
+        elif ev.get("type") == "tool_start":
+            tools.append({
+                "name": ev.get("name"), "label": ev.get("label"),
+                "ok": True, "summary": "", "started": ev.get("ts"),
+            })
+        elif ev.get("type") == "tool_done":
+            if tools:
+                tools[-1].update({"ok": bool(ev.get("ok")), "summary": ev.get("summary", "")})
+    content = "".join(assistant_parts).strip()
+    mid = desk_store.upsert_last_assistant(cid, content, {"tools": tools, "latency": round(time.time() - started, 2)})
+    convo = desk_store.get_conversation(cid)
+    if convo and convo["title"] in ("New chat", ""):
+        title = (user_text or "New chat").strip().splitlines()[0][:48]
+        if title:
+            desk_store.rename_conversation(cid, title)
+    return mid
+
+
+# ── auth decorator ────────────────────────────────────────────────────────────
+
+def _check_desk_token() -> bool:
+    tok = request.headers.get("X-NOVA-Desk", "")
+    return bool(tok) and tok == run_token
+
+
+def require_token(fn):
+    def wrapper(*args, **kwargs):
+        if not _check_desk_token():
+            return jsonify({"error": "unauthorized"}), 401
+        return fn(*args, **kwargs)
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+# ── app ───────────────────────────────────────────────────────────────────────
+
+app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="/static")
+app.json.ensure_ascii = False
+sock = Sock(app)
+
+# Module-level event bus stubs — replaced by real implementations in run_desk_server()
+def _noop_event(event): pass
+def _noop_str(text, role="nova"): pass
+def _noop_task(task_id, label=""): pass
+def _noop_task_done(task_id, ok=True, summary=""): pass
+def _noop_agent(agent_id, task_id, name, action="", tool=""): pass
+def _noop_agent_progress(agent_id, action="", tool=""): pass
+def _noop_agent_done(agent_id, ok=True, summary=""): pass
+def _noop_orb(state): pass
+publish_event = _noop_event
+publish_voice_state = _noop_str
+publish_transcript = _noop_str
+publish_task_start = _noop_task
+publish_task_done = _noop_task_done
+publish_agent_start = _noop_agent
+publish_agent_progress = _noop_agent_progress
+publish_agent_done = _noop_agent_done
+publish_orb_state = _noop_orb
+
+
+@app.get("/")
+def index():
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    html = html.replace("__DESK_TOKEN__", run_token)
+    html = html.replace("__DESK_VERSION__", APP_VERSION)
+    return Response(html, mimetype="text/html")
+
+
+# ── status / meta ─────────────────────────────────────────────────────────────
+
+@app.get("/api/bootstrap")
+@require_token
+def api_bootstrap():
+    return jsonify({
+        "version": APP_VERSION,
+        "token": run_token,
+        "company": _resolve("NOVA_COMPANY", "Omniel") or "Omniel",
+        "assistant_name": _resolve("NOVA_ASSISTANT_NAME", "NOVA") or "NOVA",
+    })
+
+
+@app.get("/api/status")
+@require_token
+def api_status():
+    online = False
+    try:
+        if callable(is_online):
+            # Run is_online with a quick timeout to avoid blocking
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(is_online)
+                try:
+                    online = bool(future.result(timeout=1.0))
+                except (concurrent.futures.TimeoutError, Exception):
+                    online = False
+        elif isinstance(is_online, bool):
+            online = is_online
+    except Exception:
+        pass
+
+    tools = {}
+    try:
+        for name, avail in (dict(_TOOL_AVAILABILITY or {})).items():
+            tools[name] = bool(avail)
+    except Exception:
+        pass
+    tools["remember_fact"] = True
+
+    local_intel = {"available": False, "ollama_running": False, "model": "", "installed": [], "runtime_state": "UNKNOWN"}
+    try:
+        import nova
+        runtime = getattr(nova, "_local_runtime", None)
+        if runtime:
+            local_intel["runtime_state"] = runtime.state.name
+            local_intel["ollama_running"] = runtime.is_running
+    except Exception:
+        pass
+
+    router_state = "unknown"
+    try:
+        import nova
+        _r = getattr(nova, "_nova_router", None)
+        router_state = type(_r).__name__ if _r else "None"
+    except Exception:
+        pass
+
+    connectivity = "online"
+    try:
+        import nova
+        conn = getattr(nova, "_connectivity", None)
+        if conn:
+            connectivity = conn.state.value
+    except Exception:
+        pass
+
+    voice_status = {
+        "available": False,
+        "transcription": {"any": False},
+        "enabled": bool(desk_settings.get("voice_enabled", True)),
+        "responses": bool(desk_settings.get("voice_responses", True)),
+        "provider": "unknown",
+    }
+    try:
+        voice_status["available"] = desk_voice.audio_available()
+    except Exception:
+        pass
+
+    facts_count = 0
+    try:
+        mt = _ns("_memory_texts", None)
+        if mt is not None:
+            facts_count = len(list(mt) if not isinstance(mt, (list, tuple)) else mt)
+    except Exception:
+        pass
+
+    auth = {}
+    try:
+        auth = _auth_status()
+    except Exception:
+        pass
+
+    return jsonify({
+        "online": online,
+        "connectivity": connectivity,
+        "degraded": bool(_resolve("_rest_backoff_until") or False),
+        "model": _VISION_MODEL,
+        "has_key": bool(_GEMINI_KEY),
+        "gemini": bool(_HAS_GEMINI),
+        "tools": tools,
+        "memory": {
+            "enabled": desk_settings.get("memory_enabled", True),
+            "facts": facts_count,
+        },
+        "voice": voice_status,
+        "local_intelligence": local_intel,
+        "brain_ready": _brain_ready,
+        "router_state": router_state,
+        "user": _meta_dict().get("user_name", "User"),
+        "auth": auth,
+        "uptime": round(time.time() - _started_at, 1),
+        "version": APP_VERSION,
+    })
+
+
+def _auth_status() -> dict:
+    """Credential posture for the UI — never contains secrets."""
+    try:
+        from desk import creds as desk_creds
+        return desk_creds.resolve()
+    except Exception as e:
+        return {"mode": "unknown", "onboarded": False, "has_credential": False,
+                "cloud_configured": False, "byok_present": False,
+                "byok_masked": "", "cloud_error": str(e)[:120]}
+
+
+@app.get("/api/capabilities")
+@require_token
+def api_capabilities():
+    """Return a runtime-derived capability inventory."""
+    caps = {}
+
+    # Voice
+    voice_avail = desk_voice.audio_available()
+    voice_stt = desk_voice.transcription_available()
+    caps["voice"] = {
+        "transcription": {"available": bool(voice_stt), "status": "AVAILABLE" if voice_stt else "UNAVAILABLE"},
+        "audio_output": {"available": bool(voice_avail), "status": "AVAILABLE" if voice_avail else "UNAVAILABLE"},
+        "continuous_mode": {"available": bool(desk_settings.get("continuous_conversation", False)), "status": "AVAILABLE" if desk_settings.get("continuous_conversation", False) else "DEGRADED"},
+    }
+
+    # Tools
+    tools = {}
+    for name, avail in (dict(_TOOL_AVAILABILITY or {})).items():
+        tools[name] = {"available": bool(avail), "status": "AVAILABLE" if avail else "UNAVAILABLE"}
+    tools["remember_fact"] = {"available": True, "status": "AVAILABLE"}
+    tools["nova_memory"] = {"available": _ns("_living_memory") is not None, "status": "AVAILABLE" if _ns("_living_memory") else "UNAVAILABLE"}
+    tools["nova_task"] = {"available": _ns("_task_manager") is not None, "status": "AVAILABLE" if _ns("_task_manager") else "UNAVAILABLE"}
+    tools["close_app"] = {"available": True, "status": "AVAILABLE"}
+    caps["tools"] = tools
+
+    # Intelligence
+    caps["intelligence"] = {
+        "online_model": {"available": bool(_HAS_GEMINI and _GEMINI_KEY), "model": _VISION_MODEL if _HAS_GEMINI else "none", "status": "AVAILABLE" if _HAS_GEMINI else "UNAVAILABLE"},
+        "offline_model": {"available": bool(_ns("_nova_router")), "status": "AVAILABLE" if _ns("_nova_router") else "UNAVAILABLE"},
+        "memory": {"available": bool(_ns("_living_memory")), "status": "AVAILABLE" if _ns("_living_memory") else "UNAVAILABLE"},
+        "planner": {"available": True, "status": "AVAILABLE"},
+    }
+
+    # System
+    caps["system"] = {
+        "computer_control": {"available": bool(_TOOL_AVAILABILITY.get("computer_control")), "status": "AVAILABLE" if _TOOL_AVAILABILITY.get("computer_control") else "UNAVAILABLE"},
+        "vision": {"available": bool(_TOOL_AVAILABILITY.get("vision")), "status": "AVAILABLE" if _TOOL_AVAILABILITY.get("vision") else "UNAVAILABLE"},
+        "file_operations": {"available": bool(_TOOL_AVAILABILITY.get("file_controller")), "status": "AVAILABLE" if _TOOL_AVAILABILITY.get("file_controller") else "UNAVAILABLE"},
+        "web_search": {"available": bool(_TOOL_AVAILABILITY.get("web_search")), "status": "AVAILABLE" if _TOOL_AVAILABILITY.get("web_search") else "UNAVAILABLE"},
+        "browser": {"available": bool(_TOOL_AVAILABILITY.get("browser_control")), "status": "AVAILABLE" if _TOOL_AVAILABILITY.get("browser_control") else "UNAVAILABLE"},
+        "app_launcher": {"available": bool(_TOOL_AVAILABILITY.get("open_app")), "status": "AVAILABLE" if _TOOL_AVAILABILITY.get("open_app") else "UNAVAILABLE"},
+    }
+
+    return jsonify({"capabilities": caps})
+
+
+@app.get("/api/health")
+def api_health():
+    return jsonify({"ok": True})
+
+
+# ── tools ─────────────────────────────────────────────────────────────────────
+
+@app.get("/api/tools")
+@require_token
+def api_tools():
+    tools = {}
+    for name, avail in (dict(_TOOL_AVAILABILITY or {})).items():
+        tools[name] = {
+            "available": bool(avail),
+            "label": desk_chat.tool_label(name),
+            "source": "actions" if avail else "unavailable",
+            "category": desk_confirm.TOOL_CATEGORY.get(name, ""),
+            "permission": desk_confirm._permission_for(name),  # noqa: SLF001
+        }
+    tools["remember_fact"] = {"available": True, "label": "Remember fact", "source": "nova",
+                              "category": "memory", "permission": desk_confirm._permission_for("remember_fact")}  # noqa: SLF001
+    tools["nova_memory"] = {"available": _ns("_living_memory") is not None, "label": "Memory store",
+                            "source": "living_memory", "category": "memory",
+                            "permission": desk_confirm._permission_for("nova_memory")}  # noqa: SLF001
+    tools["nova_task"] = {"available": _ns("_task_manager") is not None, "label": "Task manager",
+                          "source": "task_manager", "category": "computer",
+                          "permission": desk_confirm._permission_for("nova_task")}  # noqa: SLF001
+    return jsonify({"tools": tools, "mcp": _mcp_status()})
+
+
+# ── conversations ─────────────────────────────────────────────────────────────
+
+@app.get("/api/conversations")
+@require_token
+def api_conversations():
+    return jsonify({"conversations": desk_store.list_conversations()})
+
+
+@app.get("/api/conversations/search")
+@require_token
+def api_conversations_search():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"conversations": []})
+    return jsonify({"conversations": desk_store.search_conversations(q)})
+
+
+@app.post("/api/conversations")
+@require_token
+def api_new_conversation():
+    data = request.get_json(silent=True) or {}
+    project_id = (data.get("project_id") or "").strip()
+    if project_id and desk_projects.get_project(project_id) is None:
+        return jsonify({"error": "Unknown project"}), 400
+    cid = desk_store.new_conversation(project_id=project_id)
+    return jsonify({"id": cid, "project_id": project_id})
+
+
+@app.get("/api/conversations/<cid>")
+@require_token
+def api_get_conversation(cid):
+    convo = desk_store.get_conversation(cid)
+    if convo is None:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(convo)
+
+
+@app.patch("/api/conversations/<cid>")
+@require_token
+def api_patch_conversation(cid):
+    data = request.get_json(silent=True) or {}
+    title = (data.get("title") or "").strip()
+    if title:
+        desk_store.rename_conversation(cid, title)
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/conversations/<cid>")
+@require_token
+def api_delete_conversation(cid):
+    desk_store.delete_conversation(cid)
+    _stop_events.pop(cid, None)
+    return jsonify({"ok": True})
+
+
+# ── chat ──────────────────────────────────────────────────────────────────────
+
+def _run_chat(cid, message, image_path, streaming):
+    meta = _meta_dict()
+    msgs = [{"role": "system", "content": _system_prompt(message, meta, cid)}]
+    msgs += _history_messages(cid, int(desk_settings.get("history_turns", 10)))
+    msgs.append({"role": "user", "content": message})
+    ev = stop_event(cid)
+    ev.clear()
+    return desk_chat.run_turn(msgs, meta, image_path=image_path or "",
+                              stop_event=ev, streaming=streaming)
+
+
+@app.post("/api/chat")
+@require_token
+def api_chat():
+    data = request.get_json(silent=True) or {}
+    cid = (data.get("conversation_id") or "").strip()
+    if not cid:
+        cid = desk_store.new_conversation()
+    message = (data.get("message") or "").strip()
+    image_path = (data.get("image_path") or data.get("image") or "").strip()
+    if not message and not image_path:
+        return jsonify({"error": "No message"}), 400
+    if image_path and not Path(image_path).exists():
+        return jsonify({"error": "Image file was not found on disk"}), 400
+    if message:
+        desk_store.add_message(cid, "user", message, {})
+    elif image_path:
+        desk_store.add_message(cid, "user", f"[image attached: {Path(image_path).name}]", {"image": Path(image_path).name})
+
+    streaming_on = bool(desk_settings.get("streaming", True))
+    events_accum: list = []
+    started = time.time()
+
+    # Publish orb state: thinking when chat starts
+    publish_event({"type": "orb_state", "state": "thinking", "ts": time.time()})
+
+    def event_gen():
+        try:
+            for ev in _run_chat(cid, message, image_path, streaming_on):
+                events_accum.append(ev)
+                yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
+                # Update orb state based on events
+                if ev.get("type") == "tool_start":
+                    publish_event({"type": "orb_state", "state": "executing", "ts": time.time()})
+                elif ev.get("type") in ("assistant", "done"):
+                    pass  # handled in finally
+        except GeneratorExit:
+            pass
+        except Exception as e:
+            log.error("chat turn failed: %s", e, exc_info=True)
+            err = _ev_error(e)
+            events_accum.append(err)
+            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+        finally:
+            # Return orb to idle
+            publish_event({"type": "orb_state", "state": "idle", "ts": time.time()})
+            if message or image_path:
+                _persist_turn(cid, message, events_accum, started)
+
+    resp = Response(event_gen(), mimetype="text/event-stream")
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Accel-Buffering"] = "no"
+    resp.headers["Connection"] = "keep-alive"
+    return resp
+
+
+def _ev_error(e) -> dict:
+    friendly = (
+        "NOVA couldn't complete that request. This usually means the model "
+        "call failed or timed out. Please retry, or check the connection."
+    )
+    return {"type": "error", "message": friendly, "detail": str(e)[:300]}
+
+
+@app.post("/api/chat/stop")
+@require_token
+def api_chat_stop():
+    data = request.get_json(silent=True) or {}
+    cid = data.get("conversation_id", "")
+    ev = _stop_events.get(cid)
+    if ev:
+        ev.set()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/regenerate")
+@require_token
+def api_regenerate():
+    data = request.get_json(silent=True) or {}
+    cid = data.get("conversation_id", "")
+    convo = desk_store.get_conversation(cid)
+    if not convo:
+        return jsonify({"error": "not found"}), 404
+    msgs = convo["messages"]
+    last_user = None
+    ridx = None
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i]["role"] == "assistant":
+            continue
+        if msgs[i]["role"] == "user":
+            last_user = msgs[i]
+            ridx = i
+            break
+    if last_user is None:
+        return jsonify({"error": "No message to regenerate"}), 400
+    # drop the assistant message that followed the last user turn
+    removed = 0
+    with_none = []
+    for i, m in enumerate(msgs):
+        if i > ridx and m["role"] == "assistant" and removed == 0:
+            removed += 1
+            continue
+        with_none.append(m)
+    # persist removal
+    for m in msgs[ridx + 1:]:
+        desk_store.delete_message(m["id"])
+    events_accum: list = []
+    started = time.time()
+    message = last_user.get("content", "")
+    image_path = ""
+    ev = stop_event(cid)
+    ev.clear()
+
+    def event_gen():
+        try:
+            for ev_ in desk_chat.run_turn(
+                [{"role": "system", "content": _system_prompt(message, _meta_dict(), cid)}]
+                + [{"role": "user", "content": message}],
+                _meta_dict(), image_path="", stop_event=ev,
+                streaming=bool(desk_settings.get("streaming", True))):
+                events_accum.append(ev_)
+                yield f"data: {json.dumps(ev_, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            log.error("regenerate failed: %s", e, exc_info=True)
+            err = _ev_error(e)
+            events_accum.append(err)
+            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+        finally:
+            _persist_turn(cid, message, events_accum, started)
+
+    resp = Response(event_gen(), mimetype="text/event-stream")
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Accel-Buffering"] = "no"
+    return resp
+
+
+# ── memory ────────────────────────────────────────────────────────────────────
+
+@app.get("/api/memory")
+@require_token
+def api_memory():
+    q = (request.args.get("q") or "").strip()
+    facts = list(_ns("_memory_texts", []) or [])[-200:]
+    records = []
+    lm = _ns("_living_memory")
+    metrics = {}
+    if lm is not None:
+        try:
+            records = [
+                {
+                    "text": r.get("text", ""),
+                    "type": r.get("type", ""),
+                    "importance": r.get("importance", 0.0),
+                    "project": r.get("project", ""),
+                    "confirmed": bool(r.get("confirmed", True)),
+                    "updated": r.get("updated", 0.0),
+                    "superseded": bool(r.get("superseded_by")),
+                    "decayed": bool(r.get("decay", {}).get("active")),
+                }
+                for r in lm.all_records()
+            ]
+        except Exception as e:
+            log.warning("living memory listing failed: %s", e)
+        try:
+            metrics = dict(lm._metrics or {})  # noqa: SLF001
+        except Exception:
+            metrics = {}
+    living = []
+    ctx = ""
+    if lm is not None and q:
+        try:
+            recs = lm.search(q)
+            living = [{"text": r.get("text", ""), "confidence": r.get("confidence", "")}
+                      for r in (recs or [])][:20]
+        except Exception:
+            living = []
+        try:
+            ctx = build_memory_context(_meta_dict(), query=q)
+        except Exception:
+            ctx = ""
+    return jsonify({"facts": facts, "records": records, "metrics": metrics,
+                    "living": living, "context": ctx,
+                    "enabled": desk_settings.get("memory_enabled", True)})
+
+
+@app.delete("/api/memory/records")
+@require_token
+def api_memory_record_delete():
+    data = request.get_json(silent=True) or {}
+    text = data.get("text") or ""
+    updated = data.get("updated") or 0
+    lm = _ns("_living_memory")
+    if lm is None:
+        return jsonify({"ok": False, "error": "Living memory is not initialized."}), 400
+    if not text:
+        return jsonify({"ok": False, "error": "Missing record text"}), 400
+    try:
+        ok = lm.delete_record(text, float(updated))
+    except Exception:
+        ok = False
+    return jsonify({"ok": ok})
+
+
+@app.post("/api/memory/clear")
+@require_token
+def api_memory_clear():
+    data = request.get_json(silent=True) or {}
+    if not data.get("confirm"):
+        return jsonify({"error": "confirmation required"}), 400
+    lm = _ns("_living_memory")
+    cleared = 0
+    try:
+        if lm is not None and hasattr(lm, "clear_all"):
+            cleared = lm.clear_all()
+    except Exception:
+        pass
+    try:
+        facts = _ns("_memory_texts", [])
+        facts.clear()
+    except Exception:
+        pass
+    return jsonify({"ok": True, "cleared": cleared})
+
+
+@app.post("/api/memory/toggle")
+@require_token
+def api_memory_toggle():
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled"))
+    desk_settings.set_many({"memory_enabled": enabled})
+    return jsonify({"ok": True, "enabled": enabled})
+
+
+# ── vision ────────────────────────────────────────────────────────────────────
+
+@app.post("/api/vision")
+@require_token
+def api_vision():
+    f = request.files.get("image")
+    if f is None:
+        return jsonify({"error": "No image uploaded"}), 400
+    question = (request.form.get("question") or "").strip() or "What do you see in this image?"
+    tmp = tempfile.NamedTemporaryFile(suffix=Path(f.filename or "img.png").suffix or ".png", delete=False)
+    f.save(tmp.name)
+    if not callable(_gemini_vision):
+        return jsonify({"error": "Vision is unavailable in this build."})
+    try:
+        text = _gemini_vision(tmp.name, question)
+        return jsonify({"text": str(text)})
+    except Exception as e:
+        log.error("vision failed: %s", e, exc_info=True)
+        return jsonify({"error": "Vision analysis failed. Please check the Gemini API key."}), 500
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+
+
+# ── voice (push-to-talk) ──────────────────────────────────────────────────────
+
+@app.post("/api/voice/start")
+@require_token
+def api_voice_start():
+    ok, msg = desk_voice.start_capture()
+    return jsonify({"ok": ok, "message": msg, **desk_voice.status()})
+
+
+@app.post("/api/voice/stop")
+@require_token
+def api_voice_stop():
+    path, msg = desk_voice.stop_capture()
+    if not path:
+        return jsonify({"ok": False, "message": msg})
+    transcript, err = desk_voice.transcribe(path)
+    try:
+        os.unlink(path)
+    except Exception:
+        pass
+    if transcript:
+        return jsonify({"ok": True, "transcript": transcript, "message": msg})
+    return jsonify({"ok": False, "message": err or "No speech was recognised."})
+
+
+@app.post("/api/voice/abort")
+@require_token
+def api_voice_abort():
+    return jsonify({"ok": True, "message": desk_voice.abort_capture()})
+
+
+@app.get("/api/voice/status")
+@require_token
+def api_voice_status():
+    return jsonify(desk_voice.status())
+
+
+# ── live (Gemini Live native audio) ───────────────────────────────────────────
+
+@app.post("/api/live/start")
+@require_token
+def api_live_start():
+    mgr = desk_live.get_live_manager()
+    r = mgr.start()
+    return jsonify(r)
+
+
+@app.post("/api/live/stop")
+@require_token
+def api_live_stop():
+    mgr = desk_live.get_live_manager()
+    r = mgr.stop()
+    return jsonify(r)
+
+
+@app.get("/api/live/status")
+@require_token
+def api_live_status():
+    mgr = desk_live.get_live_manager()
+    return jsonify(mgr.status())
+
+
+@sock.route("/api/live/ws")
+def api_live_ws(ws):
+    """WebSocket for Live audio events.
+
+    Authenticates via ?token= query param (browser WS can't set custom headers).
+    Server pushes JSON text frames: {type, ts, ...data}. Client sends nothing
+    (REST endpoints control lifecycle); server detects close via exception.
+    Also forwards voice state events to the unified /ws/events bus.
+    """
+    token = request.args.get("token", "")
+    if token != run_token:
+        ws.close(401)
+        return
+    mgr = desk_live.get_live_manager()
+    q = mgr.subscribe()
+    try:
+        while True:
+            try:
+                ev = q.get(timeout=0.5)
+                ev_dict = ev.to_dict()
+                ws.send(json.dumps(ev_dict))
+                # Forward voice state events to unified event bus
+                if ev_dict.get("type") == "state":
+                    state_val = ev_dict.get("state", "")
+                    orb_map = {
+                        "connecting": "thinking",
+                        "connected": "idle",
+                        "streaming": "listening",
+                        "disconnecting": "thinking",
+                        "error": "error",
+                        "closed": "offline",
+                    }
+                    orb_state = orb_map.get(state_val, "idle")
+                    publish_event({"type": "voice_state", "state": state_val, "ts": time.time()})
+                    publish_event({"type": "orb_state", "state": orb_state, "ts": time.time()})
+                elif ev_dict.get("type") == "user_transcript":
+                    publish_event({"type": "transcript", "text": ev_dict.get("text", ""), "role": "user", "ts": time.time()})
+                elif ev_dict.get("type") == "nova_transcript":
+                    publish_event({"type": "transcript", "text": ev_dict.get("text", ""), "role": "nova", "ts": time.time()})
+            except Exception:
+                break
+    finally:
+        mgr.unsubscribe(q)
+
+
+# ── local intelligence (Ollama model management) ─────────────────────────────
+
+@app.get("/api/local-intelligence/status")
+@require_token
+def api_local_intel_status():
+    try:
+        from nova_intelligence.local_model_manager import get_model_manager
+        mgr = get_model_manager()
+        return jsonify(mgr.get_status())
+    except Exception as e:
+        return jsonify({"error": str(e), "runtime_available": False}), 500
+
+
+@app.get("/api/local-intelligence/models")
+@require_token
+def api_local_intel_models():
+    try:
+        from nova_intelligence.local_model_manager import get_model_manager
+        mgr = get_model_manager()
+        return jsonify({"models": mgr.list_available()})
+    except Exception as e:
+        return jsonify({"error": str(e), "models": []}), 500
+
+
+@app.post("/api/local-intelligence/set-model")
+@require_token
+def api_local_intel_set_model():
+    data = request.get_json(silent=True) or {}
+    model_id = data.get("model", "").strip()
+    if not model_id:
+        return jsonify({"ok": False, "error": "No model specified"}), 400
+    try:
+        from nova_intelligence.local_model_manager import get_model_manager
+        mgr = get_model_manager()
+        ok = mgr.set_current_model(model_id)
+        # Update router's Ollama provider model
+        import nova
+        router = getattr(nova, "_nova_router", None)
+        if router:
+            ollama = router.get_provider("ollama")
+            if ollama:
+                ollama.model = model_id
+        return jsonify({"ok": ok, "model": model_id})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/local-intelligence/download")
+@require_token
+def api_local_intel_download():
+    data = request.get_json(silent=True) or {}
+    model_id = data.get("model", "").strip()
+    if not model_id:
+        return jsonify({"ok": False, "error": "No model specified"}), 400
+    try:
+        from nova_intelligence.local_model_manager import get_model_manager
+        mgr = get_model_manager()
+        ok = mgr.download_model(model_id)
+        return jsonify({"ok": ok, "model": model_id})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/local-intelligence/remove")
+@require_token
+def api_local_intel_remove():
+    data = request.get_json(silent=True) or {}
+    model_id = data.get("model", "").strip()
+    if not model_id:
+        return jsonify({"ok": False, "error": "No model specified"}), 400
+    try:
+        from nova_intelligence.local_model_manager import get_model_manager
+        mgr = get_model_manager()
+        ok = mgr.remove_model(model_id)
+        return jsonify({"ok": ok, "model": model_id})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/local-intelligence/test")
+@require_token
+def api_local_intel_test():
+    data = request.get_json(silent=True) or {}
+    model_id = data.get("model", "")
+    try:
+        from nova_intelligence.local_model_manager import get_model_manager
+        mgr = get_model_manager()
+        result = mgr.test_model(model_id or None)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/api/local-intelligence/diagnostics")
+@require_token
+def api_local_intel_diagnostics():
+    try:
+        import nova
+        router = getattr(nova, "_nova_router", None)
+        conn = getattr(nova, "_connectivity", None)
+        diag = {
+            "connectivity": conn.snapshot() if conn else {"state": "unknown"},
+            "router": router.snapshot() if router else {"providers": {}},
+        }
+        # Ollama status
+        try:
+            from nova_intelligence.local_model_manager import get_model_manager
+            diag["ollama"] = get_model_manager().get_status()
+        except Exception:
+            diag["ollama"] = {"runtime_available": False}
+        # Voice status
+        diag["voice"] = {
+            "stt": desk_voice.transcription_available(),
+            "tts": desk_voice.audio_available(),
+        }
+        return jsonify(diag)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/local-intelligence/runtime")
+@require_token
+def api_local_intel_runtime():
+    """Get Ollama runtime status and start/stop controls."""
+    try:
+        import nova
+        runtime = getattr(nova, "_local_runtime", None)
+        if not runtime:
+            return jsonify({"error": "Runtime not initialized", "state": "UNKNOWN"}), 503
+        return jsonify(runtime.health_check())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/api/local-intelligence/runtime/start")
+@require_token
+def api_local_intel_runtime_start():
+    """Start Ollama runtime."""
+    try:
+        import nova
+        runtime = getattr(nova, "_local_runtime", None)
+        if not runtime:
+            return jsonify({"ok": False, "error": "Runtime not initialized"}), 503
+        ok = runtime.start()
+        return jsonify({"ok": ok, "state": runtime.state.name})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/local-intelligence/runtime/stop")
+@require_token
+def api_local_intel_runtime_stop():
+    """Stop Ollama runtime (only if NOVA started it)."""
+    try:
+        import nova
+        runtime = getattr(nova, "_local_runtime", None)
+        if not runtime:
+            return jsonify({"ok": False, "error": "Runtime not initialized"}), 503
+        ok = runtime.stop()
+        return jsonify({"ok": ok, "state": runtime.state.name})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ── Offline Knowledge (ZIM) ─────────────────────────────────────────────────
+
+@app.get("/api/offline-knowledge/status")
+@require_token
+def api_offline_knowledge_status():
+    """Get status of offline knowledge base (ZIM files)."""
+    try:
+        from nova_intelligence.offline_knowledge import OfflineKnowledgeManager
+        mgr = OfflineKnowledgeManager()
+        return jsonify(mgr.status())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/offline-knowledge/packages")
+@require_token
+def api_offline_knowledge_packages():
+    """List available and installed packages."""
+    try:
+        from nova_intelligence.offline_knowledge import OfflineKnowledgeManager
+        mgr = OfflineKnowledgeManager()
+        return jsonify({
+            "installed": mgr.installed_packages(),
+            "available": mgr.available_packages(),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/api/offline-knowledge/install")
+@require_token
+def api_offline_knowledge_install():
+    """Install a ZIM package."""
+    data = request.get_json(silent=True) or {}
+    package_id = data.get("package_id", "")
+    if not package_id:
+        return jsonify({"ok": False, "error": "package_id required"}), 400
+    try:
+        from nova_intelligence.offline_knowledge import OfflineKnowledgeManager
+        mgr = OfflineKnowledgeManager()
+        ok = mgr.install(package_id)
+        return jsonify({"ok": ok, "package_id": package_id})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.post("/api/offline-knowledge/remove")
+@require_token
+def api_offline_knowledge_remove():
+    """Remove an installed ZIM package."""
+    data = request.get_json(silent=True) or {}
+    package_id = data.get("package_id", "")
+    if not package_id:
+        return jsonify({"ok": False, "error": "package_id required"}), 400
+    try:
+        from nova_intelligence.offline_knowledge import OfflineKnowledgeManager
+        mgr = OfflineKnowledgeManager()
+        ok = mgr.remove(package_id)
+        return jsonify({"ok": ok, "package_id": package_id})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ── projects ───────────────────────────────────────────────────────────────────
+
+@app.get("/api/projects")
+@require_token
+def api_projects_list():
+    projects = desk_projects.list_projects()
+    projects.sort(key=lambda p: p.get("updated", 0), reverse=True)
+    for p in projects:
+        try:
+            p["conversations"] = desk_store.count_by_project(p["id"])
+        except Exception:
+            p["conversations"] = 0
+    return jsonify({"projects": projects})
+
+
+@app.post("/api/projects")
+@require_token
+def api_projects_create():
+    data = request.get_json(silent=True) or {}
+    p = desk_projects.create_project(
+        name=data.get("name", ""),
+        description=data.get("description", ""),
+        instructions=data.get("instructions", ""),
+        color=data.get("color", "violet"),
+    )
+    return jsonify({"ok": True, "project": p})
+
+
+@app.get("/api/projects/<pid>")
+@require_token
+def api_projects_get(pid):
+    p = desk_projects.get_project(pid)
+    if p is None:
+        return jsonify({"error": "not found"}), 404
+    p["conversations"] = desk_store.count_by_project(pid)
+    p["recent"] = desk_store.list_conversations(limit=50, project_id=pid)
+    return jsonify({"project": p})
+
+
+@app.patch("/api/projects/<pid>")
+@require_token
+def api_projects_patch(pid):
+    data = request.get_json(silent=True) or {}
+    p = desk_projects.update_project(
+        pid,
+        name=data.get("name"),
+        description=data.get("description"),
+        instructions=data.get("instructions"),
+        color=data.get("color"),
+    )
+    if p is None:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"ok": True, "project": p})
+
+
+@app.delete("/api/projects/<pid>")
+@require_token
+def api_projects_delete(pid):
+    ok = desk_projects.delete_project(pid)
+    return jsonify({"ok": ok})
+
+
+# ── images / media ─────────────────────────────────────────────────────────────
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+
+
+@app.get("/api/images")
+@require_token
+def api_images():
+    base = workspace_dir()
+    images = []
+    for p in sorted(base.rglob("*")):
+        if p.is_file() and p.suffix.lower() in _IMAGE_EXTS:
+            rel = str(p.relative_to(base))
+            images.append({
+                "name": rel,
+                "size": p.stat().st_size,
+                "modified": p.stat().st_mtime,
+                "url": "/api/files/" + rel.replace("\\", "/"),
+            })
+    return jsonify({"images": images, "workspace": str(base)})
+
+
+@app.get("/api/files/<path:path>")
+@require_token
+def api_file_content(path):
+    """Serve a workspace file (inline preview or download)."""
+    try:
+        target = _safe_join(path)
+    except (ValueError, OSError):
+        return jsonify({"error": "Invalid path"}), 400
+    if not target.is_file():
+        return jsonify({"error": "Not found"}), 404
+    mimetypes = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+        ".txt": "text/plain; charset=utf-8", ".md": "text/markdown; charset=utf-8",
+        ".html": "text/html; charset=utf-8", ".htm": "text/html; charset=utf-8",
+        ".json": "application/json", ".csv": "text/csv; charset=utf-8",
+        ".pdf": "application/pdf", ".py": "text/x-python; charset=utf-8",
+        ".zip": "application/zip",
+    }
+    mime = mimetypes.get(target.suffix.lower(), "application/octet-stream")
+    dl = request.args.get("dl") == "1"
+    data = target.read_bytes()
+    resp = Response(data, mimetype=mime)
+    if dl or mime == "application/octet-stream":
+        resp.headers["Content-Disposition"] = (
+            "attachment; filename=\"" + target.name.replace("\"", "") + "\"")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# ── MCP status (real introspection, never fabricated) ─────────────────────────
+
+def _mcp_status() -> dict:
+    try:
+        has_mcp = bool(getattr(_nova, "HAS_MCP", False))
+    except Exception:
+        has_mcp = False
+    bridge = _ns("_mcp_bridge")
+    servers, tools = [], []
+    if has_mcp and bridge is not None:
+        try:
+            servers = list(getattr(bridge, "servers", lambda: [])() or []) or []
+            servers = [getattr(s, "name", None) or s if isinstance(s, str) else
+                       {"name": getattr(s, "name", None) or str(s)} for s in servers]
+        except Exception:
+            servers = []
+        try:
+            decls = list(getattr(bridge, "gemini_declarations", lambda: [])() or []) or []
+            tools = [{"name": d.get("name") if isinstance(d, dict) else d for d in decls}]
+        except Exception:
+            tools = []
+    return {
+        "enabled": bool(has_mcp and bridge is not None),
+        "package": bool(has_mcp),
+        "connected_servers": len(servers) if has_mcp else 0,
+        "servers": servers,
+        "tools": tools,
+        "message": ("MCP is disabled — run with the `mcp` package installed and a "
+                    "server configured (e.g. NOVA_MCP_FILESYSTEM_ENABLED=1) to enable it."
+                    if not has_mcp else
+                    ("No MCP servers connected." if not servers else "")),
+    }
+
+
+@app.get("/api/mcp")
+@require_token
+def api_mcp():
+    return jsonify(_mcp_status())
+
+
+# ── tasks ──────────────────────────────────────────────────────────────────────
+
+@app.get("/api/tasks")
+@require_token
+def api_tasks():
+    tm = _ns("_task_manager")
+    if tm is None:
+        return jsonify({"tasks": [], "status": "Task manager not initialized."})
+    tasks = []
+    try:
+        raw = getattr(tm, "list", None)
+        if callable(raw):
+            tasks = raw()
+    except Exception:
+        tasks = []
+    if not tasks and callable(getattr(tm, "exec_command", None)):
+        try:
+            out = tm.exec_command("status", task_id="", title="", steps=[], meta={})
+            return jsonify({"tasks": [], "status": str(out)})
+        except Exception as e:
+            return jsonify({"tasks": [], "status": f"Task manager error: {e}"})
+    return jsonify({"tasks": tasks, "status": "ok"})
+
+
+# ── permissions ────────────────────────────────────────────────────────────────
+
+@app.get("/api/permissions")
+@require_token
+def api_permissions():
+    return jsonify({
+        "categories": list(desk_settings._PERMISSION_CATEGORIES),  # noqa: SLF001
+        "permissions": desk_settings.get("permissions", {}),
+        "tool_map": desk_confirm.TOOL_CATEGORY,
+        "policy": desk_settings.get("confirm_policy", "prompt"),
+    })
+
+
+# ── files ─────────────────────────────────────────────────────────────────────
+
+def _safe_join(name: str) -> Path:
+    name = name.replace("\\", "/")
+    if ".." in name.split("/"):
+        raise ValueError("Invalid path")
+    base = workspace_dir()
+    p = (base / name).resolve()
+    if not str(p).startswith(str(base.resolve())):
+        raise ValueError("Invalid path")
+    return p
+
+
+@app.get("/api/files")
+@require_token
+def api_files_list():
+    base = workspace_dir()
+    files = []
+    for p in sorted(base.rglob("*")):
+        if p.is_file():
+            files.append({
+                "name": str(p.relative_to(base)),
+                "size": p.stat().st_size,
+                "modified": p.stat().st_mtime,
+            })
+    return jsonify({"files": files, "workspace": str(base)})
+
+
+@app.post("/api/files/upload")
+@require_token
+def api_files_upload():
+    f = request.files.get("file")
+    if f is None:
+        return jsonify({"error": "No file uploaded"}), 400
+    name = (Path(f.filename or "file.bin").name or "file.bin")
+    try:
+        target = _safe_join("attachments/" + name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        f.save(target)
+    except (ValueError, OSError) as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "name": name, "path": str(target)})
+
+
+@app.post("/api/files/save")
+@require_token
+def api_files_save():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name") or "").strip()
+    content = data.get("content") or ""
+    if not name:
+        return jsonify({"error": "No filename"}), 400
+    try:
+        target = _safe_join(name)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(content), encoding="utf-8")
+    except (ValueError, OSError) as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "path": str(target), "workspace": str(workspace_dir())})
+
+
+# ── settings ──────────────────────────────────────────────────────────────────
+
+@app.get("/api/settings")
+@require_token
+def api_settings_get():
+    return jsonify({"settings": desk_settings.all(), "toggles": desk_settings.toggles()})
+
+
+@app.post("/api/settings")
+@require_token
+def api_settings_post():
+    data = request.get_json(silent=True) or {}
+    # permissions are applied as a merge; everything else goes through set_many
+    if isinstance(data.get("permissions"), dict):
+        desk_settings.set_many({"permissions": data["permissions"]})
+        data.pop("permissions", None)
+    desk_settings.set_many(data)
+    return jsonify({"ok": True, "settings": desk_settings.all()})
+
+
+@app.post("/api/settings/profile")
+@require_token
+def api_settings_profile():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("user_name") or "").strip()
+    if name:
+        desk_settings.set_many({"user_name": name})
+        _META["user_name"] = name
+    return jsonify({"ok": True, "user_name": desk_settings.get("user_name") or "User"})
+
+
+# ── onboarding / credentials ──────────────────────────────────────────────────
+# The Gemini key NEVER travels through these endpoints in the server→client
+# direction. BYOK keys are accepted once, sealed with DPAPI, and only ever
+# reported back masked.
+
+def _creds():
+    from desk import creds as desk_creds
+    return desk_creds
+
+
+@app.get("/api/onboarding")
+@require_token
+def api_onboarding_status():
+    return jsonify({"ok": True, "auth": _auth_status()})
+
+
+@app.post("/api/onboarding/byok")
+@require_token
+def api_onboarding_byok():
+    data = request.get_json(silent=True) or {}
+    key = (data.get("api_key") or "").strip()
+    try:
+        st = _creds().set_byok(key)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Could not store key securely: {e}"}), 500
+    log.info("BYOK credential stored (%s)", st.get("byok_masked", ""))
+    return jsonify({"ok": True, "auth": st})
+
+
+@app.delete("/api/onboarding/byok")
+@require_token
+def api_onboarding_byok_clear():
+    st = _creds().clear_byok_and_apply()
+    log.info("BYOK credential removed; effective mode now %s", st.get("mode"))
+    return jsonify({"ok": True, "auth": st})
+
+
+@app.post("/api/onboarding/offline")
+@require_token
+def api_onboarding_offline():
+    st = _creds().choose_offline()
+    return jsonify({"ok": True, "auth": st})
+
+
+@app.post("/api/onboarding/cloud")
+@require_token
+def api_onboarding_cloud():
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    try:
+        st = _creds().choose_cloud(url)
+    except Exception as e:
+        # honest failure: no fabricated provider, no fake success
+        return jsonify({"ok": False, "error": str(e)[:200],
+                        "auth": _auth_status()}), 502
+    return jsonify({"ok": True, "auth": st})
+
+
+@app.post("/api/onboarding/complete")
+@require_token
+def api_onboarding_complete():
+    _creds().mark_onboarded()
+    return jsonify({"ok": True, "auth": _auth_status()})
+
+
+@app.get("/api/live/token")
+@require_token
+def api_live_token():
+    """Ephemeral Gemini Live credential via the NOVA backend.
+
+    Production flow: Desktop → NOVA backend mints short-lived Live token →
+    Desktop opens the Live session directly. Requires a deployed NOVA Cloud
+    backend; without one this returns an honest 503 (the long-lived Gemini key
+    is never shipped to the client).
+    """
+    c = _creds()
+    cloud = c.current_cloud_client()
+    if not cloud.active:
+        return jsonify({"ok": False, "error":
+                        "Live tokens require NOVA Cloud (set cloud_url). "
+                        "Voice currently uses the local on-device stack."}), 503
+    try:
+        tok = cloud.mint_live_token()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"NOVA Cloud unreachable: {type(e).__name__}"}), 502
+    return jsonify({"ok": True, **tok})
+
+
+# ── confirmations ─────────────────────────────────────────────────────────────
+
+@app.get("/api/confirm/pending")
+@require_token
+def api_confirm_pending():
+    return jsonify({"pending": desk_confirm.store.pending()})
+
+
+@app.post("/api/confirm")
+@require_token
+def api_confirm_decision():
+    data = request.get_json(silent=True) or {}
+    req_id = data.get("id", "")
+    decision = str(data.get("decision", "")).strip().lower()
+    if not req_id:
+        return jsonify({"error": "Missing id"}), 400
+    if decision in ("yes", "y", "true", "1"):
+        ok = desk_confirm.store.decide(req_id, True)
+    elif decision in ("no", "n", "false", "0"):
+        ok = desk_confirm.store.decide(req_id, False)
+    else:
+        return jsonify({"error": "Decision must be yes or no"}), 400
+    return jsonify({"ok": ok})
+
+
+# ── runner ────────────────────────────────────────────────────────────────────
+
+_server = None
+
+
+def shutdown_desk_server() -> None:
+    """Stop the Werkzeug server (called by the desktop shell on window close)."""
+    global _server
+    srv = _server
+    _server = None
+    if srv is not None:
+        try:
+            srv.shutdown()
+        except Exception:
+            pass
+    for ev in _stop_events.values():
+        ev.set()
+
+
+def _serve(srv):
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+# ── 3D Mind Map data ──────────────────────────────────────────────────────────
+
+import math
+
+REGION_COLORS = {
+    "core":      "#2dd4a8",
+    "memory":    "#a78bfa",
+    "working":   "#38bdf8",
+    "agents":    "#fb7185",
+    "knowledge": "#fbbf24",
+    "rim":       "#64748b",
+}
+
+def _collect_mind_map_nodes():
+    """Assemble real nodes from all NOVA data sources."""
+    nodes = []
+    nid = 0
+
+    # Core — the orchestrator itself
+    nodes.append({
+        "id": f"n{nid}", "region": "core", "type": "core",
+        "label": "NOVA", "detail": "Master orchestrator",
+        "size": 1.0, "accent": REGION_COLORS["core"],
+    })
+    nid += 1
+
+    # Memory nodes
+    try:
+        mem_path = Path(__file__).parent.parent / "nova_memory_store" / "records.json"
+        if mem_path.exists():
+            records = json.loads(mem_path.read_text(encoding="utf-8"))
+            for rec in records[:30]:
+                nodes.append({
+                    "id": f"n{nid}", "region": "memory", "type": "memory",
+                    "label": rec.get("text", rec.get("fact", ""))[:60],
+                    "detail": rec.get("text", rec.get("fact", "")),
+                    "size": 0.5, "accent": REGION_COLORS["memory"],
+                    "source_type": rec.get("type", "unknown"),
+                    "source_id": rec.get("id", ""),
+                })
+                nid += 1
+    except Exception:
+        pass
+
+    # Facts from memory_texts.json
+    try:
+        facts_path = Path(__file__).parent.parent / "memory_texts.json"
+        if facts_path.exists():
+            facts = json.loads(facts_path.read_text(encoding="utf-8"))
+            for fact in (facts if isinstance(facts, list) else []):
+                text = fact if isinstance(fact, str) else fact.get("text", str(fact))
+                nodes.append({
+                    "id": f"n{nid}", "region": "memory", "type": "fact",
+                    "label": text[:60], "detail": text,
+                    "size": 0.4, "accent": REGION_COLORS["memory"],
+                })
+                nid += 1
+    except Exception:
+        pass
+
+    # Agent nodes
+    try:
+        import nova_agents
+        for agent in nova_agents.AgentType:
+            nodes.append({
+                "id": f"n{nid}", "region": "agents", "type": "agent",
+                "label": agent.name, "detail": f"Agent: {agent.name}",
+                "size": 0.6, "accent": REGION_COLORS["agents"],
+            })
+            nid += 1
+    except Exception:
+        pass
+
+    # Tool nodes
+    try:
+        tool_decl = getattr(_nova, "TOOL_DECLARATIONS", [])
+        categories = {}
+        for t in tool_decl:
+            cat = t.get("category", "general")
+            categories.setdefault(cat, []).append(t.get("name", "unknown"))
+        for cat, tools in categories.items():
+            for tool_name in tools:
+                nodes.append({
+                    "id": f"n{nid}", "region": "knowledge", "type": "tool",
+                    "label": tool_name, "detail": f"Tool: {tool_name} ({cat})",
+                    "size": 0.35, "accent": REGION_COLORS["knowledge"],
+                    "category": cat,
+                })
+                nid += 1
+    except Exception:
+        pass
+
+    # Working memory nodes (current session)
+    try:
+        cid = desk_store.current_conversation_id() if hasattr(desk_store, "current_conversation_id") else None
+        if cid:
+            msgs = desk_store.get_messages(cid, limit=20)
+            for m in msgs:
+                if m.get("role") == "user":
+                    nodes.append({
+                        "id": f"n{nid}", "region": "working", "type": "message",
+                        "label": m.get("content", "")[:60],
+                        "detail": m.get("content", ""),
+                        "size": 0.3, "accent": REGION_COLORS["working"],
+                    })
+                    nid += 1
+    except Exception:
+        pass
+
+    return nodes
+
+
+def _collect_mind_map_edges(nodes):
+    """Compute semantic edges between nodes using FAISS embeddings if available."""
+    edges = []
+    if len(nodes) < 2:
+        return edges
+
+    # Try FAISS-based cosine similarity
+    try:
+        import faiss
+        import numpy as np
+        embedder_path = Path(__file__).parent.parent / "nova_embedder"
+        if embedder_path.exists():
+            from sentence_transformers import SentenceTransformer
+            model = SentenceTransformer(str(embedder_path))
+            texts = [n.get("detail", n.get("label", "")) for n in nodes]
+            embeddings = model.encode(texts, show_progress_bar=False)
+            embeddings = np.array(embeddings, dtype="float32")
+            faiss.normalize_L2(embeddings)
+            index = faiss.IndexFlatIP(embeddings.shape[1])
+            index.add(embeddings)
+            D, I = index.search(embeddings, min(4, len(nodes)))
+            for i, (dists, neighbors) in enumerate(zip(D, I)):
+                for j, (dist, neighbor) in enumerate(zip(dists, neighbors)):
+                    if i != neighbor and dist > 0.35 and j < 3:
+                        edge_id = tuple(sorted([nodes[i]["id"], nodes[neighbor]["id"]]))
+                        if not any(e["source"] == edge_id[0] and e["target"] == edge_id[1] for e in edges):
+                            edges.append({
+                                "source": edge_id[0], "target": edge_id[1],
+                                "weight": float(dist), "type": "semantic",
+                            })
+            return edges
+    except Exception:
+        pass
+
+    # Fallback: region-based edges
+    region_groups = {}
+    for n in nodes:
+        region_groups.setdefault(n["region"], []).append(n["id"])
+    for region, nids in region_groups.items():
+        for i in range(len(nids)):
+            for j in range(i + 1, min(i + 4, len(nids))):
+                edges.append({
+                    "source": nids[i], "target": nids[j],
+                    "weight": 0.5, "type": "regional",
+                })
+    return edges
+
+
+@app.get("/api/mind-map")
+@require_token
+def api_mind_map():
+    """Return the skeleton mind map: all nodes, edges, and stats."""
+    try:
+        nodes = _collect_mind_map_nodes()
+        edges = _collect_mind_map_edges(nodes)
+
+        region_counts = {}
+        for n in nodes:
+            r = n["region"]
+            region_counts[r] = region_counts.get(r, 0) + 1
+
+        stats = {
+            "total_nodes": len(nodes),
+            "total_edges": len(edges),
+            "regions": region_counts,
+            "has_faiss": False,
+        }
+        try:
+            import faiss
+            stats["has_faiss"] = True
+        except ImportError:
+            pass
+
+        return jsonify({"nodes": nodes, "edges": edges, "stats": stats})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/api/mind-map/node/<node_id>")
+@require_token
+def api_mind_map_node(node_id):
+    """Return detail for a single node (lazy-loaded on click)."""
+    try:
+        nodes = _collect_mind_map_nodes()
+        node = next((n for n in nodes if n["id"] == node_id), None)
+        if not node:
+            return jsonify({"error": "Node not found"}), 404
+
+        detail = {
+            "node": node,
+            "connections": [],
+        }
+
+        # Find connected edges
+        edges = _collect_mind_map_edges(nodes)
+        connected_ids = set()
+        for e in edges:
+            if e["source"] == node_id:
+                connected_ids.add(e["target"])
+            elif e["target"] == node_id:
+                connected_ids.add(e["source"])
+
+        detail["connections"] = [n for n in nodes if n["id"] in connected_ids]
+        return jsonify(detail)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ── Mind Map live observer WebSocket ──────────────────────────────────────────
+
+_observer_clients: list = []
+_observer_lock = threading.Lock()
+
+def _notify_observers(event_type: str = "update"):
+    """Push a lightweight event to all connected observer clients."""
+    msg = json.dumps({"type": event_type, "ts": time.time()})
+    with _observer_lock:
+        dead = []
+        for ws in _observer_clients:
+            try:
+                ws.send(msg)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            _observer_clients.remove(ws)
+
+@sock.route("/ws/observe")
+def ws_observe(ws):
+    """Read-only WebSocket for mind map live updates. Never touches voice/chat socket."""
+    token = request.args.get("token", "")
+    if token != run_token:
+        return
+    with _observer_lock:
+        _observer_clients.append(ws)
+    try:
+        # Keep alive — receive only pings, never send data except via _notify_observers
+        while True:
+            data = ws.receive(timeout=30)
+            if data is None:
+                break
+    except Exception:
+        pass
+    finally:
+        with _observer_lock:
+            if ws in _observer_clients:
+                _observer_clients.remove(ws)
+
+
+def run_desk_server(meta, port: int | None = None) -> None:
+    """Entrypoint called by nova.py --desk. Blocks (serves until stopped)."""
+    global _META, run_token, _started_at, _server
+    global publish_event, publish_voice_state, publish_transcript
+    global publish_task_start, publish_task_done
+    global publish_agent_start, publish_agent_progress, publish_agent_done
+    global publish_orb_state
+    _META = dict(meta or {})
+    run_token = secrets.token_hex(16)
+    _started_at = time.time()
+
+    ok, msg = desk_confirm.install(ui_mode=True)
+    log.info("[DESK] %s", msg)
+
+    if port is None:
+        port = int(os.getenv("NOVA_DESK_PORT", "") or 8765)
+    try:
+        port = int(_resolve("DESK_PORT", port) or port)
+    except Exception:
+        pass
+
+    from werkzeug.serving import make_server
+    host = os.getenv("NOVA_DESK_HOST", "127.0.0.1")
+    _server = make_server(host, port, app, threaded=True)
+    print(f"[NOVA] 🖥  NOVA Desktop backend ready at http://{host}:{port}")
+
+    # ── Unified event bus (voice state + agent lifecycle + transcripts) ────────
+    _event_clients: list = []
+    _event_lock = threading.Lock()
+
+    def publish_event(event: dict):
+        msg = json.dumps(event, ensure_ascii=False)
+        with _event_lock:
+            dead = []
+            for cws in _event_clients:
+                try:
+                    cws.send(msg)
+                except Exception:
+                    dead.append(cws)
+            for cws in dead:
+                _event_clients.remove(cws)
+
+    def publish_voice_state(state: str, **extra):
+        publish_event({"type": "voice_state", "state": state, "ts": time.time(), **extra})
+
+    def publish_transcript(text: str, role: str = "nova"):
+        publish_event({"type": "transcript", "text": text, "role": role, "ts": time.time()})
+
+    def publish_task_start(task_id: str, label: str = ""):
+        publish_event({"type": "task_start", "task_id": task_id, "label": label or "Processing", "ts": time.time()})
+
+    def publish_task_done(task_id: str, ok: bool = True, summary: str = ""):
+        publish_event({"type": "task_done", "task_id": task_id, "ok": ok, "summary": summary, "ts": time.time()})
+
+    def publish_agent_start(agent_id: str, task_id: str, name: str, action: str = "", tool: str = ""):
+        publish_event({"type": "agent_start", "agent_id": agent_id, "task_id": task_id, "name": name, "action": action, "tool": tool, "ts": time.time()})
+
+    def publish_agent_progress(agent_id: str, action: str = "", tool: str = ""):
+        publish_event({"type": "agent_progress", "agent_id": agent_id, "action": action, "tool": tool, "ts": time.time()})
+
+    def publish_agent_done(agent_id: str, ok: bool = True, summary: str = ""):
+        publish_event({"type": "agent_done", "agent_id": agent_id, "ok": ok, "summary": summary, "ts": time.time()})
+
+    def publish_orb_state(state: str):
+        publish_event({"type": "orb_state", "state": state, "ts": time.time()})
+
+    # Make publish functions accessible from chat module
+    import desk.chat as _chat_mod
+    _chat_mod._publish_event = publish_event
+    _chat_mod._publish_task_start = publish_task_start
+    _chat_mod._publish_task_done = publish_task_done
+    _chat_mod._publish_agent_start = publish_agent_start
+    _chat_mod._publish_agent_progress = publish_agent_progress
+    _chat_mod._publish_agent_done = publish_agent_done
+    _chat_mod._publish_orb_state = publish_orb_state
+
+    @sock.route("/ws/events")
+    def ws_events(cws):
+        """Unified event WebSocket for the NOVA UI."""
+        token = request.args.get("token", "")
+        if token != run_token:
+            cws.close(401)
+            return
+        with _event_lock:
+            _event_clients.append(cws)
+        try:
+            while True:
+                data = cws.receive(timeout=30)
+                if data is None:
+                    break
+        except Exception:
+            pass
+        finally:
+            with _event_lock:
+                if cws in _event_clients:
+                    _event_clients.remove(cws)
+
+    # Auto-start Gemini Live session (voice-first behavior)
+    try:
+        def _auto_start_live():
+            """Auto-start Live session after a short delay to let the server stabilize."""
+            import time as _time
+            _time.sleep(2.0)  # give the server a moment to be ready
+            try:
+                mgr = desk_live.get_live_manager()
+                result = mgr.start()
+                if result.get("ok"):
+                    print(f"[NOVA] 🔊 Voice auto-started: {result.get('message', 'ok')}")
+                else:
+                    print(f"[NOVA] ⚠️  Voice auto-start skipped: {result.get('reason', 'unknown')}")
+            except Exception as e:
+                print(f"[NOVA] ⚠️  Voice auto-start failed: {e}")
+        threading.Thread(target=_auto_start_live, daemon=True).start()
+    except Exception as e:
+        print(f"[NOVA] ⚠️  Voice auto-start thread failed: {e}")
+
+    print(f"[NOVA] Press Ctrl+C to stop.")
+    _serve(_server)

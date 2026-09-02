@@ -1,0 +1,58 @@
+/* NOVA Brand System — Central typography and identity tokens
+   Official font: Radja (Geometric sans-serif)
+   Official logo: NOVA geometric star mark */
+
+/* ── @font-face ──────────────────────────────────────────────── */
+@font-face {
+  font-family: "Radja";
+  src: url("/static/brand/fonts/Radja.ttf") format("truetype");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ── Typography tokens ────────────────────────────────────────── */
+:root {
+  /* Brand font family */
+  --font-brand: "Radja", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-sans: "Radja", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+
+  /* Display — hero text, init screen */
+  --type-display: 700 56px/1.1 var(--font-brand);
+  /* Heading — section titles */
+  --type-h1: 600 28px/1.25 var(--font-brand);
+  --type-h2: 600 20px/1.3 var(--font-brand);
+  /* Body — primary content */
+  --type-body: 400 14px/1.6 var(--font-sans);
+  --type-body-sm: 400 13px/1.5 var(--font-sans);
+  /* UI — buttons, labels, navigation */
+  --type-ui: 500 13px/1.4 var(--font-sans);
+  --type-ui-sm: 500 11px/1.3 var(--font-sans);
+  /* Caption — metadata, timestamps */
+  --type-caption: 400 11px/1.4 var(--font-sans);
+  /* Mono — code, technical */
+  --type-mono: 400 12px/1.5 var(--font-mono);
+}
+
+/* ── Logo ─────────────────────────────────────────────────────── */
+.nova-logo {
+  background-image: url("/static/brand/logo/nova-logo.png");
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: center;
+}
+.nova-logo-wordmark {
+  background-image: url("/static/brand/logo/nova-logo.png");
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: center;
+  width: 120px;
+  height: 40px;
+}
+.nova-icon {
+  background-image: url("/static/brand/logo/nova-icon.png");
+  background-size: contain;
+  background-repeat: no-repeat;
+  background-position: center;
+}

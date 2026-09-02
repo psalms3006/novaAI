@@ -48,6 +48,13 @@ def _get_pyttsx3():
 
 
 pyttsx3 = _get_pyttsx3()
+
+def _nova_call(name, *args, **kwargs):
+    fn = _nova_get(name)
+    if callable(fn):
+        return fn(*args, **kwargs)
+    return None
+
 is_online = _nova_get('is_online')
 is_ollama_running = _nova_get('is_ollama_running')
 check_network_recovery = _nova_get('check_network_recovery')
@@ -60,7 +67,18 @@ _execute_tool_sync = _nova_get('_execute_tool_sync')
 agent_process = _nova_get('agent_process')
 _call_gemini_chat = _nova_get('_call_gemini_chat')
 _trim_history = _nova_get('_trim_history')
-get_text_input = _nova_get('get_text_input')
+
+
+def _keyboard_input() -> str:
+    """Robust keyboard input for --text mode (never touches the mic)."""
+    try:
+        text = input("You: ").strip()
+        return text
+    except (EOFError, KeyboardInterrupt):
+        return ""
+
+
+get_text_input = _nova_get('get_text_input') or _keyboard_input
 _load_whisper_async = _nova_get('_load_whisper_async')
 calibrate_ambient_noise = _nova_get('calibrate_ambient_noise')
 
@@ -110,7 +128,10 @@ def speak_offline(text: str, block: bool = False) -> None:
     If block=True, waits until speech completes.
     """
     print(f"\n🔊 NOVA: {text}\n")
-    _nova._broadcast_ui({"type": "nova_speak", "text": text})
+    try:
+        _nova._broadcast_ui({"type": "nova_speak", "text": text})
+    except Exception:
+        pass
     
     done_event = threading.Event()
     _tts_queue.put((text, done_event))
@@ -125,6 +146,8 @@ def _speak_offline_impl(text: str) -> None:
 
 
 def _speak_pyttsx3(text: str) -> bool:
+    if pyttsx3 is None:
+        return False
     try:
         engine = pyttsx3.init()
         engine.setProperty("rate", TTS_RATE)
@@ -570,9 +593,24 @@ def _get_offline_response_v2(
 ) -> Optional[Dict[str, Any]]:
     """
     v2: Fixed offline brain with proper tool handling.
-    Priority: Gemini REST → Ollama with tools → Ollama without tools.
+    Priority: Intelligence Router → Gemini REST → Ollama with tools → Ollama without tools.
     """
-    # Try Gemini first if online
+    # Try the intelligence router first (unified online/offline)
+    try:
+        import nova
+        router = getattr(nova, "_nova_router", None)
+        if router:
+            result = router.complete(
+                messages=messages,
+                system=NOVA_OFFLINE_PROMPT,
+                tools=TOOL_DECLARATIONS if use_tools else None,
+            )
+            if result.ok:
+                return {"text": result.text, "tool_calls": result.tool_calls}
+    except Exception as e:
+        log.debug("router failed, falling back to legacy cascade: %s", e)
+
+    # Legacy fallback: Try Gemini first if online
     if is_online() and HAS_GEMINI and GEMINI_API_KEY:
         print("🌐 [Gemini REST]...")
         result = _call_gemini_chat(messages, use_tools=use_tools)
@@ -671,28 +709,37 @@ def think_offline_v2(user_message: str, meta: dict) -> str:
     if result["tool_calls"]:
         print(f"🔧 Tool calls detected: {[tc['name'] for tc in result['tool_calls']]}")
         
-        # Build follow-up messages
-        followup = list(messages) + [result["raw_message"]]
-        
+        # Execute each tool and collect results as plain-text context. Feeding
+        # tool output back as text avoids the OpenAI<->Gemini function-call
+        # round-trip, which the converter does not support.
+        context_bits = []
         for tc in result["tool_calls"]:
             tool_name = tc["name"]
             tool_args = tc["args"]
             
             print(f"   Executing: {tool_name}({json.dumps(tool_args)[:100]})")
             
-            # Use offline-aware execution
-            tool_result = _execute_offline_tool(tool_name, tool_args, meta)
+            try:
+                tool_result = _execute_offline_tool(tool_name, tool_args, meta)
+            except Exception as tool_err:
+                tool_result = f"[{tool_name} failed: {tool_err}]"
+            tool_result = tool_result if isinstance(tool_result, str) else str(tool_result)
             print(f"   Result: {tool_result[:200]}...")
             
-            # Add to conversation
-            tool_msg = {
-                "role": "tool",
-                "content": tool_result,
-                "name": tool_name
-            }
-            if tc.get("id"):
-                tool_msg["tool_call_id"] = tc["id"]
-            followup.append(tool_msg)
+            context_bits.append(
+                f"Tool '{tool_name}' returned:\n{tool_result[:500]}"
+            )
+        
+        tool_prompt = (
+            "The following tool results were retrieved for the user's last message.\n\n"
+            + "\n\n".join(context_bits)
+            + "\n\nAnswer the user clearly using these results. If the results are "
+              "empty or insufficient, say so honestly and do not fabricate."
+        )
+        followup = list(messages) + [
+            {"role": "assistant", "content": (result.get("text") or "").strip()},
+            {"role": "user", "content": tool_prompt},
+        ]
         
         # Get final response after tool execution
         final = _get_offline_response_v2(followup, use_tools=False)
@@ -732,12 +779,21 @@ def run_offline_loop_v2(meta: dict) -> None:
     
     # Load STT
     if not TEXT_MODE:
-        threading.Thread(target=_load_whisper_async, daemon=True).start()
-        calibrate_ambient_noise()
+        _calibrate = _nova_get("calibrate_ambient_noise")
+        if callable(_calibrate):
+            calibrate_ambient_noise = _calibrate
+            calibrate_ambient_noise()
+        else:
+            calibrate_ambient_noise = None
     
     # Greeting
     _input_fn = get_text_input if TEXT_MODE else listen_offline
-    user_name = offline_greeting(meta, speak_offline, _input_fn)
+    _greet = offline_greeting
+    if callable(_greet):
+        user_name = _greet(meta, speak_offline, _input_fn)
+    else:
+        user_name = meta.get("user_name") or "there"
+        speak_offline(f"Welcome back, {user_name}." if meta.get("user_name") else f"Hello, {user_name}.")
     
     # Main loop
     while True:
@@ -748,12 +804,18 @@ def run_offline_loop_v2(meta: dict) -> None:
         
         # Get input
         set_offline_state(OfflineState.LISTENING)
-        user_input = get_text_input() if TEXT_MODE else listen_offline()
+        user_input = (
+            get_text_input() if TEXT_MODE and callable(get_text_input)
+            else listen_offline() if callable(listen_offline)
+            else input("You: ") if TEXT_MODE
+            else ""
+        )
         
         # Network recovery check
-        if check_network_recovery(
+        _recover_fn = _nova_get("check_network_recovery")
+        if callable(_recover_fn) and _recover_fn(
             meta, speak_offline,
-            get_text_input if TEXT_MODE else listen_offline,
+            _input_fn if callable(_input_fn) else (lambda: input("You: ")),
             GEMINI_API_KEY or "", FORCE_OFFLINE
         ):
             return
@@ -817,6 +879,44 @@ def run_offline_loop_v2(meta: dict) -> None:
                 except ImportError:
                     speak_offline("nova_safety.py not installed.")
                 _handled = True
+            if not _handled and user_input in ("/memory", "/mem", "/memories"):
+                try:
+                    _lm = nova_state._living_memory
+                    if _lm:
+                        speak_offline(_lm.exec_command("stats"))
+                    else:
+                        speak_offline("Living memory not initialized.")
+                except Exception:
+                    speak_offline("Living memory error.")
+                _handled = True
+            if not _handled and user_input in ("/tasks demo", "/task demo", "/demo task"):
+                try:
+                    _tm = nova_state._task_manager
+                    if not _tm:
+                        speak_offline("Task manager not initialized.")
+                    else:
+                        steps = [
+                            {"tool": "planner", "args": {"action": "list"}, "verify": "pending|reminder|none"},
+                            {"tool": "nova_memory", "args": {"cmd": "stats"}, "verify": "memory|active"},
+                        ]
+                        res = _tm.exec_command(
+                            "submit", task_id="", title="Self-demo: living systems",
+                            steps=steps, meta={},
+                        )
+                        speak_offline(f"{res} Try '/tasks' in a moment to watch progress.")
+                except Exception:
+                    speak_offline("Task manager error.")
+                _handled = True
+            if not _handled and user_input in ("/tasks", "/task", "/jobs"):
+                try:
+                    _tm = nova_state._task_manager
+                    if _tm:
+                        speak_offline(_tm.exec_command("status", {}))
+                    else:
+                        speak_offline("Task manager not initialized.")
+                except Exception:
+                    speak_offline("Task manager error.")
+                _handled = True
             if _handled:
                 continue
 
@@ -828,6 +928,14 @@ def run_offline_loop_v2(meta: dict) -> None:
         # Main thinking
         reply = think_offline_v2(user_input, meta)
         speak_offline(reply)
+        
+        # [living memory] feed finished turn
+        _living_turn = getattr(_nova, "_living_turn", None)
+        if _living_turn and reply:
+            try:
+                _living_turn(user_input, reply)
+            except Exception:
+                pass
         
         # Periodic memory extraction
         _nova._mem_extract_turn_counter += 1

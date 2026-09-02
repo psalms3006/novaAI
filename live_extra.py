@@ -51,6 +51,7 @@ _stt_model_lock = _nova._stt_model_lock
 _executor = _nova._executor
 _execute_tool_sync = _nova._execute_tool_sync
 _gemini_generate_with_delay = _nova._gemini_generate_with_delay
+add_memory_fact = _nova.add_memory_fact
 
 def _is_rate_limited(*args, **kwargs):
     fn = getattr(_nova, "_is_rate_limited", None)
@@ -98,6 +99,8 @@ class NOVALive:
         self._turn_done      = False
         self._has_greeted    = False
         self._last_speak_end = 0.0
+        self._play_q         = None
+        self._barge_in_pending = False
         # Diagnostic counters — stage 0: did __init__ even reach here?
         self._diag_mic_chunks_sent   = 0
         self._diag_mic_chunks_muted  = 0
@@ -152,12 +155,37 @@ class NOVALive:
         state = "🔊 SPEAKING" if value else "🎙️  LISTENING"
         print(f"\r{state}  ", end="", flush=True)
 
+    def _barge_in(self) -> None:
+        """User started speaking over NOVA — stop playback NOW and yield the mic."""
+        if not self._is_speaking:
+            return
+        self._barge_in_pending = True
+        _diag("BARGE", "⚠️ user speech detected during NOVA output — interrupting playback")
+        self._set_speaking(False)
+        # 1) Empty the asyncio queue feeding playback (Gemini→speaker)
+        if self.audio_in_queue is not None:
+            while True:
+                try:
+                    self.audio_in_queue.get_nowait()
+                except (asyncio.QueueEmpty, Exception):
+                    break
+        # 2) Empty the playback worker's own queue (already-decoded int16 chunks)
+        _pq = self._play_q
+        if _pq is not None:
+            try:
+                with _pq.mutex:
+                    _pq.queue.clear()
+            except Exception:
+                pass
+        _diag("BARGE", f"playback queues drained — audio_in_queue_size_now={self.audio_in_queue.qsize() if self.audio_in_queue else -1}")
+        self._barge_in_pending = False
+
     def speak(self, text: str) -> None:
         if not self._loop or not self.session:
             return
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
-                turns={"parts": [{"text": text}]}, turn_complete=True
+                turns={"role": "user", "parts": [{"text": text}]}, turn_complete=True
             ),
             self._loop,
         )
@@ -178,7 +206,7 @@ class NOVALive:
         )
         try:
             await self.session.send_client_content(
-                turns={"parts": [{"text": prompt}]}, turn_complete=True
+                turns={"role": "user", "parts": [{"text": prompt}]}, turn_complete=True
             )
         except Exception as e:
             print(f"[NOVA] ⚠️ Greeting failed: {e}")
@@ -222,7 +250,7 @@ class NOVALive:
                 _diag("SEND", "session went None mid-loop — dropping message, NOT exiting task")
                 continue
             try:
-                await self.session.send_realtime_input(media=msg)
+                await self.session.send_realtime_input(audio=msg)
                 self._diag_ws_bytes_out += len(msg.get("data", b""))
                 sent_count += 1
                 if consecutive_failures > 0:
@@ -257,6 +285,14 @@ class NOVALive:
         _silence_chunk: bytes = bytes(CHUNK_SIZE * 2)  # 16-bit = 2 bytes/sample
         _cb_count = {"n": 0, "dropped": 0}
         _rms_window = {"sum": 0.0, "n": 0, "max": 0.0}
+        # Barge-in detection: sustained speech while NOVA is talking.
+        _BARGE_IN_RMS    = 350.0     # int16 RMS above this counts as "speech"
+        _BARGE_IN_CHUNKS = 2         # consecutive loud chunks before interrupting
+        _speech_runs = {"n": 0}
+
+        def _request_barge_in() -> None:
+            if self._loop is not None:
+                self._loop.call_soon_threadsafe(self._barge_in)
 
         def _callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
             _cb_count["n"] += 1
@@ -271,12 +307,29 @@ class NOVALive:
                 too_soon = (time.time() - self._last_speak_end) < 0.25
 
             if speaking or too_soon:
-                self._diag_mic_chunks_muted += 1
-                # Send silence to keep Gemini WS alive (prevents 1011 keepalive timeout)
-                data = {"data": _silence_chunk, "mime_type": "audio/pcm"}
+                # NOVA is talking. Mute by default, BUT keep an ear out: if the user
+                # starts speaking over NOVA, barge in (stop playback + send real audio
+                # so Gemini cuts off its own output too).
+                rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
+                if rms > _BARGE_IN_RMS:
+                    _speech_runs["n"] += 1
+                    if _speech_runs["n"] >= _BARGE_IN_CHUNKS:
+                        _speech_runs["n"] = 0
+                        _request_barge_in()
+                        speaking = False
+                        self._diag_mic_chunks_sent += 1
+                        data = {"data": indata.tobytes(), "mime_type": "audio/pcm;rate=16000"}
+                    else:
+                        self._diag_mic_chunks_muted += 1
+                        data = {"data": _silence_chunk, "mime_type": "audio/pcm;rate=16000"}
+                else:
+                    _speech_runs["n"] = 0
+                    self._diag_mic_chunks_muted += 1
+                    # Send silence to keep Gemini WS alive (prevents 1011 keepalive timeout)
+                    data = {"data": _silence_chunk, "mime_type": "audio/pcm;rate=16000"}
             else:
                 self._diag_mic_chunks_sent += 1
-                data = {"data": indata.tobytes(), "mime_type": "audio/pcm"}
+                data = {"data": indata.tobytes(), "mime_type": "audio/pcm;rate=16000"}
                 # RMS of the REAL (non-muted) samples actually being sent — tests
                 # whether the mic is capturing usable signal at all.
                 rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
@@ -364,6 +417,13 @@ class NOVALive:
                             txt = sc.input_transcription.text.strip()
                             if txt:
                                 in_buf.append(txt)
+                        if sc and getattr(sc, "interrupted", False):
+                            # Server cut off its own generation because the user's
+                            # audio reached it (barge-in) — stop playback promptly.
+                            if not self._is_speaking:
+                                continue
+                            self._barge_in()
+                            continue
                         if sc and sc.turn_complete:
                             self._turn_done = True
                             self._set_speaking(False)
@@ -387,6 +447,13 @@ class NOVALive:
                                         target=lambda u=full_in, a=full_out: extract_memory_updates(u, a, self.meta),
                                         daemon=True,
                                     ).start()
+                            # [living memory] feed finished turn
+                            _living_turn = getattr(_nova, "_living_turn", None)
+                            if _living_turn and (full_in or full_out):
+                                try:
+                                    _living_turn(full_in, full_out)
+                                except Exception:
+                                    pass
                     if response.tool_call and response.tool_call.function_calls:
                         for fc in response.tool_call.function_calls:
                             _diag("RECV", f"tool_call received: {fc.name}({dict(fc.args or {})})")
@@ -418,6 +485,7 @@ class NOVALive:
         _diag("PLAY", "task started")
         import queue as _q
         _play_q: _q.Queue = _q.Queue(maxsize=200)
+        self._play_q = _play_q
         _write_errors = {"n": 0}
 
         def _play_worker() -> None:
@@ -627,7 +695,10 @@ def _call_gemini_chat(
     if _is_rate_limited():
         return None
     try:
-        client   = genai.Client(api_key=GEMINI_API_KEY)
+        client   = genai.Client(
+            api_key=GEMINI_API_KEY,
+            http_options=gtypes.HttpOptions(timeout=15000),
+        )
         contents: List[Any] = []
         system_txt = ""
 
@@ -701,6 +772,12 @@ def _load_whisper_async() -> None:
     """Load faster-whisper STT model in a background thread."""
     if not HAS_FASTER_WHISPER:
         log.warning("faster-whisper not installed — STT unavailable.")
+        _stt_loaded.set()
+        return
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        log.error("faster-whisper failed to import at load time — STT unavailable.")
         _stt_loaded.set()
         return
     try:

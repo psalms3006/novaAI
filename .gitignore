@@ -88,6 +88,8 @@ heartbeat_*.json
 memory.json
 memory_meta.json
 memory_texts.json
+data/nova_audit.ndjson
+data/trust_preferences.json
 
 # =========================
 # Temporary / Backup
@@ -103,3 +105,29 @@ memory_texts.json
 Thumbs.db
 Desktop.ini
 .DS_Store
+# Build and distribution output
+dist/
+build/
+dist_temp/
+
+# Executables and installers
+*.exe
+*.msi
+
+# Archives
+*.zip
+*.rar
+*.7z
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# PyInstaller
+*.spec

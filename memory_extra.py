@@ -170,6 +170,17 @@ def build_memory_context(meta: dict, query: str = "") -> str:
         lines.append(f"- User's gender is {meta['user_gender']}")
     for fact in (search_memory(query) if query else nova_state._memory_texts[-TOP_K:]):
         lines.append(f"- {fact}")
+    # [living memory] recollect top relevant structured records too
+    try:
+        _lm = nova_state._living_memory
+        if _lm is not None:
+            for rec in _lm.search(query or "", top_k=4):
+                _txt = (rec or {}).get("text", "").strip()
+                if _txt and _txt not in lines:
+                    tag = "confirmed" if rec.get("confirmed") else "recalled"
+                    lines.append(f"- [{tag}] {_txt}")
+    except Exception:
+        pass
     return "\n".join(lines) if lines else ""
 
 
@@ -179,6 +190,15 @@ def get_all_memory_text(meta: dict) -> str:
         lines.append(f"Your name is {meta['user_name']}.")
     for fact in nova_state._memory_texts:
         lines.append(f"- {fact}")
+    try:
+        _lm = nova_state._living_memory
+        if _lm is not None:
+            for rec in _lm.all()[-15:]:
+                _txt = (rec or {}).get("text", "").strip()
+                if _txt and _txt not in nova_state._memory_texts:
+                    lines.append(f"- {_txt}")
+    except Exception:
+        pass
     return " ".join(lines) if lines else "I have nothing stored about you yet."
 
 
