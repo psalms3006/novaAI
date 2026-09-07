@@ -57,32 +57,26 @@ class IntelligenceRouter:
     def get_provider(self, name: str) -> Optional[IntelligenceProvider]:
         return self._providers.get(name)
 
-    def select_provider(
+    def rank_providers(
         self,
         require_tools: bool = False,
         require_vision: bool = False,
         tool_names: Optional[List[str]] = None,
-    ) -> Optional[IntelligenceProvider]:
-        """Select the best provider for the current conditions.
-        
-        Uses connectivity state, provider health, task requirements, and
-        tool network requirements to make intelligent routing decisions.
+    ) -> List[IntelligenceProvider]:
+        """Return every usable provider, best first.
+
+        Returning a ranked *list* rather than a single winner is what makes
+        fallback real: :meth:`complete` and :meth:`stream` walk this list and
+        try the next provider when one actually fails, instead of surfacing the
+        first provider's error to the user as if nothing else existed.
+
+        Ranking inputs: connectivity state, provider health, capability
+        requirements, and the network requirements of the tools in play.
         """
         state = self._connectivity.state
-+        # ---- DEBUG ----
-+        # Show whether we have a Gemini provider registered
-+        gemini_present = "set" if self._providers.get("gemini") is not None else "None"
-+        print(f"[DEBUG] gemini_provider: {gemini_present}")
-+        # Show current connectivity state
-+        print(f"[DEBUG] connectivity_state: {state.name}")
-+        # Show online preference flag
-+        print(f"[DEBUG] online_preferred: {self._online_preferred}")
-+        # ---- END DEBUG ----
-
-        # Classify the task based on tool requirements
         task_class = self._classify_task(tool_names)
 
-        # Filter by capability requirements
+        # ── Capability filter ─────────────────────────────────────────────────
         candidates = []
         for name, prov in self._providers.items():
             if require_tools and not (prov.capabilities & ProviderCapability.TOOL_CALLING):
@@ -92,82 +86,64 @@ class IntelligenceRouter:
             candidates.append((name, prov))
 
         if not candidates:
-            log.warning("[ROUTER] no provider matches requirements (tools=%s, vision=%s)", require_tools, require_vision)
-            return None
+            log.warning(
+                "[ROUTER] no provider matches requirements (tools=%s, vision=%s)",
+                require_tools, require_vision,
+            )
+            return []
 
-        # ── Health-aware routing ──────────────────────────────────────────────
-        # Filter to only healthy providers
-        healthy = [(n, p) for n, p in candidates if p.health.is_healthy and p.is_available()]
-        if not healthy:
-            # Fall back to any available provider (even unhealthy ones)
-            log.warning("[ROUTER] no healthy providers; trying unhealthy ones")
-            healthy = [(n, p) for n, p in candidates if p.is_available()]
-        
-        if not healthy:
+        # ── Availability filter ───────────────────────────────────────────────
+        available = [(n, p) for n, p in candidates if p.is_available()]
+        if not available:
             log.warning("[ROUTER] no provider available")
-            return None
+            return []
 
-        # ── Task-based selection ──────────────────────────────────────────────
+        # Healthy providers rank above unhealthy ones, but unhealthy ones stay
+        # in the list as last resorts — a provider with 3 consecutive failures
+        # is still better than answering "no provider available".
+        healthy = [(n, p) for n, p in available if p.health.is_healthy]
+        degraded = [(n, p) for n, p in available if not p.health.is_healthy]
 
-        # LOCAL task: prefer Ollama (it's optimized for tool-heavy local work)
-        if task_class == TaskClassification.LOCAL:
-            for name, prov in healthy:
-                if "ollama" in name.lower():
-                    debug_branch = "LOCAL -> Ollama"
-                    print(f"[DEBUG] branch: {debug_branch}")
-                    return prov
-            # If no Ollama, any healthy provider will do
-            debug_branch = "LOCAL -> any healthy"
-            print(f"[DEBUG] branch: {debug_branch}")
-            # will fall through to later fallback
- 
-        # ONLINE task: prefer Gemini (cloud capabilities needed)
-        if task_class == TaskClassification.ONLINE:
-            if state != ConnectivityState.OFFLINE:
-                for name, prov in healthy:
-                    if "gemini" in name.lower():
-                        debug_branch = "ONLINE -> Gemini"
-                        print(f"[DEBUG] branch: {debug_branch}")
-                        return prov
-            # No Gemini found
-            debug_branch = "ONLINE -> any healthy"
-            print(f"[DEBUG] branch: {debug_branch}")
- 
-        # HYBRID or fallback: use connectivity + preference
-        if self._online_preferred and state == ConnectivityState.ONLINE:
-            for name, prov in healthy:
-                if "gemini" in name.lower():
-                    debug_branch = "HYBRID (online preferred) -> Gemini"
-                    print(f"[DEBUG] branch: {debug_branch}")
-                    return prov
-            # No Gemini found in HYBRID preference
-            debug_branch = "HYBRID (online preferred) -> any healthy"
-            print(f"[DEBUG] branch: {debug_branch}")
- 
-        if state == ConnectivityState.DEGRADED:
-            # Degraded: check if the previously-used online provider is still healthy
-            if self._last_provider_used:
-                prev = self._providers.get(self._last_provider_used)
-                if prev and prev.health.is_healthy and prev.is_available():
-                    debug_branch = "DEGRADED -> previous provider"
-                    print(f"[DEBUG] branch: {debug_branch}")
-                    return prev
-            # Fall through to local preference
- 
-        if state in (ConnectivityState.OFFLINE, ConnectivityState.DEGRADED):
-            for name, prov in healthy:
-                if "ollama" in name.lower():
-                    debug_branch = "OFFLINE/DEGRADED -> Ollama"
-                    print(f"[DEBUG] branch: {debug_branch}")
-                    return prov
-            debug_branch = "OFFLINE/DEGRADED -> any healthy"
-            print(f"[DEBUG] branch: {debug_branch}")
- 
-        # Final fallback: first healthy provider
-        debug_branch = "FINAL fallback"
-        print(f"[DEBUG] branch: {debug_branch}")
-        print(f"[DEBUG] final provider: {healthy[0][0] if healthy else 'None'}")
-        return healthy[0][1] if healthy else None
+        def _prefers_online() -> bool:
+            """Should the cloud provider outrank the local one for this task?"""
+            if task_class == TaskClassification.ONLINE:
+                return state != ConnectivityState.OFFLINE
+            if task_class == TaskClassification.LOCAL:
+                return False
+            if state == ConnectivityState.OFFLINE:
+                return False
+            return self._online_preferred
+
+        online_first = _prefers_online()
+
+        def _sort_key(item):
+            name = item[0].lower()
+            is_online_provider = "gemini" in name
+            # False sorts before True, so negate to put the preferred kind first.
+            return (0 if is_online_provider == online_first else 1, name)
+
+        ordered = sorted(healthy, key=_sort_key) + sorted(degraded, key=_sort_key)
+
+        log.info(
+            "[ROUTER] rank: state=%s online_preferred=%s task=%s online_first=%s order=%s",
+            state.value, self._online_preferred, task_class.value, online_first,
+            [n for n, _ in ordered],
+        )
+        return [p for _, p in ordered]
+
+    def select_provider(
+        self,
+        require_tools: bool = False,
+        require_vision: bool = False,
+        tool_names: Optional[List[str]] = None,
+    ) -> Optional[IntelligenceProvider]:
+        """The single best provider for the current conditions, or None."""
+        ranked = self.rank_providers(
+            require_tools=require_tools,
+            require_vision=require_vision,
+            tool_names=tool_names,
+        )
+        return ranked[0] if ranked else None
 
     def _classify_task(self, tool_names: Optional[List[str]] = None) -> TaskClassification:
         """Classify a task based on which tools it uses.
@@ -198,6 +174,17 @@ class IntelligenceRouter:
             return TaskClassification.LOCAL
         return TaskClassification.HYBRID
 
+    def _note_provider_used(self, name: str) -> None:
+        old_provider = self._last_provider_used
+        self._last_provider_used = name
+        if old_provider and old_provider != name:
+            log.info("[ROUTER] switched: %s -> %s", old_provider, name)
+            for cb in self._switch_callbacks:
+                try:
+                    cb(old_provider, name)
+                except Exception:
+                    pass
+
     def complete(
         self,
         messages: List[Dict[str, Any]],
@@ -208,35 +195,54 @@ class IntelligenceRouter:
         require_tools: bool = False,
         require_vision: bool = False,
     ) -> GenerateResult:
-        """Route a completion request to the best provider."""
-        provider = self.select_provider(
+        """Route a completion request, falling over to the next provider on failure."""
+        ranked = self.rank_providers(
             require_tools=require_tools,
             require_vision=require_vision,
+            tool_names=[t.get("name") for t in (tools or [])],
         )
-        if provider is None:
+        if not ranked:
             return GenerateResult(
                 error="No intelligence provider available. Check Ollama or network connection.",
                 provider="none",
             )
 
-        old_provider = self._last_provider_used
-        self._last_provider_used = provider.name
-
-        # Notify on provider switch
-        if old_provider and old_provider != provider.name:
-            log.info("[ROUTER] switched: %s -> %s", old_provider, provider.name)
-            for cb in self._switch_callbacks:
+        errors: List[str] = []
+        for provider in ranked:
+            self._note_provider_used(provider.name)
+            try:
+                result = provider.complete(
+                    messages=messages,
+                    system=system,
+                    tools=tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except Exception as e:
+                # A provider that raises is a provider that failed. Record it
+                # against its health so ranking learns, then try the next one.
                 try:
-                    cb(old_provider, provider.name)
+                    provider.health.record_failure(str(e))
                 except Exception:
                     pass
+                errors.append(f"{provider.name}: {e}")
+                log.warning("[ROUTER] %s raised, trying next provider: %s", provider.name, e)
+                continue
 
-        return provider.complete(
-            messages=messages,
-            system=system,
-            tools=tools,
-            temperature=temperature,
-            max_tokens=max_tokens,
+            if result.error:
+                errors.append(f"{provider.name}: {result.error}")
+                log.warning(
+                    "[ROUTER] %s returned error, trying next provider: %s",
+                    provider.name, str(result.error)[:200],
+                )
+                continue
+
+            return result
+
+        log.error("[ROUTER] all providers failed: %s", errors)
+        return GenerateResult(
+            error="; ".join(errors) or "All intelligence providers failed.",
+            provider="none",
         )
 
     def stream(
@@ -248,28 +254,82 @@ class IntelligenceRouter:
         max_tokens: int = 1024,
         require_tools: bool = False,
     ) -> Iterator[str]:
-        """Route a streaming request to the best provider."""
-        provider = self.select_provider(require_tools=require_tools)
-        if provider is None:
-            yield "[No intelligence provider available]"
-            return
+        """Route a streaming request, falling over to the next provider on failure.
 
-        old_provider = self._last_provider_used
-        self._last_provider_used = provider.name
-        if old_provider and old_provider != provider.name:
-            for cb in self._switch_callbacks:
+        Failover only happens *before the first chunk reaches the caller*. Once
+        text has been yielded, switching providers mid-answer would splice two
+        different responses together, so a late failure is surfaced instead.
+        """
+        ranked = self.rank_providers(
+            require_tools=require_tools,
+            tool_names=[t.get("name") for t in (tools or [])],
+        )
+        if not ranked:
+            raise RuntimeError(
+                "No intelligence provider available. Check Ollama or network connection."
+            )
+
+        errors: List[str] = []
+        for provider in ranked:
+            self._note_provider_used(provider.name)
+            emitted = False
+            try:
+                for chunk in provider.stream(
+                    messages=messages,
+                    system=system,
+                    tools=tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ):
+                    emitted = True
+                    yield chunk
+                if emitted:
+                    return
+            except Exception as e:
                 try:
-                    cb(old_provider, provider.name)
+                    provider.health.record_failure(str(e))
                 except Exception:
                     pass
+                errors.append(f"{provider.name}: {e}")
+                if emitted:
+                    # Partial answer already delivered — do not restart with a
+                    # different provider; report the truncation honestly.
+                    log.error("[ROUTER] %s failed mid-stream: %s", provider.name, e)
+                    yield f"\n\n[Response interrupted: {e}]"
+                    return
+                log.warning("[ROUTER] %s stream failed, trying next provider: %s", provider.name, e)
+                continue
 
-        yield from provider.stream(
-            messages=messages,
-            system=system,
-            tools=tools,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+            # Stream completed without error but produced nothing. That is not
+            # a provider outage — it usually means the model replied with a
+            # non-text part (e.g. a function call), which the streaming API
+            # drops. Retry the SAME provider non-streamed before demoting it,
+            # so a healthy primary is never abandoned for a slow local model.
+            log.info("[ROUTER] %s streamed no text; retrying non-streamed", provider.name)
+            try:
+                result = provider.complete(
+                    messages=messages,
+                    system=system,
+                    tools=tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            except Exception as e:
+                errors.append(f"{provider.name}: {e}")
+                continue
+            if result.error:
+                errors.append(f"{provider.name}: {result.error}")
+                continue
+            if result.text:
+                yield result.text
+                return
+            errors.append(f"{provider.name}: empty response")
+
+        log.error("[ROUTER] all providers failed to stream: %s", errors)
+        # Raise rather than yielding a diagnostic string: callers must be able
+        # to tell a failure from an answer, and the user must never see a raw
+        # bracketed error where NOVA's reply belongs.
+        raise RuntimeError("; ".join(errors) or "All intelligence providers failed.")
 
     def snapshot(self) -> dict:
         """Full diagnostics snapshot."""

@@ -225,10 +225,48 @@ class CapabilityRegistry:
 
 def _sessions_specs() -> List[CapabilitySpec]:
     def _remember_fact(args: Dict[str, Any], ctx: CapabilityContext) -> str:
+        """Persist a fact the user asked NOVA to remember.
+
+        This used to append to ``ctx.session_facts`` and nothing else. In the
+        desktop runtime a fresh CapabilityContext is built for every tool call,
+        so that list was discarded the moment the call returned: NOVA replied
+        "Remembered: ..." and stored nothing, and the fact was gone from the
+        next turn onward. Writing through to the real memory subsystems is what
+        makes "remember this" actually mean something across sessions.
+        """
         fact = str(args.get("fact", "")).strip()
         if not fact:
             return "No fact provided."
+
         ctx.session_facts.append(fact)
+
+        stored_anywhere = False
+        meta = getattr(ctx, "meta", None) or {}
+
+        # Structured/living memory (survives restarts, supports supersession).
+        try:
+            import nova_state
+            living = getattr(nova_state, "_living_memory", None)
+            if living is not None:
+                living.remember(fact, source="user", confirmed=True, importance=0.8)
+                stored_anywhere = True
+        except Exception as e:  # pragma: no cover - defensive
+            log.warning("living memory write failed for remember_fact: %s", e)
+
+        # Flat semantic fact store (used to build the prompt's MEMORY block).
+        try:
+            import nova as _nova
+            add_fact = getattr(_nova, "add_memory_fact", None)
+            if callable(add_fact):
+                add_fact(fact, meta if isinstance(meta, dict) else {})
+                stored_anywhere = True
+        except Exception as e:  # pragma: no cover - defensive
+            log.warning("semantic memory write failed for remember_fact: %s", e)
+
+        if not stored_anywhere:
+            # Never claim a durable write that did not happen.
+            return (f"Noted for this session only: {fact} "
+                    "(persistent memory is unavailable right now).")
         return f"Remembered: {fact}"
 
     def _list_facts(_args: Dict[str, Any], ctx: CapabilityContext) -> str:

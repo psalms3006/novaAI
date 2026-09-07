@@ -27,6 +27,13 @@ for _s in (sys.stdout, sys.stderr):
 if "--desk" not in sys.argv:
     sys.argv.append("--desk")
 
+# TLS trust must be established before any HTTPS client exists in this process.
+try:
+    from nova_tls import ensure_tls_trust as _ensure_tls_trust
+    _ensure_tls_trust()
+except Exception:
+    pass
+
 PORT = int(os.getenv("NOVA_DESK_PORT", "") or 8765)
 DESK_URL = f"http://127.0.0.1:{PORT}"
 START_MODE = os.getenv("NOVA_DESK_MODE", "full")
@@ -66,8 +73,9 @@ _LOADING_HTML = """<!DOCTYPE html>
       attempts++;
       statusEl.textContent='Starting NOVA... ('+attempts+')';
       fetch('/api/health',{signal:AbortSignal.timeout(2000)})
-        .then(function(r){
-          if(r.ok){
+        .then(function(r){ return r.json(); })
+        .then(function(j){
+          if(j && (j.ready || j.brain_ready)){
             statusEl.textContent='Ready!';
             statusEl.className='status ready';
             setTimeout(function(){window.location.href='/'},300);
@@ -203,19 +211,29 @@ def main() -> int:
 
     def _wait_for_backend():
         import requests
-        deadline = time.time() + 120
+        deadline = time.time() + 180
         _log(f"Waiting for backend at {DESK_URL}")
         while time.time() < deadline:
             try:
                 r = requests.get(f"{DESK_URL}/api/health", timeout=2)
                 if r.status_code < 500:
-                    _log(f"Backend ready (status={r.status_code})")
-                    _on_backend_ready()
-                    return True
+                    try:
+                        payload = r.json()
+                    except Exception:
+                        payload = {}
+                    # Wait until the NOVA brain (router) is actually ready, not just
+                    # the HTTP server. This prevents the user from typing before the
+                    # intelligence pipeline has finished initialising.
+                    if payload.get("ready") or payload.get("brain_ready"):
+                        _log(f"Backend ready (status={r.status_code}, ready=true)")
+                        _on_backend_ready()
+                        return True
+                    else:
+                        _log("Backend up but brain still initialising — waiting...")
             except Exception:
                 pass
             time.sleep(0.5)
-        _log("Backend not ready — navigating anyway")
+        _log("Backend not ready within deadline — navigating anyway")
         _on_backend_ready()
         return False
 

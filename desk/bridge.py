@@ -337,6 +337,22 @@ def api_status():
         if runtime:
             local_intel["runtime_state"] = runtime.state.name
             local_intel["ollama_running"] = runtime.is_running
+        # Ask the registered provider what is actually installed. Reading only
+        # the runtime state reported "available: false / installed: []" while a
+        # model was present and being routed to, which made the offline story
+        # look broken in the UI when it was not.
+        _r = getattr(nova, "_nova_router", None)
+        if _r is not None:
+            for _pname, _prov in getattr(_r, "_providers", {}).items():
+                if "ollama" not in _pname.lower():
+                    continue
+                local_intel["model"] = getattr(_prov, "model", "") or ""
+                local_intel["available"] = bool(_prov.is_available())
+                try:
+                    local_intel["installed"] = [m.get("name", "") for m in _prov.list_models()]
+                except Exception:
+                    pass
+                break
     except Exception:
         pass
 
@@ -399,11 +415,26 @@ def api_status():
         "local_intelligence": local_intel,
         "brain_ready": _brain_ready,
         "router_state": router_state,
+        "tls": _tls_status(),
         "user": _meta_dict().get("user_name", "User"),
         "auth": auth,
         "uptime": round(time.time() - _started_at, 1),
         "version": APP_VERSION,
     })
+
+
+def _tls_status() -> dict:
+    """Outbound TLS trust posture.
+
+    Surfaced in /api/status because a broken trust store is invisible to every
+    other health signal: DNS resolves, TCP connects, connectivity reads
+    "online" — and every model call still fails.
+    """
+    try:
+        import nova_tls
+        return nova_tls.status()
+    except Exception as e:
+        return {"applied": False, "method": "unknown", "error": str(e)}
 
 
 def _auth_status() -> dict:
@@ -465,7 +496,12 @@ def api_capabilities():
 
 @app.get("/api/health")
 def api_health():
-    return jsonify({"ok": True})
+    try:
+        import nova
+        ready = getattr(nova, "_nova_router", None) is not None
+    except Exception:
+        ready = False
+    return jsonify({"ok": True, "ready": ready, "brain_ready": _brain_ready})
 
 
 # ── tools ─────────────────────────────────────────────────────────────────────

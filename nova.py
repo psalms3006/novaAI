@@ -51,6 +51,17 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 del _stream
 
+# ── TLS trust (must run before any HTTPS client is constructed) ───────────────
+# Routes certificate verification through the OS trust store so NOVA still
+# works on machines where HTTPS is intercepted by a corporate proxy or by
+# antivirus HTTPS scanning — certifi does not contain those roots, and every
+# Gemini/web-search call fails without this.
+try:
+    from nova_tls import ensure_tls_trust as _ensure_tls_trust
+    _ensure_tls_trust()
+except Exception:
+    pass
+
 # Phase 3 (additive, not yet wired into hot paths): knowledge graph + reliability primitives
 import time
 import logging
@@ -98,7 +109,9 @@ try:
     HAS_FAISS = True
 except ImportError:
     HAS_FAISS = False
-    print("⚠️  FAISS not installed. Memory search disabled.")
+    # Not a degradation any more: memory_extra falls back to an exact numpy
+    # inner-product index, which is equivalent at a personal fact store's scale.
+    print("ℹ️  FAISS not installed — using the built-in numpy memory index.")
 
 # SentenceTransformer imported lazily in _load_embedder_async (saves ~90s startup)
 HAS_SENTENCE_TRANSFORMERS = True   # will be set False if import fails at load time
@@ -155,14 +168,14 @@ except ImportError:
 #  ENVIRONMENT & CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-    load_dotenv()
-    # Desktop credential layer (cloud session / DPAPI-sealed BYOK). No-op when
-    # GEMINI_API_KEY is already set — the dev .env workflow is untouched.
-    try:
-        from desk.creds import bootstrap as _creds_bootstrap
-        _creds_bootstrap()
-    except Exception:
-        pass
+load_dotenv()
+# Desktop credential layer (cloud session / DPAPI-sealed BYOK). No-op when
+# GEMINI_API_KEY is already set — the dev .env workflow is untouched.
+try:
+    from desk.creds import bootstrap as _creds_bootstrap
+    _creds_bootstrap()
+except Exception:
+    pass
 
 # ── Load nova_config.toml (Tier 6 config) ────────────────────────────────────
 try:
@@ -409,7 +422,11 @@ except ImportError:
     HAS_MCP = False
     log.warning("nova/mcp package not found — MCP tools disabled. pip install mcp to enable.")
 _faiss_index:       Optional[Any]  = None
-_memory_lock        = threading.Lock()
+# Reentrant: add_memory_fact() holds this lock and then calls
+# _atomic_save_memory(), which takes it again. With a plain Lock that is a
+# self-deadlock — it stayed hidden only because add_memory_fact() used to
+# return early whenever FAISS was missing and never reached the save.
+_memory_lock        = threading.RLock()
 _TOOL_AVAILABILITY: Dict[str, bool] = {}
 _executor           = ThreadPoolExecutor(max_workers=4)
 _nova_memory:       Optional[Any] = None 
@@ -442,6 +459,31 @@ def _gemini_generate_with_delay(client, **kwargs):
         time.sleep(_MIN_GAP_BETWEEN_CALLS - elapsed)
     _last_gemini_call = time.time()
     return client.models.generate_content(**kwargs)
+
+
+# ── REST rate-limit backoff helpers (shared state lives in nova_state) ─────────
+# These are referenced as `_nova._is_rate_limited` / `_nova._record_rate_limit` /
+# `_nova._reset_rate_limit` by vision_extra.py and other *_extra modules, so they
+# must exist on the nova module itself (not only inside memory_extra.py).
+
+def _is_rate_limited() -> bool:
+    """Return True if we're still inside a REST API backoff window."""
+    return time.time() < nova_state._rest_backoff_until
+
+
+def _record_rate_limit() -> None:
+    """Called on any 429 — doubles the backoff window (max 30 min)."""
+    nova_state._rest_backoff_secs = min(max(nova_state._rest_backoff_secs * 2, 120), 1800)
+    nova_state._rest_backoff_until = time.time() + nova_state._rest_backoff_secs
+    log.warning(
+        f"REST API rate-limited — backing off {nova_state._rest_backoff_secs:.0f}s "
+        f"(until {time.strftime('%H:%M:%S', time.localtime(nova_state._rest_backoff_until))})"
+    )
+
+
+def _reset_rate_limit() -> None:
+    """Called on a successful REST call — resets backoff."""
+    nova_state._rest_backoff_secs = 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1750,13 +1792,28 @@ def main() -> None:
         embed_start = time.time()
         try:
             from sentence_transformers import SentenceTransformer  # lazy import
-            nova_state._embedder = SentenceTransformer(EMBED_MODEL)
-            print(f"✅ Embedding model ready ({time.time()-embed_start:.2f}s)")
         except ImportError:
             HAS_SENTENCE_TRANSFORMERS = False
             log.warning("sentence-transformers not installed — memory search disabled.")
+            _embedder_loaded.set()
+            return
+
+        try:
+            nova_state._embedder = SentenceTransformer(EMBED_MODEL)
+            print(f"✅ Embedding model ready ({time.time()-embed_start:.2f}s)")
         except Exception as e:
-            log.warning(f"Embedding model failed: {e}")
+            # Do NOT collapse this into the ImportError branch above. Loading a
+            # local model dir raises ModuleNotFoundError from deep inside
+            # sentence_transformers when the saved model's format does not match
+            # the installed library version — reporting that as
+            # "sentence-transformers not installed" hid a real, fixable bug and
+            # silently disabled semantic memory search.
+            HAS_SENTENCE_TRANSFORMERS = False
+            log.warning(
+                "Embedding model %r failed to load (%s: %s) — semantic memory "
+                "search disabled, falling back to keyword matching.",
+                EMBED_MODEL, type(e).__name__, e,
+            )
         _embedder_loaded.set()
         # Rebuild index now that embedder is ready
         if nova_state._embedder and nova_state._memory_texts:
@@ -1782,7 +1839,7 @@ def main() -> None:
         from living_memory import init_living_memory as _init_lm
         from task_manager import init_task_manager as _init_tm
         nova_state._living_memory = _init_lm(
-            path="living_memory.json", search_fn=None, mirror=True,
+            path=str(_DATA_DIR / "living_memory.json"), search_fn=None, mirror=True,
         )
         nova_state._task_manager = _init_tm(
             tool_executor=_execute_tool_sync,
@@ -1804,7 +1861,7 @@ def main() -> None:
         _MIGRATE_MARKER = Path("living_memory.migrated")
     try:
         if nova_state._living_memory is not None:
-            if not Path("living_memory.json").exists():
+            if not (_DATA_DIR / "living_memory.json").exists():
                 _MIGRATE_MARKER.unlink(missing_ok=True)
             _imported = 0
             if not _MIGRATE_MARKER.exists():
@@ -1845,7 +1902,38 @@ def main() -> None:
         from nova_intelligence.local_model_manager import get_model_manager
         from nova_intelligence.local_runtime import LocalRuntimeManager
 
-        _connectivity = ConnectivityManager(check_interval=20.0)
+        def _gemini_api_check() -> bool:
+            """Cheap reachability probe for the Gemini API host (TLS handshake, no API call).
+
+            Avoids a full list_models()/generateContent() call so we never burn
+            quota or trip rate limits just to learn whether the host is reachable.
+
+            This completes the TLS handshake rather than only the TCP connect: a
+            bare TCP connect succeeds even when certificate verification is
+            broken, which previously let NOVA report "online / api_healthy"
+            while every single model call failed with CERTIFICATE_VERIFY_FAILED.
+            """
+            try:
+                import nova_tls
+                ok, err = nova_tls.probe(timeout=5.0)
+                if not ok:
+                    log.warning("[CONNECTIVITY] Gemini API TLS probe failed: %s", err[:200])
+                return ok
+            except Exception:
+                import socket as _socket
+                try:
+                    _sock = _socket.create_connection(
+                        ("generativelanguage.googleapis.com", 443), timeout=5.0
+                    )
+                    _sock.close()
+                    return True
+                except OSError:
+                    return False
+
+        _connectivity = ConnectivityManager(
+            check_interval=20.0,
+            api_check_fn=_gemini_api_check,
+        )
         _connectivity.start_background()
 
         # Auto-detect and start Ollama if needed
@@ -1868,6 +1956,10 @@ def main() -> None:
         if HAS_GEMINI and GEMINI_API_KEY:
             from nova_intelligence.gemini_provider import GeminiProvider
             _gemini_provider = GeminiProvider(api_key=GEMINI_API_KEY)
+            log.info("[ROUTER] Gemini provider created (key present, %d chars)", len(str(GEMINI_API_KEY)))
+        else:
+            log.warning("[ROUTER] Gemini provider NOT created (HAS_GEMINI=%s, key_present=%s)",
+                        HAS_GEMINI, bool(GEMINI_API_KEY))
 
         _nova_router = init_router(
             gemini_provider=_gemini_provider,

@@ -321,6 +321,7 @@ def run_turn(
             for tc in tool_calls
         ]
         exec_list = []
+        pending_tool_results: List[Tuple[str, str]] = []
         for tc in tool_calls:
             name = tc.get("name", "")
             if stop_event is not None and stop_event.is_set():
@@ -344,11 +345,7 @@ def run_turn(
             # Publish agent done event
             if _publish_agent_done:
                 _publish_agent_done(agent_id, ok=ok, summary=summary[:120])
-            followup_msgs.append({
-                "role": "tool",
-                "content": result,
-                "tool_call_id": tc.get("id", ""),
-            })
+            pending_tool_results.append((name, result))
 
         if stop_event is not None and stop_event.is_set():
             yield _ev("assistant", text=r_text)
@@ -357,12 +354,32 @@ def run_turn(
                 _publish_task_done(task_id, ok=True, summary=f"{len(tool_events)} tools executed")
             return
 
-        # 3. Follow-up round to produce the final answer
+        # 3. Follow-up round to produce the final answer.
+        #
+        # Turn order matters. The assistant turn that *requested* the tools has
+        # to come before their results, and the conversation must end on a user
+        # turn — Gemini rejects a request whose last content is a model turn
+        # with "400 Requests ending with a model turn are not supported", which
+        # made every tool-using answer fall through to the local model.
         yield _ev("status", label="Finishing up")
+        called = ", ".join(n for n, _ in pending_tool_results) or "tools"
         followup_msgs.append({
-            "role": "assistant", "content": r_text or "",
-            "tool_calls": [{"id": c.get("id", ""), "type": "function", "function": {"name": c.get("name", ""), "arguments": ""}} for c in tool_calls],
+            "role": "assistant",
+            "content": r_text or f"(calling {called})",
         })
+        if pending_tool_results:
+            results_block = "\n\n".join(
+                f"[{name} result]\n{res}" for name, res in pending_tool_results
+            )
+            followup_msgs.append({
+                "role": "user",
+                "content": (
+                    f"{results_block}\n\n"
+                    "Using these tool results, reply to my original request "
+                    "directly. Do not narrate your reasoning or mention that "
+                    "tools were used."
+                ),
+            })
         final_text, _tokens2 = _finish_round(followup_msgs, stop_event, streaming)
         if final_text is None or not final_text.strip():
             final_text = r_text.strip()
@@ -442,6 +459,39 @@ def _first_round(messages, stop_event, streaming):
     return _get_offline_response(user_msg), [], []
 
 
+def _model_error_message(error: str) -> str:
+    """Turn a raw provider/router error into an honest, user-facing message.
+
+    Kept separate from the offline fallback so real failures (API quota,
+    transient 5xx, config problems) are never disguised as "brain still
+    starting up". The full detail is always logged at ERROR level by the
+    caller before this message is produced.
+    """
+    err = (error or "").strip()
+    detail = err[:200]
+    if "No intelligence provider" in err:
+        return ("I can't reach an AI model right now — neither the cloud nor a "
+                "local model is available. Check your API key and that Ollama is running.")
+    if any(tok in err for tok in ("11434", "ConnectionPool", "Read Timeout", "Read timed out",
+                                  "Connection refused", "localhost", "ollama")):
+        return ("The local AI model (Ollama) isn't responding. "
+                "Add your Gemini API key in Settings → Account, or start Ollama and load a model.")
+    if "503" in err or "UNAVAILABLE" in err or "high demand" in err:
+        return ("The AI model is temporarily overloaded (503). "
+                "Please wait a moment and try again.")
+    if "429" in err or "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
+        return "The AI model quota was reached (429). Please wait and retry."
+    if "401" in err or "API key" in err or "api key" in err:
+        return "The AI API key was rejected (401). Check your GEMINI_API_KEY."
+    if "CERTIFICATE_VERIFY_FAILED" in err or "certificate verify failed" in err.lower():
+        return ("I can reach the network but can't establish a trusted HTTPS "
+                "connection to the AI provider. This usually means antivirus "
+                "HTTPS scanning or a corporate proxy is intercepting TLS. NOVA "
+                "normally handles this via the system certificate store — "
+                "check that the 'truststore' package is installed.")
+    return f"The AI model call failed: {detail}"
+
+
 def _get_offline_response(user_msg: str) -> str:
     """Return a helpful offline response when no AI backend is available."""
     msg_lower = user_msg.lower().strip()
@@ -517,14 +567,17 @@ def _router_round(router, messages, use_tools, stop_event=None, streaming=True):
             if result.text:
                 tokens.append(_ev("token", text=result.text))
             if result.error:
-                log.warning("router.complete returned error: %s", result.error)
-                user_msg = messages[-1].get("content", "") if messages else ""
-                return _get_offline_response(user_msg), [], tokens
+                # Surface the real error instead of a misleading offline message.
+                log.error("router.complete returned error: %s", result.error)
+                err_text = _model_error_message(result.error)
+                return err_text, [], tokens
+            if not result.text and not result.tool_calls:
+                log.warning("router.complete returned empty result (no text, no tools)")
+                return "I received your message but couldn't produce a response. Please try again.", [], tokens
             return result.text or "", result.tool_calls or [], tokens
         except Exception as e:
-            log.warning("router complete failed: %s", e)
-            user_msg = messages[-1].get("content", "") if messages else ""
-            return _get_offline_response(user_msg), [], []
+            log.error("router complete failed: %s", e, exc_info=True)
+            return _model_error_message(str(e)), [], []
 
     # Text-only follow-up: streaming is fine
     if streaming:
@@ -541,12 +594,19 @@ def _router_round(router, messages, use_tools, stop_event=None, streaming=True):
                 tokens.append(_ev("token", text=chunk))
             return "".join(text_parts), [], tokens
         except Exception as e:
-            log.warning("router streaming failed; falling back to complete: %s", e)
+            log.error("router streaming failed; falling back to complete: %s", e, exc_info=True)
 
-    result = router.complete(
-        messages=router_msgs,
-        system=system,
-    )
+    try:
+        result = router.complete(
+            messages=router_msgs,
+            system=system,
+        )
+    except Exception as e:
+        log.error("router complete failed (follow-up): %s", e, exc_info=True)
+        return _model_error_message(str(e)), [], []
+    if result.error:
+        log.error("router.complete returned error (follow-up): %s", result.error)
+        return _model_error_message(result.error), [], []
     return result.text or "", [], []
 
 

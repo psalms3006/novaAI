@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -27,8 +28,14 @@ class OllamaProvider:
         self,
         base_url: str = OLLAMA_DEFAULT_URL,
         model: str = "llama3.2",
-        timeout: int = 30,
+        timeout: int = 0,
     ):
+        # 8s was far too short to be a real fallback: a cold local model spends
+        # most of that just loading weights into memory, so every offline
+        # request failed with a read timeout right after the router had
+        # correctly chosen Ollama. Availability probes stay short (3s, below);
+        # this timeout covers actual generation.
+        timeout = timeout or int(os.getenv("NOVA_OLLAMA_TIMEOUT", "") or 120)
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._timeout = timeout
@@ -202,9 +209,12 @@ class OllamaProvider:
                         continue
             self._health.record_success()
         except Exception as e:
+            # Raise rather than yielding an error string: the router can only
+            # fail over to another provider if the failure is visible as an
+            # exception. A yielded "[Error: ...]" looks like a valid answer.
             self._health.record_failure(str(e))
             log.warning("[OLLAMA] stream error: %s", e)
-            yield f"[Error: {e}]"
+            raise
 
     def get_model_info(self) -> dict:
         return {

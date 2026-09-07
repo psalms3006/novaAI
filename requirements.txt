@@ -18,6 +18,9 @@
 # ── Core ───────────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0          # .env file loading
 requests>=2.31.0              # HTTP client (Gemini REST, web search, etc.)
+truststore>=0.9.0             # TLS verification via the OS trust store — required on
+                              # machines with antivirus HTTPS scanning / corporate TLS
+                              # proxies, where certifi lacks the interception root
 psutil>=5.9.0                 # Process monitoring, system info
 pyyaml>=6.0                   # YAML config loading
 

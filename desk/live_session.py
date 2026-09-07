@@ -123,6 +123,11 @@ class LiveManager:
         turn_complete, interrupted, error, go_away
     """
 
+    # Reconnect policy for a dropped/failed Live socket.
+    MAX_RECONNECT_ATTEMPTS = 6
+    RECONNECT_BASE_DELAY = 2.0
+    RECONNECT_MAX_DELAY = 60.0
+
     def __init__(self, model: str | None = None, voice: str | None = None):
         self._model = model or os.getenv("LIVE_MODEL", LIVE_MODEL_DEFAULT)
         self._voice = voice or os.getenv("NOVA_VOICE", _resolve("NOVA_VOICE", "Aoede"))
@@ -283,6 +288,10 @@ class LiveManager:
 
     # ── asyncio loop ──────────────────────────────────────────────────────
 
+    def _should_reconnect(self) -> bool:
+        with self._state_lock:
+            return self._state not in (LiveState.DISCONNECTING, LiveState.CLOSED)
+
     def _run_loop(self) -> None:
         try:
             self._loop = asyncio.new_event_loop()
@@ -329,39 +338,76 @@ class LiveManager:
             ),
         )
 
-        _log("[LIVE] connecting to %s voice=%s ...", self._model, self._voice)
-        t0 = time.time()
-        try:
-            async with client.aio.live.connect(model=self._model, config=config) as session:
-                self._session = session
-                dt = time.time() - t0
-                self._t_connected = time.time()
-                with self._state_lock:
-                    self._state = LiveState.STREAMING
-                _log("[LIVE] connected in %.1fs", dt)
-                self._publish(LiveEvent("state", state="connected", connect_time_s=round(dt, 2)))
+        # Reconnect policy. Without a bound, a permanent failure (bad key,
+        # revoked quota, broken TLS trust) turned into an infinite 2s retry
+        # loop that spammed the log forever and never told the user anything.
+        consecutive_failures = 0
+        while self._should_reconnect():
+            _log("[LIVE] connecting to %s voice=%s ...", self._model, self._voice)
+            t0 = time.time()
+            connected_ok = False
+            try:
+                async with (client.aio.live.connect(model=self._model, config=config) as session,
+                            asyncio.TaskGroup() as tg):
+                    self._session = session
+                    connected_ok = True
+                    consecutive_failures = 0
+                    dt = time.time() - t0
+                    self._t_connected = time.time()
+                    with self._state_lock:
+                        self._state = LiveState.STREAMING
+                    _log("[LIVE] connected in %.1fs", dt)
+                    self._publish(LiveEvent("state", state="connected", connect_time_s=round(dt, 2)))
 
-                self._start_mic()
+                    self._start_mic()
 
-                # Auto-send greeting (like terminal behavior)
-                await self._send_greeting(session)
+                    # Auto-send greeting (like terminal behavior)
+                    await self._send_greeting(session)
 
-                await asyncio.gather(
-                    self._mic_sender(session),
-                    self._receiver(session),
-                    self._text_sender(session),
+                    tg.create_task(self._mic_sender(session))
+                    tg.create_task(self._receiver(session))
+                    tg.create_task(self._text_sender(session))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if not connected_ok:
+                    consecutive_failures += 1
+                _log(
+                    "[LIVE] connect/run error (failure %d/%d): %s",
+                    consecutive_failures, self.MAX_RECONNECT_ATTEMPTS, e,
                 )
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            _log("[LIVE] connect/run error: %s", e)
-            self._last_error = str(e)
+                self._last_error = str(e)
+                self._publish(LiveEvent("state", state="error", error=str(e)))
+            finally:
+                self._stop_mic()
+                self._session = None
+
+            # Reconnect on transient drops (keepalive timeout, network blip, 5xx)
+            if not self._should_reconnect():
+                break
+
+            if consecutive_failures >= self.MAX_RECONNECT_ATTEMPTS:
+                _log(
+                    "[LIVE] giving up after %d consecutive failures: %s",
+                    consecutive_failures, self._last_error,
+                )
+                with self._state_lock:
+                    self._state = LiveState.ERROR
+                self._publish(LiveEvent(
+                    "state", state="error", error=self._last_error, gave_up=True,
+                ))
+                break
+
+            # Exponential backoff with a ceiling, so a persistent outage costs
+            # a trickle of retries rather than 30 per minute.
+            delay = min(
+                self.RECONNECT_BASE_DELAY * (2 ** max(0, consecutive_failures - 1)),
+                self.RECONNECT_MAX_DELAY,
+            )
             with self._state_lock:
-                self._state = LiveState.ERROR
-            self._publish(LiveEvent("state", state="error", error=str(e)))
-        finally:
-            self._stop_mic()
-            self._session = None
+                self._state = LiveState.CONNECTING
+            self._publish(LiveEvent("state", state="connecting", retry_in_s=round(delay, 1)))
+            await asyncio.sleep(delay)
 
     async def _send_greeting(self, session: Any) -> None:
         """Send a proactive greeting after connecting, like the terminal does."""
@@ -390,7 +436,9 @@ class LiveManager:
                 data = await loop.run_in_executor(None, self._mic_queue.get, True, 0.1)
                 if data is None:
                     break
-                await session.send(input_audio=data)
+                await session.send_realtime_input(
+                    audio=gtypes.Blob(data=data, mime_type="audio/pcm;rate=16000")
+                )
                 self._audio_bytes_in += len(data)
             except queue.Empty:
                 continue
@@ -398,7 +446,7 @@ class LiveManager:
                 break
             except Exception as e:
                 _log("[LIVE] mic send error: %s", e)
-                break
+                raise
 
     async def _receiver(self, session: Any) -> None:
         try:
@@ -407,13 +455,16 @@ class LiveManager:
                 if sc is None:
                     continue
 
-                if sc.model_turn and sc.model_turn.data:
-                    audio = sc.model_turn.data
-                    b64 = base64.b64encode(audio).decode("ascii")
-                    self._audio_bytes_out += len(audio)
-                    if self._t_first_audio == 0.0:
-                        self._t_first_audio = time.time()
-                    self._publish(LiveEvent("audio", data_b64=b64, size=len(audio)))
+                if sc.model_turn and sc.model_turn.parts:
+                    for part in sc.model_turn.parts:
+                        inline = getattr(part, "inline_data", None)
+                        if inline is not None and getattr(inline, "data", None):
+                            audio = inline.data
+                            b64 = base64.b64encode(audio).decode("ascii")
+                            self._audio_bytes_out += len(audio)
+                            if self._t_first_audio == 0.0:
+                                self._t_first_audio = time.time()
+                            self._publish(LiveEvent("audio", data_b64=b64, size=len(audio)))
 
                 if sc.input_transcription and sc.input_transcription.text:
                     text = sc.input_transcription.text.strip()
@@ -435,12 +486,13 @@ class LiveManager:
 
                 if msg.go_away:
                     self._publish(LiveEvent("go_away"))
-                    break
+                    raise ConnectionError("gemini live go_away")
         except asyncio.CancelledError:
             pass
         except Exception as e:
             _log("[LIVE] receiver error: %s", e)
             self._publish(LiveEvent("error", error=str(e)))
+            raise
 
     async def _text_sender(self, session: Any) -> None:
         loop = asyncio.get_running_loop()
@@ -449,7 +501,9 @@ class LiveManager:
                 text = await loop.run_in_executor(None, self._input_text_queue.get, True, 0.1)
                 if text is None:
                     break
-                await session.send(input_text=text)
+                await session.send_client_content(
+                    turns={"role": "user", "parts": [{"text": text}]}, turn_complete=True
+                )
             except queue.Empty:
                 continue
             except asyncio.CancelledError:
