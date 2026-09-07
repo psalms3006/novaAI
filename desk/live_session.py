@@ -149,6 +149,7 @@ class LiveManager:
         self._turn_count: int = 0
         self._audio_bytes_out: int = 0
         self._audio_bytes_in: int = 0
+        self._has_greeted: bool = False
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -169,6 +170,7 @@ class LiveManager:
             self._turn_count = 0
             self._audio_bytes_out = 0
             self._audio_bytes_in = 0
+            self._has_greeted = False
         self._thread = threading.Thread(target=self._run_loop, name="nova-live", daemon=True)
         self._thread.start()
         return {"ok": True, "message": "connecting"}
@@ -361,8 +363,13 @@ class LiveManager:
 
                     self._start_mic()
 
-                    # Auto-send greeting (like terminal behavior)
-                    await self._send_greeting(session)
+                    # Greet once per session, not on every reconnect. The Live
+                    # socket drops on keepalive timeout roughly every minute of
+                    # silence, so greeting on reconnect made an idle NOVA speak
+                    # an unprompted greeting over and over.
+                    if not self._has_greeted:
+                        self._has_greeted = True
+                        await self._send_greeting(session)
 
                     tg.create_task(self._mic_sender(session))
                     tg.create_task(self._receiver(session))

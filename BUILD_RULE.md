@@ -88,7 +88,9 @@ For major milestones, feature completions, bug fixes intended for release, and u
 ## Current Maintained Artifacts
 
 - **Source**: `C:\Users\Lenovo\project-nova\`
-- **EXE**: `C:\Users\Lenovo\project-nova\dist\NOVADesktop\NOVA.exe` (PyInstaller)
+- **EXE**: `C:\Users\Lenovo\project-nova\dist\NOVADesktop2\NOVA.exe` (PyInstaller)
+- **Installer**: `packaging\out\NOVA-Setup.exe` (Inno Setup 6, from `packaging\NOVA-Setup.iss`)
+- **Portable ZIP**: `packaging\out\NOVA-portable.zip`
 - **Build spec**: `C:\Users\Lenovo\project-nova\packaging\nova_desktop.spec`
 
 ### Build Commands
@@ -96,10 +98,16 @@ For major milestones, feature completions, bug fixes intended for release, and u
 ```bash
 # Full rebuild (kill running NOVA.exe first if needed)
 cd C:\Users\Lenovo\project-nova
-pyinstaller packaging/nova_desktop.spec --clean --noconfirm
+python -m PyInstaller packaging/nova_desktop.spec --clean --noconfirm
+
+# Installer (Inno Setup 6)
+"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" packaging\NOVA-Setup.iss
+
+# Portable ZIP
+powershell -Command "Compress-Archive -Path dist\NOVADesktop2\* -DestinationPath packaging\out\NOVA-portable.zip -Force"
 
 # Verify EXE exists and is current
-Get-Item dist\NOVADesktop\NOVA.exe | Select-Object Length, LastWriteTime
+Get-Item dist\NOVADesktop2\NOVA.exe | Select-Object Length, LastWriteTime
 ```
 
 ---
