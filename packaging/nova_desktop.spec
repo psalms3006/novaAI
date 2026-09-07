@@ -24,7 +24,7 @@ if os.path.exists(_python_dll):
 
 hidden = [
     # web stack
-    "flask", "flask.json", "jinja2", "werkzeug", "its_dangerous", "click",
+    "flask", "flask.json", "jinja2", "werkzeug", "itsdangerous", "click",
     "requests", "urllib3",
     # TLS trust via the OS certificate store — without this, HTTPS fails on any
     # machine with antivirus HTTPS scanning or a corporate TLS proxy.
@@ -36,7 +36,7 @@ hidden = [
     "webview", "webview.platforms.winforms", "webview.platforms.edgechromium",
     "clr", "pythonnet",
     # audio / stt
-    "sounddevice", "sounddevice._sounddevice_data",
+    "sounddevice",
     "faster_whisper", "ctranslate2", "tokenizers", "huggingface_hub",
     # tts (pyttsx3 SAPI5 driver)
     "pyttsx3", "pyttsx3.drivers", "pyttsx3.drivers.sapi5", "comtypes",
@@ -44,7 +44,7 @@ hidden = [
     "PIL", "numpy",
     # gemini SDK (live + chat)
     "google.genai", "google.genai.types",
-    "grpc", "proto_plus",
+    "grpc", "proto",
     # nova_intelligence package
     "nova_intelligence", "nova_intelligence.connectivity",
     "nova_intelligence.provider", "nova_intelligence.ollama_provider",
@@ -65,13 +65,30 @@ hidden = [
     # misc runtime
     "psutil", "sqlite3",
 ]
+
+# Tool modules and subsystems that are resolved dynamically (importlib /
+# function-local imports), so PyInstaller's static analysis cannot see them.
+# Without this, actions.vision, actions.file_processor, core.execution_engine
+# and the memory.* layers were simply absent from the build and the tools
+# reported themselves as missing at runtime.
+for _pkg in ("actions", "capabilities", "core", "orchestrator", "memory",
+             "trust", "integrations", "tools", "agent"):
+    try:
+        hidden += [m for m in collect_submodules(_pkg)
+                   if not m.endswith(("._init_", ".__main__", "._smoke_test"))]
+    except Exception:
+        pass
+# Only submodules that actually exist in the installed google-genai. Listing
+# names that do not exist made PyInstaller emit "ERROR: Hidden import not
+# found" for each, which hid real build failures in the noise.
 hidden += [
     "google.genai", "google.genai.types", "google.genai._api_client",
-    "google.genai._auth", "google.genai._common", "google.genai._config",
-    "google.genai._exceptions", "google.genai._fetch", "google.genai._utils",
-    "google.genai.live", "google.genai.models", "google.genai.sessions",
+    "google.genai._common",
+    "google.genai.live", "google.genai.models",
     "google.genai.files", "google.genai.caches", "google.genai.batches",
-    "google.genai.tokens", "google.genai._base_transformer",
+    "google.genai.tokens",
+    # legacy SDK — still imported lazily by actions/dev_agent.py, agent/executor.py
+    # and agent/planner.py, so it has to be collected for those paths to work.
     "google.generativeai", "google.generativeai.models",
 ]
 
@@ -81,8 +98,16 @@ a = Analysis(
     binaries=_binaries,    datas=[
         # the SPA + vendored js/css
         (os.path.join(ROOT, "desk", "static"), "desk/static"),
-        # local embedding model used by living-memory semantic search
-        (os.path.join(ROOT, "nova_embedder"), "nova_embedder"),
+        # NOTE: nova_embedder is deliberately NOT bundled. Loading it needs
+        # sentence-transformers, which needs torch + transformers — all three
+        # are excluded below to keep the installer near 200 MB rather than
+        # several GB. Shipping the 90 MB model without its runtime added dead
+        # weight to every download and could never load. Memory still works in
+        # the packaged app: facts persist, and retrieval falls back to the
+        # lexical search in memory_extra._lexical_search / living_memory.search.
+        # To re-enable semantic search, drop torch/transformers from `excludes`,
+        # add "sentence_transformers" to `hidden`, and restore the line below.
+        # (os.path.join(ROOT, "nova_embedder"), "nova_embedder"),
         # first-run key template (users copy it next to NOVA.exe as ".env")
         (os.path.join(ROOT, ".env.template"), ".env.template"),
         # runtime config template (model selection etc.) — no secrets inside

@@ -1467,8 +1467,11 @@ def _execute_tool_sync(tool_name: str, args: dict, meta: dict) -> str:
                 )
             return f"Remembered: {fact}" if fact else "No fact provided."
         except Exception as _re:
+            # Never claim a durable write that did not happen — the user acts on
+            # this confirmation and would not know the fact had been dropped.
             log.warning("remember_fact failed: %s", _re)
-            return (f"Remembered: {fact}" if fact else "No fact provided.")
+            return (f"I couldn't save that to memory ({_re}). "
+                    f"I'll keep it in mind for this conversation only.")
     if tool_name == "nova_memory":
         try:
             if nova_state._living_memory:

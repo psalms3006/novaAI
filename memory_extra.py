@@ -232,13 +232,48 @@ def add_memory_fact(text: str, meta: dict) -> bool:
         return True
 
 
-def search_memory(query: str, top_k: int = TOP_K) -> List[str]:
-    if not nova_state._memory_texts or _faiss_index is None or _faiss_index.ntotal == 0:
+_LEXICAL_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "do", "for", "from", "how",
+    "i", "in", "is", "it", "me", "my", "of", "on", "or", "the", "to", "what",
+    "when", "where", "which", "who", "why", "you", "your",
+}
+
+
+def _lexical_search(query: str, top_k: int) -> List[str]:
+    """Word-overlap fallback used when no embedding model is loaded.
+
+    The packaged app ships without torch/transformers, so the embedder is
+    unavailable there. Without this, every stored fact became unreachable in
+    the distributed build even though it had been saved correctly.
+    """
+    tokens = {
+        w for w in re.findall(r"\w+", (query or "").lower())
+        if len(w) > 2 and w not in _LEXICAL_STOPWORDS
+    }
+    if not tokens:
         return []
+    scored = []
+    for text in nova_state._memory_texts:
+        low = text.lower()
+        hits = sum(1 for t in tokens if t in low)
+        if hits:
+            scored.append((hits / len(tokens), text))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [t for score, t in scored[:top_k] if score >= 0.34]
+
+
+def search_memory(query: str, top_k: int = TOP_K) -> List[str]:
+    if not nova_state._memory_texts:
+        return []
+    if nova_state._embedder is None or _faiss_index is None or _faiss_index.ntotal == 0:
+        return _lexical_search(query, top_k)
     k = min(top_k, len(nova_state._memory_texts))
     scores, indices = _faiss_index.search(_embed(query), k)
-    return [nova_state._memory_texts[i] for i, s in zip(indices[0], scores[0])
+    hits = [nova_state._memory_texts[i] for i, s in zip(indices[0], scores[0])
             if i < len(nova_state._memory_texts) and s >= MIN_SCORE]
+    # A semantically thin match is still better answered lexically than not at
+    # all (exact names, IDs and rare tokens embed poorly).
+    return hits or _lexical_search(query, top_k)
 
 
 def build_memory_context(meta: dict, query: str = "") -> str:

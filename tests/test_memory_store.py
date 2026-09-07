@@ -207,3 +207,34 @@ def test_build_memory_context_includes_a_matching_fact(memory_env):
 
 def test_build_memory_context_is_empty_with_no_data(memory_env):
     assert memory_extra.build_memory_context({}, query="anything") == ""
+
+
+# ── lexical fallback (what the packaged app relies on) ────────────────────────
+
+def test_lexical_fallback_finds_a_fact_without_an_embedder(memory_env, monkeypatch):
+    """The shipped EXE has no torch/transformers, so there is no embedder."""
+    memory_extra.add_memory_fact("User's favourite programming language is Rust", {})
+    memory_extra.add_memory_fact("User lives in Lagos", {})
+    monkeypatch.setattr(nova_state, "_embedder", None)
+
+    hits = memory_extra.search_memory("what is my favourite programming language")
+    assert hits == ["User's favourite programming language is Rust"]
+
+
+def test_lexical_fallback_ignores_stopword_only_queries(memory_env, monkeypatch):
+    memory_extra.add_memory_fact("User lives in Lagos", {})
+    monkeypatch.setattr(nova_state, "_embedder", None)
+    assert memory_extra.search_memory("what is it") == []
+
+
+def test_lexical_fallback_returns_nothing_for_an_unrelated_query(memory_env, monkeypatch):
+    memory_extra.add_memory_fact("User lives in Lagos", {})
+    monkeypatch.setattr(nova_state, "_embedder", None)
+    assert memory_extra.search_memory("quantum chromodynamics research") == []
+
+
+def test_build_memory_context_works_without_an_embedder(memory_env, monkeypatch):
+    memory_extra.add_memory_fact("User's favourite programming language is Rust", {})
+    monkeypatch.setattr(nova_state, "_embedder", None)
+    ctx = memory_extra.build_memory_context({}, query="favourite programming language")
+    assert "Rust" in ctx

@@ -120,7 +120,32 @@ def _gemini_vision(image_path: Path, question: str) -> str:
             contents=[question, gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png")]
         )
         _nova._reset_rate_limit()
-        return (response.text or "").strip()
+        text = ""
+        try:
+            text = (response.text or "").strip()
+        except Exception:
+            text = ""
+        if text:
+            return text
+        # An empty vision response is a failure, not a description. Returning ""
+        # produced the bare header "Looking at your screen:" with nothing under
+        # it, which reads to the user (and to the model in the follow-up round)
+        # as a successful analysis. Report why it was empty instead.
+        reason = ""
+        try:
+            cand = (getattr(response, "candidates", None) or [None])[0]
+            reason = str(getattr(cand, "finish_reason", "") or "")
+            if not reason:
+                fb = getattr(response, "prompt_feedback", None)
+                reason = str(getattr(fb, "block_reason", "") or "")
+        except Exception:
+            pass
+        log.warning("[VISION] empty response from %s (finish_reason=%r)", VISION_MODEL, reason)
+        return (
+            "The vision model returned no description"
+            + (f" (finish reason: {reason})" if reason else "")
+            + ". The screenshot was captured but could not be analysed."
+        )
     except Exception as e:
         err = str(e)
         if "429" in err or "RESOURCE_EXHAUSTED" in err:

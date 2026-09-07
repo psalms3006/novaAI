@@ -362,11 +362,11 @@ def run_turn(
         # with "400 Requests ending with a model turn are not supported", which
         # made every tool-using answer fall through to the local model.
         yield _ev("status", label="Finishing up")
-        called = ", ".join(n for n, _ in pending_tool_results) or "tools"
-        followup_msgs.append({
-            "role": "assistant",
-            "content": r_text or f"(calling {called})",
-        })
+        # Only add the assistant turn if the model actually said something. A
+        # synthetic placeholder here gets echoed back verbatim by the model and
+        # shown to the user as NOVA's answer.
+        if r_text and r_text.strip():
+            followup_msgs.append({"role": "assistant", "content": r_text})
         if pending_tool_results:
             results_block = "\n\n".join(
                 f"[{name} result]\n{res}" for name, res in pending_tool_results
