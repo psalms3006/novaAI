@@ -178,6 +178,15 @@
       </footer>
     </div>
 
+    <!-- inspector sheet: real data for the nav views, opened on demand -->
+    <aside class="inspector" id="inspector">
+      <div class="inspector-head">
+        <span class="inspector-ttl" id="inspector-title">DETAIL</span>
+        <button class="icon-btn" id="btn-inspector-close" title="Close" aria-label="Close">&#10005;</button>
+      </div>
+      <div class="inspector-body" id="inspector-body"></div>
+    </aside>
+
     <!-- kept for app.js compatibility; the drawer owns this surface now -->
     <aside class="right-field" id="right-field" hidden></aside>
   </div>

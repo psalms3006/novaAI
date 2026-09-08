@@ -1009,8 +1009,13 @@ document.querySelectorAll(".nav-item").forEach(btn =>
       refreshStatus();
       $("settings-modal").classList.add("open");
       showSettingsTab("general");
+    } else if (window.novaOpenView) {
+      // Real inspector panel (hud.js). These used to fall through to a toast
+      // that just echoed the view name — five controls that looked functional
+      // and did nothing, while their backends already existed.
+      window.novaOpenView(view);
     } else {
-      toast(`${view} view`);
+      toast(`${view} unavailable`);
     }
   }));
 

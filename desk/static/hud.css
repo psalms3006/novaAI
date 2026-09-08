@@ -539,3 +539,52 @@ body[data-mode="ambient"] .hud { padding: 0; }
 
 /* Voice-first: the presence gets the room, not the composer. */
 .orb-container { min-height: min(46vh, 460px); }
+
+/* ── inspector: progressive disclosure for the nav views ─────────────────
+   Deliberately a sheet, not another permanent panel — the default view stays
+   NOVA plus voice, and detail appears only when asked for. */
+.inspector {
+  position: absolute;
+  top: 0; right: 0; bottom: 0;
+  width: min(460px, 46vw);
+  z-index: 45;
+  background: rgba(5, 11, 20, 0.97);
+  border-left: 1px solid var(--hud-line);
+  backdrop-filter: blur(10px);
+  transform: translateX(100%);
+  transition: transform .24s cubic-bezier(.4,0,.2,1);
+  display: flex; flex-direction: column;
+  padding: 14px 16px;
+  gap: 10px;
+}
+.inspector.open { transform: translateX(0); }
+.inspector-head {
+  display: flex; align-items: center; justify-content: space-between;
+  border-bottom: 1px solid var(--hud-line-soft); padding-bottom: 8px;
+}
+.inspector-ttl {
+  font-family: var(--hud-mono); font-size: 10px;
+  letter-spacing: 0.24em; color: var(--hud-cyan); text-transform: uppercase;
+}
+.inspector-body { flex: 1; overflow-y: auto; font-family: var(--hud-mono); font-size: 11px; }
+.insp-row {
+  padding: 7px 8px; border: 1px solid var(--hud-line-soft);
+  margin-bottom: 5px; color: var(--hud-text); line-height: 1.5;
+}
+.insp-row .sub { color: var(--hud-muted); font-size: 9.5px; letter-spacing: .08em; }
+.insp-row.ok  { border-color: rgba(76,224,179,.30); }
+.insp-row.off { opacity: .45; }
+.insp-empty { color: var(--hud-muted); font-size: 10px; letter-spacing: .12em; padding: 10px 2px; }
+
+
+/* Ambient window: a 260px frameless always-on-top OS window running this same
+   page with ?mode=ambient. Only the presence is visible, so NOVA reads as one
+   continuous entity that has stepped aside rather than a second widget. */
+body[data-mode="ambient"] { background: transparent !important; cursor: pointer; }
+body[data-mode="ambient"] #app.app { background: transparent !important; }
+body[data-mode="ambient"] .stage { padding: 0; gap: 0; }
+body[data-mode="ambient"] .orb-container { min-height: 0; height: 100vh; }
+body[data-mode="ambient"] .stage-state { position: absolute; bottom: 8px; left: 0; right: 0; }
+body[data-mode="ambient"] .orb-label { font-size: 8px; letter-spacing: .3em; opacity: .8; }
+body[data-mode="ambient"] .voice-cta,
+body[data-mode="ambient"] .inspector { display: none; }

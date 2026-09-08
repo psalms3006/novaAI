@@ -284,9 +284,110 @@
     requestAnimationFrame(frame);
   }
 
+  /* ── inspector ─────────────────────────────────────────────────────── */
+
+  const VIEWS = {
+    projects: {
+      title: "Projects",
+      url: "/api/projects",
+      rows: (d) => (d.projects || d || []).map((p) => ({
+        main: p.name || p.title || p.id, sub: p.description || "no description",
+      })),
+    },
+    files: {
+      title: "Workspace files",
+      url: "/api/files",
+      rows: (d) => (d.files || d || []).map((f) => ({
+        main: f.name || f.path || String(f),
+        sub: f.size != null ? `${(f.size / 1024).toFixed(1)} KB` : "",
+      })),
+    },
+    skills: {
+      title: "Tools & capabilities",
+      url: "/api/tools",
+      rows: (d) => Object.entries(d.tools || {}).map(([name, t]) => ({
+        main: t.label || name,
+        sub: `${name} · ${t.category || "tool"} · ${t.permission || ""}`,
+        ok: t.available, off: !t.available,
+      })),
+    },
+    memory: {
+      title: "Memory",
+      url: "/api/memory",
+      rows: (d) => {
+        const out = (d.facts || []).map((f) => ({ main: f, sub: "fact" }));
+        for (const r of d.records || []) {
+          out.push({ main: r.text, sub: `${r.type || "record"} · importance ${r.importance}`, ok: r.confirmed });
+        }
+        return out;
+      },
+    },
+  };
+
+  async function openView(view) {
+    const sheet = $("inspector");
+    const body = $("inspector-body");
+    const title = $("inspector-title");
+    if (!sheet || !body) return;
+
+    if (view === "mind-map") {
+      // The Mind Map is its own three.js surface, already shipped.
+      document.body.dataset.view = "mind-map";
+      sheet.classList.remove("open");
+      logLine("mind map view requested", "");
+      window.dispatchEvent(new CustomEvent("nova:view", { detail: "mind-map" }));
+      return;
+    }
+
+    const spec = VIEWS[view];
+    if (!spec) return;
+    title.textContent = spec.title.toUpperCase();
+    body.innerHTML = '<div class="insp-empty">LOADING…</div>';
+    sheet.classList.add("open");
+    try {
+      const res = await fetch(spec.url, {
+        headers: { "X-NOVA-Desk": TOKEN }, signal: AbortSignal.timeout(6000),
+      });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const rows = spec.rows(await res.json()) || [];
+      body.innerHTML = rows.length
+        ? rows.map((r) => `<div class="insp-row${r.ok ? " ok" : ""}${r.off ? " off" : ""}">
+             ${escapeHtml(r.main || "")}${r.sub ? `<div class="sub">${escapeHtml(r.sub)}</div>` : ""}
+           </div>`).join("")
+        : '<div class="insp-empty">NOTHING HERE YET</div>';
+      logLine(`${view}: ${rows.length} item(s)`, "");
+    } catch (e) {
+      body.innerHTML = `<div class="insp-empty">COULD NOT LOAD — ${escapeHtml(String(e.message || e))}</div>`;
+      logLine(`${view} failed: ${e.message || e}`, "bad");
+    }
+  }
+  window.novaOpenView = openView;
+
   /* ── boot ──────────────────────────────────────────────────────────── */
 
+  /* ── ambient mode ──────────────────────────────────────────────────── */
+
+  const AMBIENT = new URLSearchParams(location.search).get("mode") === "ambient";
+
+  function initAmbient() {
+    document.body.dataset.mode = "ambient";
+    // In ambient the page is a 260px always-on-top window showing only the
+    // orb, so none of the HUD panels are on screen — don't poll for them.
+    document.title = "NOVA";
+    // Clicking the presence brings the full command centre back.
+    document.addEventListener("click", async () => {
+      try {
+        await fetch("/api/ambient", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-NOVA-Desk": TOKEN },
+          body: JSON.stringify({ mode: "full" }),
+        });
+      } catch (e) { /* the shell may already be restoring */ }
+    });
+  }
+
   function start() {
+    if (AMBIENT) { initAmbient(); return; }
     tickClock();
     setInterval(tickClock, 100);
     poll();
@@ -298,8 +399,13 @@
     const drawer = $("left-panel");
     $("btn-toggle-panel")?.addEventListener("click", () => drawer?.classList.toggle("open"));
     $("btn-close-panel")?.addEventListener("click", () => drawer?.classList.remove("open"));
+    $("btn-inspector-close")?.addEventListener("click",
+      () => $("inspector")?.classList.remove("open"));
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") drawer?.classList.remove("open");
+      if (e.key === "Escape") {
+        drawer?.classList.remove("open");
+        $("inspector")?.classList.remove("open");
+      }
     });
   }
 

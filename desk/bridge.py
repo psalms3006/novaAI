@@ -656,6 +656,10 @@ def api_chat():
                 if first_emit:
                     desk_trace.mark("first_event_emitted", type=ev.get("type"))
                     first_emit = False
+                # Step aside for desktop work so the user can watch it happen,
+                # and only for tools where seeing the screen is the point.
+                if ev.get("type") == "tool_start" and ev.get("name") in _DESKTOP_TOOLS:
+                    set_ambient_mode("ambient")
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 # Update orb state based on events
                 if ev.get("type") == "tool_start":
@@ -673,6 +677,8 @@ def api_chat():
             # Return orb to idle
             publish_event({"type": "orb_state", "state": "idle", "ts": time.time()})
             desk_trace.mark("stream_end", events=len(events_accum))
+            if _ambient_mode == "ambient":
+                set_ambient_mode("full")
             if message or image_path:
                 _persist_turn(cid, message, events_accum, started)
             global _last_turn_ms
@@ -1379,6 +1385,70 @@ def api_mcp():
 
 
 # ── tasks ──────────────────────────────────────────────────────────────────────
+
+# ── ambient mode ──────────────────────────────────────────────────────────────
+#
+# NOVA collapses to a small always-on-top presence while she is doing work on
+# the desktop, so the user can watch the actual application being driven. The
+# desktop shell owns the windows, so it registers hooks here and the web layer
+# only ever asks for a mode.
+
+_ambient_hooks: dict = {"enter": None, "exit": None}
+_ambient_mode: str = "full"
+
+# Tools whose value to the user is *seeing the desktop*. Purely conversational
+# turns must not yank the window away, so this list is deliberately narrow.
+_DESKTOP_TOOLS = {
+    "open_app", "close_app", "browser_control", "computer_control",
+    "computer_settings", "file_controller", "vision",
+}
+
+
+def register_ambient_hooks(enter=None, exit=None) -> None:
+    """Called by the desktop shell to expose real window control."""
+    _ambient_hooks["enter"] = enter
+    _ambient_hooks["exit"] = exit
+    log.info("[AMBIENT] hooks registered (enter=%s exit=%s)", bool(enter), bool(exit))
+
+
+def set_ambient_mode(mode: str) -> dict:
+    """Switch NOVA between the full command centre and the ambient presence."""
+    global _ambient_mode
+    mode = "ambient" if mode == "ambient" else "full"
+    if mode == _ambient_mode:
+        return {"ok": True, "mode": mode, "changed": False}
+    hook = _ambient_hooks["enter"] if mode == "ambient" else _ambient_hooks["exit"]
+    if hook is None:
+        # Headless/browser runs have no window to move; say so rather than
+        # reporting a transition that did not happen.
+        return {"ok": False, "mode": _ambient_mode, "reason": "no desktop window"}
+    try:
+        hook()
+    except Exception as e:
+        log.warning("[AMBIENT] %s hook failed: %s", mode, e)
+        return {"ok": False, "mode": _ambient_mode, "reason": str(e)}
+    _ambient_mode = mode
+    publish_event({"type": "ambient", "mode": mode, "ts": time.time()})
+    log.info("[AMBIENT] mode -> %s", mode)
+    return {"ok": True, "mode": mode, "changed": True}
+
+
+@app.post("/api/ambient")
+@require_token
+def api_ambient():
+    data = request.get_json(silent=True) or {}
+    return jsonify(set_ambient_mode((data.get("mode") or "full").strip()))
+
+
+@app.get("/api/ambient")
+@require_token
+def api_ambient_get():
+    return jsonify({
+        "ok": True,
+        "mode": _ambient_mode,
+        "available": bool(_ambient_hooks["enter"]),
+    })
+
 
 def _agent_key(agent_id: str, tool: str = "", name: str = "") -> str:
     """Map a runtime agent/tool id onto one of the roster ids in _AGENT_ROSTER.

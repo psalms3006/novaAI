@@ -237,6 +237,59 @@ def main() -> int:
         _on_backend_ready()
         return False
 
+    # ── ambient presence ──────────────────────────────────────────────
+    # A real frameless, transparent, always-on-top OS window showing the same
+    # NOVA page in ambient mode — so it is literally the same orb instance and
+    # the same visual language, not a second widget.
+    #
+    # desk.win_overlay.AmbientOverlay is NOT used: it creates a layered Win32
+    # window but has no WM_PAINT handler and never draws anything, so it would
+    # put an invisible window on screen.
+    ambient_window = None
+    try:
+        ambient_window = webview.create_window(
+            "NOVA",
+            url=f"{DESK_URL}/?mode=ambient",
+            width=260, height=260,
+            frameless=True,
+            easy_drag=True,
+            on_top=True,
+            transparent=True,
+            resizable=False,
+            hidden=True,
+            background_color="#04070d",
+        )
+        _log("Ambient window created (hidden)")
+    except Exception as e:
+        _log(f"Ambient window unavailable: {e}")
+
+    def _enter_ambient():
+        _log("Entering ambient mode")
+        if ambient_window is not None:
+            ambient_window.show()
+        loading_window.minimize()
+
+    def _exit_ambient():
+        _log("Leaving ambient mode")
+        if ambient_window is not None:
+            ambient_window.hide()
+        loading_window.restore()
+
+    def _register_hooks():
+        # The bridge is imported on the server thread; wait for it, then hand
+        # over real window control.
+        for _ in range(120):
+            try:
+                import desk.bridge as _br
+                _br.register_ambient_hooks(enter=_enter_ambient, exit=_exit_ambient)
+                _log("Ambient hooks registered with bridge")
+                return
+            except Exception:
+                time.sleep(0.5)
+        _log("Could not register ambient hooks")
+
+    threading.Thread(target=_register_hooks, daemon=True).start()
+
     wait_thread = threading.Thread(target=_wait_for_backend, daemon=True)
     wait_thread.start()
 

@@ -40,6 +40,7 @@ from pathlib import Path
 from desk.settings import app_data_dir, get as _get_setting, set_many
 
 _CRED_FILE = "byok.bin"
+_PLAINTEXT_FILE = "api_keys.json"     # plaintext fallback (mirrors MARK XXXIX)
 _DEVICE_FILE = "device.json"
 _SENTINEL = "nova-cloud-session"      # truthy placeholder, NOT a secret
 _LOG_REDACT = "nova-gateway-auth"     # what appears in logs instead of tokens
@@ -96,27 +97,72 @@ def _cred_path() -> Path:
     return app_data_dir() / _CRED_FILE
 
 
-def store_byok(api_key: str) -> None:
-    _cred_path().write_bytes(dpapi_protect(api_key.strip()))
+def _plaintext_path() -> Path:
+    return app_data_dir() / _PLAINTEXT_FILE
 
 
-def clear_byok() -> None:
+def _load_plaintext_key() -> str:
+    """Read a Gemini key from the plaintext JSON file (reliability fallback).
+
+    DPAPI sealing is preferred but has proven unreliable inside the PyInstaller
+    bundle, so a plaintext copy (same shape as MARK XXXIX's config/api_keys.json)
+    guarantees the key is always recoverable on the same machine.
+    """
+    p = _plaintext_path()
+    if not p.exists():
+        return ""
     try:
-        _cred_path().unlink(missing_ok=True)
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return (data.get("gemini_api_key") or "").strip()
+    except Exception:
+        return ""
+
+
+def _store_plaintext_key(api_key: str) -> None:
+    p = _plaintext_path()
+    data: dict = {}
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["gemini_api_key"] = api_key.strip()
+    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def store_byok(api_key: str) -> None:
+    key = api_key.strip()
+    # Always persist a plaintext copy first (reliable in frozen builds)…
+    _store_plaintext_key(key)
+    # …then attempt the more secure DPAPI seal; failures are non-fatal because
+    # load_byok() falls back to the plaintext file.
+    try:
+        _cred_path().write_bytes(dpapi_protect(key))
     except Exception:
         pass
 
 
+def clear_byok() -> None:
+    for p in (_cred_path(), _plaintext_path()):
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def load_byok() -> str:
     p = _cred_path()
-    if not p.exists():
-        return ""
-    try:
-        return dpapi_unprotect(p.read_bytes())
-    except Exception:
-        # unreadable under this user account — treat as absent, remove it
-        clear_byok()
-        return ""
+    if p.exists():
+        try:
+            return dpapi_unprotect(p.read_bytes())
+        except Exception:
+            # DPAPI unavailable (e.g. frozen build) — remove the stale blob and
+            # fall through to the plaintext copy.
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+    return _load_plaintext_key()
 
 
 def mask(key: str) -> str:
@@ -126,8 +172,15 @@ def mask(key: str) -> str:
 
 
 def valid_key_format(key: str) -> bool:
+    """Accept any plausible credential, not just `AIza…` API keys.
+
+    The google-genai SDK also accepts OAuth access tokens and other credential
+    formats (e.g. `AQ.Ab8…`), so we must not reject keys just because they don't
+    match the classic Gemini API-key shape. The real validation happens on the
+    first API call, whose error is surfaced to the user.
+    """
     k = (key or "").strip()
-    return bool(k) and k.startswith("AIza") and 30 <= len(k) <= 60
+    return len(k) >= 20
 
 
 # ── device identity ──────────────────────────────────────────────────────────
@@ -328,7 +381,7 @@ def resolve() -> dict:
 def set_byok(api_key: str) -> dict:
     """Store a user-provided key securely and re-resolve. Never returns the key."""
     if not valid_key_format(api_key):
-        raise ValueError("That doesn't look like a Gemini API key (expected AIza…).")
+        raise ValueError("That key looks too short to be valid. Paste the full key.")
     store_byok(api_key.strip())
     set_many({"auth_mode": "byok"})
     return apply_runtime()
@@ -374,7 +427,34 @@ def apply_runtime() -> dict:
         _chat.GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
     except Exception:
         pass
+    _register_router_gemini()
     return st
+
+
+def _register_router_gemini() -> None:
+    """(Re)register the Gemini provider on the running router when a key is set.
+
+    The router is built once at startup; if no API key was present then it has
+    no Gemini provider and would keep routing to a local model forever. After
+    BYOK/env resolution, make sure a Gemini provider backed by the current key
+    exists so text chat actually uses the cloud model.
+    """
+    key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not key:
+        return
+    try:
+        import nova as _nova
+    except Exception:
+        return
+    router = getattr(_nova, "_nova_router", None)
+    if router is None:
+        return
+    try:
+        if router.get_provider("gemini") is None:
+            from nova_intelligence.gemini_provider import GeminiProvider
+            router.register_provider("gemini", GeminiProvider(api_key=key))
+    except Exception:
+        pass
 
 
 def bootstrap() -> dict:
