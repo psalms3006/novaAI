@@ -580,8 +580,13 @@ body[data-mode="ambient"] .hud { padding: 0; }
 /* Ambient window: a 260px frameless always-on-top OS window running this same
    page with ?mode=ambient. Only the presence is visible, so NOVA reads as one
    continuous entity that has stepped aside rather than a second widget. */
-body[data-mode="ambient"] { background: transparent !important; cursor: pointer; }
-body[data-mode="ambient"] #app.app { background: transparent !important; }
+/* The ambient window cannot be per-pixel transparent on this backend, so
+   give it its own dark ground and a soft vignette — it reads as a small
+   floating presence rather than a clipped rectangle. */
+body[data-mode="ambient"] { cursor: pointer; background: #04070d !important; overflow: hidden; }
+body[data-mode="ambient"] #app.app {
+  background: radial-gradient(circle at 50% 45%, #0a1626 0%, #04070d 70%) !important;
+}
 body[data-mode="ambient"] .stage { padding: 0; gap: 0; }
 body[data-mode="ambient"] .orb-container { min-height: 0; height: 100vh; }
 body[data-mode="ambient"] .stage-state { position: absolute; bottom: 8px; left: 0; right: 0; }

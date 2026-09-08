@@ -42,8 +42,12 @@ class OllamaProvider:
         # most of that just loading weights into memory, so every offline
         # request failed with a read timeout right after the router had
         # correctly chosen Ollama. Availability probes stay short (3s, below);
-        # this timeout covers actual generation.
-        timeout = timeout or int(os.getenv("NOVA_OLLAMA_TIMEOUT", "") or 120)
+        # this timeout covers actual generation. 180s is not arbitrary: with
+        # NOVA's full ~4,600-token system prompt and 16 tool schemas, a 1.5B
+        # model on a memory-saturated machine took ~130s and failed at 120s,
+        # then completed in ~60s once given room. Override with
+        # NOVA_OLLAMA_TIMEOUT.
+        timeout = timeout or int(os.getenv("NOVA_OLLAMA_TIMEOUT", "") or 180)
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._timeout = timeout

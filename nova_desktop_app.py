@@ -254,7 +254,11 @@ def main() -> int:
             frameless=True,
             easy_drag=True,
             on_top=True,
-            transparent=True,
+            # NOTE: transparent=True is NOT set. On this backend (pywebview ->
+            # WinForms -> WebView2) it throws during InitCoreWebView2Async and
+            # the window never becomes visible — verified in isolation. The
+            # window is frameless with a dark ground instead, which reads as a
+            # floating presence without per-pixel transparency.
             resizable=False,
             hidden=True,
             background_color="#04070d",
