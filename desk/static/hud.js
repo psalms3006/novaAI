@@ -371,11 +371,67 @@
 
   function initAmbient() {
     document.body.dataset.mode = "ambient";
+
+    // Reveal the shell immediately and drop the splash. app.js only unhides
+    // #app at the end of its boot sequence, and the init overlay sits on top
+    // until then — in a 72px always-on-top window that meant the user saw the
+    // splash instead of the orb.
+    const kill = () => {
+      const init = document.getElementById("init-screen");
+      if (init) init.remove();
+      const app = document.getElementById("app");
+      if (app) app.style.display = "flex";
+    };
+    kill();
+    setTimeout(kill, 300);
+    setTimeout(kill, 1200);
+
+    // The orb is NOVA's presence, so it has to show what NOVA is actually
+    // doing while the main window is away. Same event bus as the full UI —
+    // one runtime, two surfaces.
+    try {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const ws = new WebSocket(`${proto}//${location.host}/ws/events?token=${TOKEN}`);
+      ws.onmessage = (evt) => {
+        let ev;
+        try { ev = JSON.parse(evt.data); } catch (e) { return; }
+        const orb = window.__novaOrb;
+        if (!orb) return;
+        if (ev.type === "orb_state" && ev.state) orb.setState(ev.state);
+        else if (ev.type === "voice_state") {
+          const map = { streaming: "listening", connected: "listening",
+                        connecting: "thinking", error: "error", closed: "offline" };
+          if (map[ev.state]) orb.setState(map[ev.state]);
+        } else if (ev.type === "task_start") orb.setState("working");
+        else if (ev.type === "agent_start") orb.setState("delegating");
+        else if (ev.type === "task_done") orb.setState("idle");
+      };
+    } catch (e) { /* the orb still renders its idle state */ }
     // In ambient the page is a 260px always-on-top window showing only the
     // orb, so none of the HUD panels are on screen — don't poll for them.
     document.title = "NOVA";
-    // Clicking the presence brings the full command centre back.
-    document.addEventListener("click", async () => {
+    // Click restores NOVA; drag repositions the orb. The window is
+    // easy_drag, so the shell moves it natively while the pointer is down —
+    // we only need to make sure a *drag* is not mistaken for a *click*, or
+    // the orb would snap NOVA open every time the user moves it.
+    const DRAG_PX = 5;
+    let downX = 0, downY = 0, moved = false, down = false;
+
+    document.addEventListener("pointerdown", (e) => {
+      down = true; moved = false;
+      downX = e.screenX; downY = e.screenY;
+    });
+
+    document.addEventListener("pointermove", (e) => {
+      if (!down) return;
+      if (Math.abs(e.screenX - downX) > DRAG_PX ||
+          Math.abs(e.screenY - downY) > DRAG_PX) moved = true;
+    });
+
+    document.addEventListener("pointerup", async () => {
+      const wasDrag = moved;
+      down = false; moved = false;
+      if (wasDrag) return;                 // repositioned, not a click
       try {
         await fetch("/api/ambient", {
           method: "POST",

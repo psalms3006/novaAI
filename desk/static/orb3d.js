@@ -220,7 +220,10 @@ export class NovaOrb3D {
 
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(42, w / h, 0.1, 100);
-    this.camera.position.set(0, 0, 5.0);
+    // In the 96px ambient window the form should fill the frame; in the full
+    // command centre it sits in open space. Same geometry, closer camera.
+    this.compact = new URLSearchParams(location.search).get("mode") === "ambient";
+    this.camera.position.set(0, 0, this.compact ? 3.75 : 5.0);
 
     this.uniforms = {
       uTime:  { value: 0 },
@@ -278,10 +281,13 @@ export class NovaOrb3D {
       uSpread: { value: 0.30 },
       uColor:  { value: new THREE.Color(0x8fe9ff) },
     };
+    // The point field reads as dirt at 96px, so the ambient form is body +
+    // wireframe only.
     this.points = new THREE.Points(pgeo, new THREE.ShaderMaterial({
       vertexShader: P_VERT, fragmentShader: P_FRAG, uniforms: this.pUniforms,
       transparent: true, blending: THREE.AdditiveBlending, depthWrite: false,
     }));
+    this.points.visible = !this.compact;
     this.scene.add(this.points);
 
     this.composer = new EffectComposer(this.renderer);
@@ -385,7 +391,9 @@ export class NovaOrb3D {
     this.inner.rotation.y *= -0.6;
     this.points.rotation.y -= spin * dt * 3;
 
-    this.bloom.strength = 0.35 + this.cur.glow * 0.35 + this.audio * 0.45;
+    this.bloom.strength = (this.compact ? 0.18 : 0.35)
+                        + this.cur.glow * (this.compact ? 0.18 : 0.35)
+                        + this.audio * (this.compact ? 0.25 : 0.45);
 
     this.composer.render();
   }

@@ -580,16 +580,71 @@ body[data-mode="ambient"] .hud { padding: 0; }
 /* Ambient window: a 260px frameless always-on-top OS window running this same
    page with ?mode=ambient. Only the presence is visible, so NOVA reads as one
    continuous entity that has stepped aside rather than a second widget. */
-/* The ambient window cannot be per-pixel transparent on this backend, so
-   give it its own dark ground and a soft vignette — it reads as a small
-   floating presence rather than a clipped rectangle. */
-body[data-mode="ambient"] { cursor: pointer; background: #04070d !important; overflow: hidden; }
-body[data-mode="ambient"] #app.app {
-  background: radial-gradient(circle at 50% 45%, #0a1626 0%, #04070d 70%) !important;
+/* ─────────────────────────────────────────────────────────────────────────
+   AMBIENT WINDOW
+   A 96px frameless always-on-top window running this same page. The shell
+   makes it layered and colour-keys pure black, so EVERY #000 pixel is punched
+   out by the compositor and only the orb itself is visible — no panel, no
+   card, no rectangle. That means the ambient page must paint nothing but the
+   orb on an exactly-black ground: any non-black chrome would survive the key
+   and show up as a floating box.
+   ───────────────────────────────────────────────────────────────────────── */
+
+body[data-mode="ambient"] {
+  background: #000 !important;
+  cursor: pointer;
+  overflow: hidden;
+  margin: 0;
 }
-body[data-mode="ambient"] .stage { padding: 0; gap: 0; }
-body[data-mode="ambient"] .orb-container { min-height: 0; height: 100vh; }
-body[data-mode="ambient"] .stage-state { position: absolute; bottom: 8px; left: 0; right: 0; }
-body[data-mode="ambient"] .orb-label { font-size: 8px; letter-spacing: .3em; opacity: .8; }
+body[data-mode="ambient"] #app.app {
+  background: #000 !important;      /* must stay pure black: it is the key */
+  display: block;
+  height: 100vh;
+  width: 100vw;
+}
+body[data-mode="ambient"] #app.app::before { display: none; }   /* no grid */
+
+/* Everything except the presence is gone. */
+body[data-mode="ambient"] .hud-head,
+body[data-mode="ambient"] .hud-pills,
+body[data-mode="ambient"] .rail,
+body[data-mode="ambient"] .rollcall,
+body[data-mode="ambient"] .command-bar,
+body[data-mode="ambient"] .live-transcript,
 body[data-mode="ambient"] .voice-cta,
-body[data-mode="ambient"] .inspector { display: none; }
+body[data-mode="ambient"] .stage-state,
+body[data-mode="ambient"] .drawer,
+body[data-mode="ambient"] .inspector,
+/* The init/splash overlay has its own opaque ground and its own "NOVA"
+   wordmark. In the ambient window it covered the orb entirely — that was the
+   black box with text on it, not the orb failing to render. */
+body[data-mode="ambient"] .init-screen,
+body[data-mode="ambient"] #init-screen,
+body[data-mode="ambient"] .toast,
+body[data-mode="ambient"] .modal-backdrop { display: none !important; }
+
+body[data-mode="ambient"] .hud { padding: 0; gap: 0; height: 100vh; }
+body[data-mode="ambient"] .hud-grid {
+  grid-template-columns: 1fr;
+  gap: 0;
+  height: 100vh;
+}
+body[data-mode="ambient"] .stage { padding: 0; gap: 0; height: 100vh; }
+body[data-mode="ambient"] .orb-container {
+  min-height: 0;
+  height: 100vh;
+  width: 100vw;
+}
+/* The canvas already screen-blends; over pure black that leaves the orb's own
+   colour untouched and the surround exactly #000 for the key to remove. */
+body[data-mode="ambient"] #orb-canvas-3d { mix-blend-mode: normal; }
+
+/* Colour-key transparency only removes *exactly* black pixels. Bloom leaves a
+   very dim halo (RGB 1-10) that survives the key and reads as a faint square
+   around the orb, so mask the canvas to a circle: everything past the orb's
+   radius becomes fully transparent, composites to pure #000, and is keyed out. */
+/* No CSS mask here any more: the shell clips the whole window to an ellipse
+   with SetWindowRgn, which is what actually removes the corners (WebView2
+   ignores layered-window colour keying). A second CSS mask only shrank the orb
+   inside that circle and left a dark ring. */
+body[data-mode="ambient"] #orb-canvas-3d { mix-blend-mode: normal; }

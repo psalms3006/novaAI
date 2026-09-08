@@ -238,45 +238,296 @@ def main() -> int:
         return False
 
     # ── ambient presence ──────────────────────────────────────────────
-    # A real frameless, transparent, always-on-top OS window showing the same
-    # NOVA page in ambient mode — so it is literally the same orb instance and
-    # the same visual language, not a second widget.
+    #
+    # NOVA has one runtime and two presentation surfaces. The ambient orb is
+    # what NOVA looks like when her main interface is NOT the thing the user is
+    # looking at — never a second app, and never shown alongside the main
+    # window.
+    #
+    # Visibility is owned by exactly one place: _ambient_watch() below, driven
+    # by real Win32 window state. Nothing else calls show()/hide() on it, so
+    # "main visible => ambient off" cannot drift out of sync.
+    #
+    # Transparency: pywebview's transparent=True throws inside
+    # InitCoreWebView2Async on this backend (verified in isolation), so instead
+    # the window is made layered and colour-keyed on pure black after creation.
+    # The page paints the orb additively on #000, and every black pixel is
+    # punched out by the compositor — a genuinely backgroundless orb.
     #
     # desk.win_overlay.AmbientOverlay is NOT used: it creates a layered Win32
-    # window but has no WM_PAINT handler and never draws anything, so it would
-    # put an invisible window on screen.
+    # window with no WM_PAINT handler and never draws anything.
+
+    # The loading ring is 64px. pywebview does not honour small sizes exactly
+    # (it reported 200x100 for a 96px request), so the real bounds are forced
+    # with SetWindowPos once the HWND exists.
+    AMBIENT_PX = 72
+
     ambient_window = None
     try:
         ambient_window = webview.create_window(
-            "NOVA",
+            "NOVA_AMBIENT",                      # distinct title so we can find the HWND
             url=f"{DESK_URL}/?mode=ambient",
-            width=260, height=260,
+            width=AMBIENT_PX, height=AMBIENT_PX,
+            # pywebview defaults min_size to (200,100), which silently floors
+            # the window and clipped the orb — the requested 72px was ignored
+            # and SetWindowPos could move it but never shrink it.
+            min_size=(1, 1),
             frameless=True,
             easy_drag=True,
             on_top=True,
-            # NOTE: transparent=True is NOT set. On this backend (pywebview ->
-            # WinForms -> WebView2) it throws during InitCoreWebView2Async and
-            # the window never becomes visible — verified in isolation. The
-            # window is frameless with a dark ground instead, which reads as a
-            # floating presence without per-pixel transparency.
             resizable=False,
             hidden=True,
-            background_color="#04070d",
+            background_color="#000000",          # the colour-key
         )
-        _log("Ambient window created (hidden)")
+        _log(f"Ambient window created ({AMBIENT_PX}px, hidden)")
     except Exception as e:
         _log(f"Ambient window unavailable: {e}")
 
+    _amb_pos_file = Path.home() / ".nova" / "ambient_pos.json"
+
+    def _load_amb_pos():
+        try:
+            import json
+            d = json.loads(_amb_pos_file.read_text(encoding="utf-8"))
+            return int(d["x"]), int(d["y"])
+        except Exception:
+            return None
+
+    def _save_amb_pos(x, y):
+        try:
+            import json
+            _amb_pos_file.parent.mkdir(parents=True, exist_ok=True)
+            _amb_pos_file.write_text(json.dumps({"x": int(x), "y": int(y)}), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _clamp_to_desktop(x, y, w, h):
+        """Keep the orb reachable across monitor/resolution changes.
+
+        Uses the *virtual* screen (all monitors) rather than the primary one, so
+        a position saved on an external display is still valid, and a position
+        on a monitor that has since been unplugged is pulled back into view.
+        """
+        try:
+            import ctypes
+            u = ctypes.windll.user32
+            vx = u.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+            vy = u.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
+            vw = u.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+            vh = u.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
+            x = max(vx, min(int(x), vx + vw - w))
+            y = max(vy, min(int(y), vy + vh - h))
+        except Exception:
+            pass
+        return int(x), int(y)
+
+    def _ambient_target_xy():
+        """Saved position if it is still on a connected display, else default."""
+        try:
+            import ctypes
+            u = ctypes.windll.user32
+            saved = _load_amb_pos()
+            if saved is None:
+                sw = u.GetSystemMetrics(0)
+                x, y = sw - AMBIENT_PX - 48, 64
+            else:
+                x, y = saved
+            return _clamp_to_desktop(x, y, AMBIENT_PX, AMBIENT_PX)
+        except Exception:
+            return 64, 64
+
+    def _place_ambient(hwnd):
+        """Force the true window bounds and restore the user's chosen position."""
+        try:
+            import ctypes
+            u = ctypes.windll.user32
+            saved = _load_amb_pos()
+            if saved is None:
+                # Default: top-right, inset from the edge, on the primary display.
+                sw = u.GetSystemMetrics(0)
+                x, y = sw - AMBIENT_PX - 48, 64
+            else:
+                x, y = saved
+            x, y = _clamp_to_desktop(x, y, AMBIENT_PX, AMBIENT_PX)
+            HWND_TOPMOST, SWP_NOACTIVATE = -1, 0x0010
+            u.SetWindowPos(hwnd, HWND_TOPMOST, x, y, AMBIENT_PX, AMBIENT_PX, SWP_NOACTIVATE)
+            _log(f"Ambient placed at ({x},{y}) {AMBIENT_PX}x{AMBIENT_PX}")
+        except Exception as e:
+            _log(f"Ambient placement failed: {e}")
+
+    def _remember_ambient_pos(hwnd):
+        try:
+            import ctypes
+
+            class _R(ctypes.Structure):
+                _fields_ = [("l", ctypes.c_long), ("t", ctypes.c_long),
+                            ("r", ctypes.c_long), ("b", ctypes.c_long)]
+
+            r = _R()
+            if ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
+                _save_amb_pos(r.l, r.t)
+        except Exception:
+            pass
+
+    def _round_window(hwnd, px) -> bool:
+        """Clip the ambient window to a circle.
+
+        WebView2 renders through DirectComposition, which bypasses layered-
+        window colour keying — SetLayeredWindowAttributes(LWA_COLORKEY) reports
+        success but the black corners still paint (measured: corner (0,0,0)
+        against a (243,243,243) backdrop). pywebview's transparent=True also
+        throws on this backend.
+
+        SetWindowRgn works at the window-manager level, so the compositor
+        cannot ignore it: the corners stop being part of the window at all.
+        They are not drawn, and clicks there fall through to whatever is
+        underneath — which is also the click-through behaviour we want.
+        """
+        try:
+            import ctypes
+            u, g = ctypes.windll.user32, ctypes.windll.gdi32
+            rgn = g.CreateEllipticRgn(0, 0, px + 1, px + 1)
+            ok = u.SetWindowRgn(hwnd, rgn, True)
+            _log(f"Ambient clipped to circle ({px}px): {bool(ok)}")
+            return bool(ok)
+        except Exception as e:
+            _log(f"Ambient circle clip failed: {e}")
+            return False
+
+    def _make_transparent(hwnd) -> bool:
+        """Punch the black background out of the ambient window."""
+        try:
+            import ctypes
+            u = ctypes.windll.user32
+            GWL_EXSTYLE, WS_EX_LAYERED, LWA_COLORKEY = -20, 0x00080000, 0x00000001
+            ex = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            u.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED)
+            # COLORREF is 0x00BBGGRR; pure black.
+            ok = u.SetLayeredWindowAttributes(hwnd, 0x000000, 255, LWA_COLORKEY)
+            # Colour-keyed pixels are also click-through: Windows routes
+            # hit-testing past them, so the invisible area around the orb
+            # does not block the app underneath.
+            _log(f"Ambient colour-key applied to hwnd={hwnd}: {bool(ok)}")
+            return bool(ok)
+        except Exception as e:
+            _log(f"Ambient colour-key failed: {e}")
+            return False
+
+    def _find_hwnd(title: str):
+        try:
+            import ctypes
+            return ctypes.windll.user32.FindWindowW(None, title)
+        except Exception:
+            return 0
+
+    # ── the one authority for ambient visibility ──────────────────────
+    def _ambient_watch():
+        """Show the orb only while the main window is not the user's view of NOVA.
+
+        MAIN visible+foreground        -> ambient OFF
+        MAIN minimised                 -> ambient ON
+        MAIN covered by another app    -> ambient ON
+        MAIN restored/foregrounded     -> ambient OFF
+        """
+        import ctypes
+        u = ctypes.windll.user32
+        main_hwnd = 0
+        amb_hwnd = 0
+        keyed = False
+        shown = None                       # tri-state so the first decision always applies
+        main_was_foreground = False        # see below
+        pending = None
+        pending_since = 0.0
+        DEBOUNCE_S = 0.6
+
+        while True:
+            time.sleep(0.4)
+            try:
+                if not main_hwnd:
+                    main_hwnd = _find_hwnd("NOVA")
+                if not amb_hwnd:
+                    amb_hwnd = _find_hwnd("NOVA_AMBIENT")
+                    if amb_hwnd and not keyed:
+                        keyed = _make_transparent(amb_hwnd)
+                if not main_hwnd:
+                    continue
+
+                minimised = bool(u.IsIconic(main_hwnd))
+                fg = u.GetForegroundWindow()
+                # Either NOVA window being foreground counts as "NOVA is present".
+                nova_fg = fg in (main_hwnd, amb_hwnd) if amb_hwnd else (fg == main_hwnd)
+
+                # Never show the orb on a fresh launch. Arm only once the main
+                # window has actually been put on screen.
+                #
+                # This deliberately keys off *visible and not minimised*, not
+                # *foreground*: if the user clicks another app while NOVA is
+                # still loading, NOVA may never take focus, and keying off
+                # foreground left the orb disabled for the whole session.
+                if not main_was_foreground:
+                    if u.IsWindowVisible(main_hwnd) and not minimised:
+                        main_was_foreground = True
+                        _log("Main window presented — ambient watch armed")
+                    continue
+
+                want = minimised or not nova_fg
+
+                # Debounce. Focus moves constantly while the user works, and
+                # toggling a topmost window on every transient change makes the
+                # orb flicker. Require the condition to hold before acting.
+                if want != pending:
+                    pending = want
+                    pending_since = time.time()
+                stable = (time.time() - pending_since) >= DEBOUNCE_S
+
+                if want != shown and stable:
+                    shown = want
+                    if ambient_window is None:
+                        continue
+                    if want:
+                        _log("Ambient ON (main minimised=%s foreground=%s)" % (minimised, nova_fg))
+                        ambient_window.show()
+                        # Geometry and the layered style must be re-asserted
+                        # AFTER show(): pywebview re-applies its own window size
+                        # on show, which overrode the 72px bounds and left the
+                        # colour-key stale (the orb came back as a black bar).
+                        # Size/position go through pywebview's own API, not
+                        # SetWindowPos: the WinForms backend re-lays-out the
+                        # Form and silently overrode raw Win32 geometry (the
+                        # window kept snapping back to 120x33 and clipped the
+                        # orb). The colour-key still has to be re-asserted on
+                        # the HWND after show().
+                        try:
+                            x, y = _ambient_target_xy()
+                            time.sleep(0.12)
+                            ambient_window.resize(AMBIENT_PX, AMBIENT_PX)
+                            ambient_window.move(x, y)
+                            _log(f"Ambient sized {AMBIENT_PX}x{AMBIENT_PX} at ({x},{y})")
+                        except Exception as e:
+                            _log(f"Ambient sizing failed: {e}")
+                        if amb_hwnd:
+                            for _ in range(4):
+                                time.sleep(0.10)
+                                keyed = _make_transparent(amb_hwnd)
+                                _round_window(amb_hwnd, AMBIENT_PX)
+                    else:
+                        _log("Ambient OFF (main window is visible)")
+                        if amb_hwnd:
+                            _remember_ambient_pos(amb_hwnd)   # user may have dragged it
+                        ambient_window.hide()
+            except Exception as e:
+                _log(f"Ambient watch error: {e}")
+
+    threading.Thread(target=_ambient_watch, name="AmbientWatch", daemon=True).start()
+
+    # The bridge asks for a *mode*; the watcher decides what is on screen. So
+    # entering ambient just means "get the main window out of the way".
     def _enter_ambient():
-        _log("Entering ambient mode")
-        if ambient_window is not None:
-            ambient_window.show()
+        _log("Ambient requested: minimising main window")
         loading_window.minimize()
 
     def _exit_ambient():
-        _log("Leaving ambient mode")
-        if ambient_window is not None:
-            ambient_window.hide()
+        _log("Full requested: restoring main window")
         loading_window.restore()
 
     def _register_hooks():
