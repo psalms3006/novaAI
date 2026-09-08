@@ -217,6 +217,7 @@ def _manager():
     from desk.live_session import LiveManager
     m = LiveManager()
     m._publish = lambda *a, **k: None          # no subscribers in a unit test
+    m._speaker_alive = True                    # no real output device in tests
     return m
 
 
@@ -229,7 +230,7 @@ def test_barge_in_latches_so_the_rest_of_the_turn_is_dropped():
     assert m._gate.speaking is True
 
     m._barge_in()
-    assert m._interrupted_turn is True
+    assert m._interrupted_epoch == m._turn_epoch
     assert m._play_q.qsize() == 0, "queued audio must be dropped"
 
     m._enqueue_audio(b"\x00\x01" * 100)
@@ -239,9 +240,10 @@ def test_barge_in_latches_so_the_rest_of_the_turn_is_dropped():
 
 def test_a_new_turn_clears_the_latch():
     m = _manager()
+    m._enqueue_audio(b"\x00\x01" * 100)         # a turn is in flight
     m._barge_in()
-    assert m._interrupted_turn is True
-    m._interrupted_turn = False                 # what turn_complete/interrupted do
+    assert m._interrupted_epoch == m._turn_epoch
+    m._turn_epoch += 1                          # what turn_complete/interrupted do
     m._enqueue_audio(b"\x00\x01" * 100)
     assert m._gate.speaking is True
 

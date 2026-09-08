@@ -43,6 +43,9 @@ except Exception:
 
 LIVE_MODEL_DEFAULT = "models/gemini-3.1-flash-live-preview"
 MIC_RATE = 16000
+# If 'speaking' is set the mic is muted, so a stuck flag means NOVA is deaf.
+# Longest plausible gap between audio chunks inside one model turn.
+SPEAKING_WATCHDOG_S = 3.0
 LIVE_RATE = 24000  # Gemini Live outputs 24 kHz 16-bit mono PCM
 
 
@@ -164,10 +167,22 @@ class LiveManager:
         self._play_thread: threading.Thread | None = None
         self._play_stop = threading.Event()
         self._turn_done_flag = False
-        # Set on barge-in. Without it, each newly arriving audio chunk
-        # re-armed 'speaking', the echo tripped the detector again, and
-        # NOVA interrupted herself in a loop several times a second.
-        self._interrupted_turn = False
+        # Barge-in suppression, scoped to the turn it belongs to.
+        #
+        # This was a plain boolean latch and that made NOVA go deaf: it was
+        # cleared only by `interrupted`/`turn_complete` from the model, but a
+        # barge-in on the *tail* of playback happens after the model already
+        # finished the turn, so neither message ever arrives again. The latch
+        # stayed set and every later chunk was discarded -- mic streaming,
+        # model replying, NOVA silent.
+        #
+        # An epoch fixes it: suppression only applies to the turn that was
+        # actually interrupted, and any new turn -- including one detected
+        # purely from the user starting to speak -- moves past it.
+        self._turn_epoch = 0
+        self._interrupted_epoch = -1
+        self._speaker_alive = False
+        self._last_audio_at = 0.0
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -278,7 +293,11 @@ class LiveManager:
                 stream.start()
             except Exception as e:
                 _log("[LIVE] speaker open failed: %s", e)
+                # Make sure a dead speaker never leaves the mic muted.
+                self._speaker_alive = False
+                self._gate.set_speaking(False)
                 return
+            self._speaker_alive = True
             _log("[LIVE] speaker ready (%d Hz)", nova_voice.RECEIVE_RATE)
             try:
                 while not self._play_stop.is_set():
@@ -291,6 +310,16 @@ class LiveManager:
                             self._gate.set_speaking(False)
                             self._turn_done_flag = False
                             self._publish(LiveEvent("state", state="listening"))
+                        elif self._gate.speaking and self._last_audio_at:
+                            # Watchdog. 'speaking' mutes the mic, so anything
+                            # that leaves it set is deafness. If the queue has
+                            # been empty well past any plausible gap in the
+                            # model's audio, stop believing NOVA is talking.
+                            if time.time() - self._last_audio_at > SPEAKING_WATCHDOG_S:
+                                _log("[LIVE] watchdog: clearing stuck speaking state")
+                                self._gate.set_speaking(False)
+                                self._turn_done_flag = False
+                                self._publish(LiveEvent("state", state="listening"))
                         continue
                     if chunk is None:
                         break
@@ -299,6 +328,8 @@ class LiveManager:
                     except Exception as e:
                         _log("[LIVE] speaker write failed: %s", e)
             finally:
+                self._speaker_alive = False
+                self._gate.set_speaking(False)
                 try:
                     stream.stop(); stream.close()
                 except Exception:
@@ -317,10 +348,17 @@ class LiveManager:
 
     def _enqueue_audio(self, audio: bytes) -> None:
         """Play a chunk and tell the surfaces how loud it is."""
-        if self._interrupted_turn:
-            # The user cut in. Discard the rest of this turn instead of
+        if self._interrupted_epoch == self._turn_epoch:
+            # The user cut into *this* turn. Discard the rest of it instead of
             # resuming playback and immediately re-triggering the detector.
+            # Scoped to the epoch, so it cannot leak into the next turn.
             return
+        if not self._speaker_alive:
+            # No playback thread: never mute the mic on its behalf, or NOVA
+            # would be permanently deaf on a machine with no working speaker.
+            self._publish(LiveEvent("error", error="speaker_unavailable"))
+            return
+        self._last_audio_at = time.time()
         self._gate.set_speaking(True)
         try:
             self._play_q.put_nowait(audio)
@@ -337,7 +375,16 @@ class LiveManager:
 
     def _barge_in(self) -> None:
         """User spoke over NOVA — stop immediately and stay stopped."""
-        self._interrupted_turn = True
+        # Only suppress a turn that is genuinely still in flight. A cough on
+        # the *tail* of playback -- after the model already finished the turn
+        # -- has nothing to cut off, and latching there is what made NOVA
+        # silent for every turn afterwards.
+        turn_in_flight = (not self._turn_done_flag) and (
+            self._play_q.qsize() > 0
+            or (self._last_audio_at and time.time() - self._last_audio_at < 1.0)
+        )
+        if turn_in_flight:
+            self._interrupted_epoch = self._turn_epoch
         # Clear speaking here too, not just in VoiceGate.process. "Stop
         # talking" has to be self-sufficient: any caller of _barge_in should
         # leave NOVA genuinely stopped, not rely on the detector having
@@ -624,6 +671,12 @@ class LiveManager:
                 if sc.input_transcription and sc.input_transcription.text:
                     text = sc.input_transcription.text.strip()
                     if text:
+                        # The user is speaking, so whatever turn was
+                        # interrupted is over. This is the backstop that makes
+                        # deafness impossible even if the model never sends
+                        # `interrupted` or `turn_complete` again.
+                        if self._interrupted_epoch == self._turn_epoch:
+                            self._turn_epoch += 1
                         self._publish(LiveEvent("user_transcript", text=text))
 
                 if sc.output_transcription and sc.output_transcription.text:
@@ -632,13 +685,13 @@ class LiveManager:
                         self._publish(LiveEvent("nova_transcript", text=text))
 
                 if sc.interrupted:
-                    self._interrupted_turn = False   # model acknowledged; new turn follows
+                    self._turn_epoch += 1            # model acknowledged the cut
                     self._publish(LiveEvent("interrupted"))
                     self._turn_count += 1
 
                 if sc.turn_complete:
                     self._turn_done_flag = True
-                    self._interrupted_turn = False   # next turn may speak again
+                    self._turn_epoch += 1            # next turn may speak again
                     self._turn_count += 1
                     self._publish(LiveEvent("turn_complete", turn_count=self._turn_count))
 
