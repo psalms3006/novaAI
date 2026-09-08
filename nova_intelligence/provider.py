@@ -150,12 +150,32 @@ class GenerateResult:
         return not self.error and (self.text or self.tool_calls)
 
 
+def provider_is_local(provider: Any) -> bool:
+    """Whether *provider* runs on this machine.
+
+    Routing needs to know "local vs remote", not "is it Gemini". The router
+    used to test `"gemini" in name`, which silently made every other cloud
+    provider rank as local and would have mis-routed the moment a second one
+    was registered. Providers declare `is_local`; the name heuristic is only a
+    fallback for third-party providers that predate the attribute.
+    """
+    declared = getattr(provider, "is_local", None)
+    if isinstance(declared, bool):
+        return declared
+    name = str(getattr(provider, "name", "")).lower()
+    return any(tok in name for tok in ("ollama", "local", "llama.cpp", "llamacpp"))
+
+
 @runtime_checkable
 class IntelligenceProvider(Protocol):
     """Protocol that all intelligence providers must implement."""
 
     @property
     def name(self) -> str: ...
+
+    #: True when inference happens on this machine. Used for network-aware
+    #: routing; see :func:`provider_is_local`.
+    is_local: bool
 
     @property
     def capabilities(self) -> ProviderCapability: ...

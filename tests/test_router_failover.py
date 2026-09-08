@@ -271,3 +271,54 @@ def test_provider_switch_callback_fires_on_failover():
     r.complete(MSGS)
 
     assert ("gemini", "ollama") in switches
+
+
+# ── provider-agnostic local/remote classification ─────────────────────────────
+
+def test_provider_is_local_uses_the_declared_attribute():
+    from nova_intelligence.provider import provider_is_local
+
+    class Declared:
+        is_local = True
+        name = "totally-cloud-sounding"
+
+    class DeclaredRemote:
+        is_local = False
+        name = "ollama-sounding-but-remote"
+
+    assert provider_is_local(Declared()) is True
+    assert provider_is_local(DeclaredRemote()) is False
+
+
+def test_provider_is_local_falls_back_to_the_name_heuristic():
+    from nova_intelligence.provider import provider_is_local
+
+    class Legacy:
+        name = "ollama:mistral"
+
+    class LegacyCloud:
+        name = "anthropic"
+
+    assert provider_is_local(Legacy()) is True
+    assert provider_is_local(LegacyCloud()) is False
+
+
+def test_real_providers_declare_their_locality():
+    from nova_intelligence.gemini_provider import GeminiProvider
+    from nova_intelligence.ollama_provider import OllamaProvider
+    assert OllamaProvider.is_local is True
+    assert GeminiProvider.is_local is False
+
+
+def test_ranking_does_not_depend_on_a_provider_being_named_gemini():
+    """A second cloud provider must rank as remote, not accidentally as local."""
+    cloud = FakeProvider("anthropic")
+    cloud.is_local = False
+    local = FakeProvider("ollama")
+    local.is_local = True
+
+    r = _router(anthropic=cloud, ollama=local)
+    assert [p.name for p in r.rank_providers()] == ["anthropic", "ollama"]
+
+    r_off = _router(state=ConnectivityState.OFFLINE, anthropic=cloud, ollama=local)
+    assert [p.name for p in r_off.rank_providers()] == ["ollama", "anthropic"]

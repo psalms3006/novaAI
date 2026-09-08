@@ -143,6 +143,9 @@ def _normalize_contents(contents: List[Any]) -> List[Any]:
 class GeminiProvider:
     """Google Gemini intelligence provider."""
 
+    #: Inference happens in the cloud; requires network.
+    is_local = False
+
     # Transient error tolerance: retry overload/quota errors with backoff, then
     # fall through to a stable pinned model before giving up.
     MAX_RETRIES = 3

@@ -90,9 +90,13 @@ class ConnectivityManager:
         dns_ok = self._check_dns()
         dns_latency = time.time() - t0
 
+        # Run the API reachability check independently of the raw DNS probe.
+        # The DNS probe (port 53 to 8.8.8.8) is frequently blocked even on a
+        # perfectly good connection, so a reachable API host must be able to
+        # declare the connection ONLINE on its own.
         api_ok = False
         api_latency = 0.0
-        if dns_ok and self._api_check_fn:
+        if self._api_check_fn:
             t1 = time.time()
             try:
                 api_ok = self._api_check_fn()
@@ -106,9 +110,13 @@ class ConnectivityManager:
             self._api_healthy = api_ok
             self._last_check = time.time()
 
-            if not dns_ok:
+            if api_ok:
+                # The actual model service is reachable — that is authoritative.
+                self._state = ConnectivityState.ONLINE
+            elif not dns_ok:
                 self._state = ConnectivityState.OFFLINE
-            elif self._api_check_fn and not api_ok:
+            elif self._api_check_fn:
+                # DNS works but the API host is unreachable → degraded
                 self._state = ConnectivityState.DEGRADED
             elif dns_latency > self._degraded_threshold:
                 self._state = ConnectivityState.DEGRADED

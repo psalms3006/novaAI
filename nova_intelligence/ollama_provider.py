@@ -24,6 +24,10 @@ OLLAMA_DEFAULT_URL = "http://localhost:11434"
 class OllamaProvider:
     """Ollama local inference provider."""
 
+    #: Inference runs on this machine — the router uses this for network-aware
+    #: routing rather than matching on the provider's name.
+    is_local = True
+
     def __init__(
         self,
         base_url: str = OLLAMA_DEFAULT_URL,

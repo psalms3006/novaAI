@@ -15,6 +15,7 @@ from .ollama_provider import OllamaProvider
 from .provider import (
     GenerateResult, IntelligenceProvider, ProviderCapability, ProviderHealth,
     TaskClassification, NetworkRequirement, TOOL_NETWORK_REQUIREMENTS,
+    provider_is_local,
 )
 
 log = logging.getLogger(__name__)
@@ -117,10 +118,11 @@ class IntelligenceRouter:
         online_first = _prefers_online()
 
         def _sort_key(item):
-            name = item[0].lower()
-            is_online_provider = "gemini" in name
-            # False sorts before True, so negate to put the preferred kind first.
-            return (0 if is_online_provider == online_first else 1, name)
+            name, prov = item
+            is_remote = not provider_is_local(prov)
+            # Providers of the preferred kind sort first; name breaks ties so
+            # ordering stays deterministic across runs.
+            return (0 if is_remote == online_first else 1, name.lower())
 
         ordered = sorted(healthy, key=_sort_key) + sorted(degraded, key=_sort_key)
 
