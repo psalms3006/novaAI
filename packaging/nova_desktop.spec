@@ -29,6 +29,8 @@ hidden = [
     # TLS trust via the OS certificate store — without this, HTTPS fails on any
     # machine with antivirus HTTPS scanning or a corporate TLS proxy.
     "nova_tls", "truststore", "truststore._api", "truststore._windows",
+    # one shared voice model + Core-owned proactive speech
+    "nova_voice", "nova_core_voice", "nova_heartbeat",
     "_ssl", "ssl",
     # websocket support (Live voice)
     "flask_sock", "simple_websocket",
