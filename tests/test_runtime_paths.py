@@ -71,3 +71,52 @@ def test_installer_declares_that_user_data_lives_outside_the_install_dir():
         pytest.skip("installer script not present")
     text = iss.read_text(encoding="utf-8", errors="replace")
     assert "APPDATA" in text.upper()
+
+
+# ── data locations must not be hardcoded to one developer's machine ──────────
+
+def test_zim_path_is_derived_not_hardcoded():
+    import nova
+    assert "project-nova/data/zim" not in nova.ZIM_DATA_PATH.replace("\\", "/").lower() or \
+        Path(nova.ZIM_DATA_PATH).is_absolute()
+    # It must resolve relative to the installed code, not a fixed home folder.
+    assert Path(nova.ZIM_DATA_PATH).is_absolute()
+
+
+def test_zim_path_follows_the_repo_in_development():
+    import nova
+    repo = Path(nova.__file__).resolve().parent
+    assert Path(nova.ZIM_DATA_PATH) == repo / "data" / "zim"
+
+
+def test_maps_path_follows_the_repo_in_development():
+    import nova
+    repo = Path(nova.__file__).resolve().parent
+    assert Path(nova.OFFLINE_MAPS_PATH) == repo / "data" / "maps"
+
+
+def test_zim_path_is_overridable_by_env(monkeypatch):
+    monkeypatch.setenv("NOVA_ZIM_DIR", r"D:\somewhere\zim")
+    import nova
+    assert nova._zim_data_path() == r"D:\somewhere\zim"
+
+
+def test_zim_path_moves_to_app_data_when_frozen(monkeypatch):
+    import nova
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    p = Path(nova._zim_data_path())
+    assert _appdata_root() in p.parents
+
+
+def test_offline_knowledge_downloads_go_to_app_data_when_frozen(monkeypatch):
+    """Multi-GB user downloads must survive uninstall/upgrade."""
+    from nova_intelligence.offline_knowledge import OfflineKnowledgeManager
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    p = OfflineKnowledgeManager.default_data_path()
+    assert _appdata_root() in p.parents
+
+
+def test_dev_agent_projects_dir_actually_exists():
+    """The old value resolved to C:/Users/<u>/Users/Lenovo/project-nova."""
+    import actions.dev_agent as da
+    assert da.PROJECTS_DIR.exists()

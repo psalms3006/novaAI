@@ -1635,13 +1635,43 @@ from live_extra import (
     _trim_history,
 )
 from agents_extra import agent_process
-ZIM_DATA_PATH = os.path.expanduser("~/project-nova/data/zim")
+def _zim_data_path() -> str:
+    """Where offline ZIM archives live.
+
+    This was hardcoded to "~/project-nova/data/zim" — a path that only exists
+    on the original developer's machine, so offline knowledge could never find
+    its archives anywhere else. When frozen it also must not resolve inside the
+    install directory, which an uninstall or upgrade wipes.
+    """
+    if getattr(sys, "frozen", False):
+        base = os.getenv("APPDATA")
+        root = Path(base) / "NOVA" if base else Path.home() / ".nova"
+        return str(root / "data" / "zim")
+    override = os.getenv("NOVA_ZIM_DIR", "").strip()
+    if override:
+        return override
+    return str(Path(__file__).resolve().parent / "data" / "zim")
+
+
+ZIM_DATA_PATH = _zim_data_path()
 
 OFFLINE_MODELS = ["tinyllama", "llama3.2", "phi3", "mistral"]
 OFFLINE_TIMEOUTS = {"tinyllama": 15, "llama3.2": 30, "phi3": 30, "mistral": 45}
 
 # ZIM/Wikipedia paths
-OFFLINE_MAPS_PATH = os.path.expanduser("~/project-nova/data/maps")
+def _maps_data_path() -> str:
+    """Offline map data location — see _zim_data_path for why this is derived."""
+    if getattr(sys, "frozen", False):
+        base = os.getenv("APPDATA")
+        root = Path(base) / "NOVA" if base else Path.home() / ".nova"
+        return str(root / "data" / "maps")
+    override = os.getenv("NOVA_MAPS_DIR", "").strip()
+    if override:
+        return override
+    return str(Path(__file__).resolve().parent / "data" / "maps")
+
+
+OFFLINE_MAPS_PATH = _maps_data_path()
 
 # Tool declarations for Ollama (must match Ollama's expected format)
 OLLAMA_TOOL_FORMAT = {

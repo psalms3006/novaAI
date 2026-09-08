@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import threading
 import time
 import traceback
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 import numpy as np
 import sounddevice as sd
@@ -402,10 +404,16 @@ class NOVALive:
                     if response is None:
                         _diag("RECV", "got None response object — skipping")
                         continue
-                    if response.data and self.audio_in_queue is not None:
-                        self._diag_ws_bytes_in += len(response.data)
-                        self._set_speaking(True)
-                        self.audio_in_queue.put_nowait(response.data)
+                    if response.server_content is not None and self.audio_in_queue is not None:
+                        _sc = response.server_content
+                        _mt = getattr(_sc, "model_turn", None)
+                        _parts = getattr(_mt, "parts", None) or []
+                        for _part in _parts:
+                            _inline = getattr(_part, "inline_data", None)
+                            if _inline is not None and getattr(_inline, "data", None):
+                                self._diag_ws_bytes_in += len(_inline.data)
+                                self._set_speaking(True)
+                                self.audio_in_queue.put_nowait(_inline.data)
                     if response.server_content:
                         sc = response.server_content
                         if sc and sc.output_transcription and sc.output_transcription.text:
@@ -815,7 +823,19 @@ OFFLINE_MODELS = ["tinyllama", "llama3.2", "phi3", "mistral"]
 OFFLINE_TIMEOUTS = {"tinyllama": 15, "llama3.2": 30, "phi3": 30, "mistral": 45}
 
 # ZIM/Wikipedia paths
-OFFLINE_MAPS_PATH = os.path.expanduser("~/project-nova/data/maps")
+def _maps_data_path() -> str:
+    """Offline map data location — see _zim_data_path for why this is derived."""
+    if getattr(sys, "frozen", False):
+        base = os.getenv("APPDATA")
+        root = Path(base) / "NOVA" if base else Path.home() / ".nova"
+        return str(root / "data" / "maps")
+    override = os.getenv("NOVA_MAPS_DIR", "").strip()
+    if override:
+        return override
+    return str(Path(__file__).resolve().parent / "data" / "maps")
+
+
+OFFLINE_MAPS_PATH = _maps_data_path()
 
 # Tool declarations for Ollama (must match Ollama's expected format)
 OLLAMA_TOOL_FORMAT = {
