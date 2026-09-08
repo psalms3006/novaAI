@@ -91,7 +91,10 @@ pytesseract>=0.3.10
 
 # ── Optional — Knowledge search (ZIM files) ───────────────────────────────────
 # Only needed for offline Wikipedia/Knowledge search via ZIM.
-libzim>=0.0.1
+libzim>=3.0.0                  # Offline Wikipedia/knowledge search via ZIM archives
+ddgs>=9.0.0                   # DuckDuckGo search. NOTE: duckduckgo_search was renamed
+                              # to ddgs; the old package's backend now returns 0 results,
+                              # which silently removed web_search's only non-Gemini path
 
 # ── Optional — Media processing ───────────────────────────────────────────────
 moviepy>=1.0.3              # Video processing

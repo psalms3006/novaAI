@@ -1,6 +1,7 @@
 """offline_extra.py — offline fallback stack (Ollama/Whisper/pyttsx3/Piper/Wiki/Maps), extracted from nova.py (Phase 2)."""
 from __future__ import annotations
-import json, os, queue, subprocess, sys, tempfile, threading, time
+import html as _html
+import json, os, queue, re, subprocess, sys, tempfile, threading, time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import numpy as np
@@ -332,6 +333,45 @@ def _build_ollama_tools():
 
 # ─── OFFLINE WIKIPEDIA (ZIM) ─────────────────────────────────────────────────
 
+# <style>/<script> bodies are not markup the tag-stripper can remove — their
+# *contents* survive it — so a Wikipedia article otherwise arrives as a wall of
+# CSS before the first sentence of prose.
+_ZIM_DROP_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.I | re.S)
+_ZIM_TAG_RE = re.compile(r"<[^>]+>")
+_ZIM_WS_RE = re.compile(r"\s+")
+_ZIM_P_RE = re.compile(r"<p\b[^>]*>(.*?)</p>", re.I | re.S)
+
+
+def _zim_text(raw: Any, limit: int = 2000) -> str:
+    """Turn a ZIM item's payload into readable plain text.
+
+    libzim returns ``Item.content`` as a memoryview of the raw article bytes —
+    HTML, not text. Slicing that straight into the result dict produced
+    "<memory at 0x...>" once it was rendered or JSON-encoded, so offline
+    articles were unusable even when the lookup itself succeeded.
+    """
+    try:
+        data = bytes(raw)
+    except Exception:
+        return ""
+    html = data.decode("utf-8", errors="replace")
+    html = _ZIM_DROP_RE.sub(" ", html)
+
+    # Prefer the article's paragraphs. Wikipedia ZIM pages carry inline
+    # TemplateStyles CSS that survives naive tag-stripping, so a whole-document
+    # strip returns a wall of ".mw-parser-output{...}" before any prose.
+    paragraphs = [
+        _ZIM_WS_RE.sub(" ", _ZIM_TAG_RE.sub(" ", m)).strip()
+        for m in _ZIM_P_RE.findall(html)
+    ]
+    prose = " ".join(x for x in paragraphs if x)
+    if not prose:
+        prose = _ZIM_WS_RE.sub(" ", _ZIM_TAG_RE.sub(" ", html)).strip()
+    # ZIM stores raw HTML, so entities survive tag-stripping as literal
+    # "&nbsp;" / "&amp;" in what the model is asked to read.
+    return _html.unescape(prose)[:limit]
+
+
 class OfflineWiki:
     """Offline Wikipedia using ZIM files."""
     
@@ -372,12 +412,13 @@ class OfflineWiki:
                 # Try exact entry first
                 entry = reader.get_entry_by_path(query.replace(" ", "_"))
                 if entry:
-                    content = entry.get_item().content
-                    results.append({
-                        "source": f"Wikipedia ({name})",
-                        "title": query,
-                        "content": content[:2000]  # First 2000 chars
-                    })
+                    content = _zim_text(entry.get_item().content)
+                    if content:
+                        results.append({
+                            "source": f"Wikipedia ({name})",
+                            "title": query,
+                            "content": content,
+                        })
                     continue
                 
                 # Fallback: search suggestions (limited in libzim)
@@ -385,12 +426,13 @@ class OfflineWiki:
                 for suggestion in suggestions:
                     entry = reader.get_entry_by_path(suggestion[0])
                     if entry:
-                        content = entry.get_item().content
-                        results.append({
-                            "source": f"Wikipedia ({name})",
-                            "title": suggestion[0].replace("_", " "),
-                            "content": content[:2000]
-                        })
+                        content = _zim_text(entry.get_item().content)
+                        if content:
+                            results.append({
+                                "source": f"Wikipedia ({name})",
+                                "title": str(suggestion[0]).replace("_", " "),
+                                "content": content,
+                            })
                         
             except Exception as e:
                 log.debug(f"ZIM search error: {e}")

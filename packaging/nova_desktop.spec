@@ -62,6 +62,9 @@ hidden = [
     "orchestrator", "orchestrator.orchestrator", "orchestrator.plan",
     # capability registry
     "capabilities", "capabilities.registry", "capabilities.contracts",
+    # search + offline knowledge — both resolved via importlib at call time,
+    # so static analysis misses them
+    "ddgs", "duckduckgo_search", "libzim",
     # misc runtime
     "psutil", "sqlite3",
 ]

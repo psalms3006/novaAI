@@ -201,11 +201,37 @@ def web_search(
 
     # Level 3: DuckDuckGo
     # [FIX-1] This try/except is now its own block — errors here are caught
+    ddg_error = ""
     try:
         results = _ddg_search(query)
-        result  = _format_ddg(query, results)
-        print(f"[WebSearch] ✅ DDG: {len(results)} result(s)")
-        return result
+        if results:
+            print(f"[WebSearch] ✅ DDG: {len(results)} result(s)")
+            return _format_ddg(query, results)
+        ddg_error = "no results"
     except Exception as e:
-        print(f"[WebSearch] ❌ All backends failed: {e}")
-        return f"Search failed, sir: {e}"
+        ddg_error = str(e)
+        print(f"[WebSearch] ⚠️ DDG failed: {e}")
+
+    # Level 4: offline knowledge (local ZIM archive).
+    # Every level above needs the network. Without this, losing connectivity —
+    # or simply exhausting the Gemini quota — left web_search with nothing to
+    # fall back on, even with a full offline Wikipedia sitting on disk.
+    try:
+        from offline_extra import get_offline_wiki
+        wiki = get_offline_wiki()
+        if wiki.libzim_available:
+            hits = wiki.search(query)
+            if hits:
+                print(f"[WebSearch] ✅ Offline ZIM: {len(hits)} result(s)")
+                lines = [f"Offline results for: {query}", ""]
+                for h in hits:
+                    lines.append(f"{h.get('title', '')} ({h.get('source', 'offline')})")
+                    lines.append(f"   {h.get('content', '')[:800]}")
+                    lines.append("")
+                return "\n".join(lines)
+    except Exception as e:
+        print(f"[WebSearch] ⚠️ Offline knowledge unavailable: {e}")
+
+    print(f"[WebSearch] ❌ All backends failed: {ddg_error}")
+    return (f"I couldn't search for that, sir. The network backends failed "
+            f"({ddg_error}) and no offline knowledge matched.")
