@@ -1,395 +1,306 @@
-/**
- * NOVA Orb — Canvas-rendered state-driven visual anchor.
+/* orb.js — NOVA's presence.
  *
- * States: idle, listening, thinking, speaking, executing, offline, error
- * Renders: teal/green core, orbital rings, particle system, waveform reactivity
- * All animations GPU-accelerated (transform/opacity), target 60fps.
+ * A fluid, waveform-driven organic blob: a closed loop whose radius is
+ * displaced by layered sine bands (the "waveform") plus slow value noise (the
+ * "fluid"), rendered as a filled body, a bright rim, and a set of concentric
+ * offset contours that read as a mesh shell. Particles drift in the field
+ * around it and are pushed outward when NOVA speaks.
+ *
+ * Motion model — states retarget an eased scale/halo on an interval, ring
+ * bands counter-rotate at per-state speeds, expanding pulses spawn
+ * probabilistically and are culled past a radius limit, and rim particles decay
+ * with damped velocity. (Adapted from the reference HudCanvas behaviour and
+ * re-expressed on canvas2d rather than QPainter.)
+ *
+ * Live audio drives it when available: setAmplitude() is fed by the Gemini Live
+ * playback path, so the surface genuinely tracks NOVA's voice instead of
+ * animating on a timer while she talks.
  */
-"use strict";
 
-const OrbState = {
-  IDLE: "idle",
-  LISTENING: "listening",
-  THINKING: "thinking",
-  SPEAKING: "speaking",
-  EXECUTING: "executing",
-  OFFLINE: "offline",
-  ERROR: "error",
+const STATES = {
+  idle:       { hue: 172, sat: 72, amp: 0.06, speed: 0.10, spin: 0.55, glow: 0.55, particles: 26 },
+  listening:  { hue: 186, sat: 85, amp: 0.16, speed: 0.22, spin: 0.90, glow: 0.85, particles: 44 },
+  thinking:   { hue: 205, sat: 80, amp: 0.11, speed: 0.34, spin: 1.60, glow: 0.75, particles: 38 },
+  speaking:   { hue: 168, sat: 90, amp: 0.30, speed: 0.40, spin: 1.30, glow: 1.00, particles: 60 },
+  working:    { hue: 152, sat: 78, amp: 0.14, speed: 0.28, spin: 1.15, glow: 0.80, particles: 46 },
+  delegating: { hue: 268, sat: 76, amp: 0.18, speed: 0.30, spin: 1.45, glow: 0.85, particles: 52 },
+  offline:    { hue: 210, sat: 10, amp: 0.03, speed: 0.05, spin: 0.20, glow: 0.25, particles: 12 },
+  error:      { hue: 8,   sat: 82, amp: 0.09, speed: 0.16, spin: 0.45, glow: 0.70, particles: 20 },
 };
+STATES.executing = STATES.working;
+STATES.connecting = STATES.thinking;
+
+/* Deterministic value noise — cheap, smooth, no dependency. */
+function makeNoise(seed = 1) {
+  const p = new Float32Array(256);
+  let s = seed;
+  for (let i = 0; i < 256; i++) {
+    s = (s * 16807) % 2147483647;
+    p[i] = s / 2147483647;
+  }
+  return (x) => {
+    const i = Math.floor(x);
+    const f = x - i;
+    const a = p[((i % 256) + 256) % 256];
+    const b = p[(((i + 1) % 256) + 256) % 256];
+    const u = f * f * (3 - 2 * f); // smoothstep
+    return a + (b - a) * u;
+  };
+}
 
 class NovaOrb {
-  constructor(canvas, size = 120) {
+  constructor(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
-    this.size = size;
-    this.dpr = window.devicePixelRatio || 1;
-    this.state = OrbState.IDLE;
-    this.prevState = OrbState.IDLE;
-    this.transitionProgress = 1; // 0..1, 1 = complete
-    this.transitionDuration = 300; // ms
-    this.transitionStart = 0;
-    this.time = 0;
-    this.audioAmplitude = 0; // 0..1, driven by real audio data
+    this.dpr = Math.min(window.devicePixelRatio || 1, 2);
+
+    this.state = "idle";
+    this.params = { ...STATES.idle };
+    this.target = { ...STATES.idle };
+
+    this.t = 0;
+    this.spin = 0;
+    this.amplitude = 0;      // live audio level, 0..1
+    this._ampDecay = 0;
+
+    this.scale = 1;
+    this.tgtScale = 1;
+    this.halo = 0.55;
+    this.tgtHalo = 0.55;
+    this._lastRetarget = 0;
+
+    this.pulses = [0.15, 0.45, 0.75];
     this.particles = [];
-    this.rings = [];
-    this._animFrame = null;
-    this._resize();
-    this._initParticles(60);
-    this._initRings(3);
+    this.noise = [makeNoise(7), makeNoise(31), makeNoise(101)];
+
+    this._running = false;
+    this._frame = null;
+    this._onResize = () => this.resize();
+    window.addEventListener("resize", this._onResize);
+    this.resize();
   }
 
-  _resize() {
-    const w = this.size;
-    const h = this.size;
+  resize() {
+    const rect = this.canvas.getBoundingClientRect();
+    const w = Math.max(1, rect.width || this.canvas.width);
+    const h = Math.max(1, rect.height || this.canvas.height);
     this.canvas.width = w * this.dpr;
     this.canvas.height = h * this.dpr;
-    this.canvas.style.width = w + "px";
-    this.canvas.style.height = h + "px";
+    this.ctx.setTransform(1, 0, 0, 1, 0, 0);
     this.ctx.scale(this.dpr, this.dpr);
+    this.w = w;
+    this.h = h;
     this.cx = w / 2;
     this.cy = h / 2;
-    this.radius = Math.min(w, h) * 0.28;
+    this.baseR = Math.min(w, h) * 0.24;
   }
 
-  _initParticles(count) {
-    this.particles = [];
-    for (let i = 0; i < count; i++) {
-      const angle = (Math.PI * 2 * i) / count + Math.random() * 0.3;
-      const dist = this.radius * (1.2 + Math.random() * 1.0);
-      this.particles.push({
-        angle,
-        dist,
-        speed: 0.0003 + Math.random() * 0.0008,
-        size: 0.8 + Math.random() * 1.5,
-        alpha: 0.2 + Math.random() * 0.5,
-        drift: (Math.random() - 0.5) * 0.001,
-      });
-    }
+  setState(next) {
+    if (!STATES[next] || next === this.state) return;
+    this.state = next;
+    this.target = { ...STATES[next] };
+    this._seedParticles();
   }
 
-  _initRings(count) {
-    this.rings = [];
-    for (let i = 0; i < count; i++) {
-      this.rings.push({
-        radius: this.radius * (1.1 + i * 0.35),
-        speed: 0.0002 * (i % 2 === 0 ? 1 : -1) * (1 + i * 0.3),
-        width: 0.5 + Math.random() * 0.8,
-        alpha: 0.08 + Math.random() * 0.12,
-        dashOffset: Math.random() * 100,
-      });
-    }
-  }
-
-  setState(newState) {
-    if (newState === this.state) return;
-    this.prevState = this.state;
-    this.state = newState;
-    this.transitionProgress = 0;
-    this.transitionStart = performance.now();
-  }
-
-  setAudioAmplitude(amp) {
-    this.audioAmplitude = Math.max(0, Math.min(1, amp));
+  /** Live audio level (0..1) from the Live playback path. */
+  setAmplitude(level) {
+    const v = Math.max(0, Math.min(1, level || 0));
+    if (v > this.amplitude) this.amplitude = v;   // attack fast
+    this._ampDecay = 0.92;                        // release slow
   }
 
   start() {
+    if (this._running) return;
+    this._running = true;
     this._tick();
   }
 
   stop() {
-    if (this._animFrame) {
-      cancelAnimationFrame(this._animFrame);
-      this._animFrame = null;
+    this._running = false;
+    if (this._frame) cancelAnimationFrame(this._frame);
+    window.removeEventListener("resize", this._onResize);
+  }
+
+  _seedParticles() {
+    const want = this.target.particles;
+    while (this.particles.length < want) {
+      const a = Math.random() * Math.PI * 2;
+      const r = this.baseR * (1.05 + Math.random() * 1.5);
+      this.particles.push({
+        a, r,
+        drift: (Math.random() - 0.5) * 0.0016,
+        vr: 0,
+        size: 0.6 + Math.random() * 1.9,
+        life: 0.35 + Math.random() * 0.65,
+        hueShift: (Math.random() - 0.5) * 60,
+      });
     }
+    if (this.particles.length > want) this.particles.length = want;
   }
 
   _tick() {
-    const now = performance.now();
-    const dt = Math.min(now - (this._lastFrame || now), 33); // cap at ~30fps min
-    this._lastFrame = now;
-    this.time += dt;
+    if (!this._running) return;
+    this.t += 1;
 
-    // Transition progress
-    if (this.transitionProgress < 1) {
-      const elapsed = now - this.transitionStart;
-      this.transitionProgress = Math.min(1, elapsed / this.transitionDuration);
+    // ── ease params toward the state's targets ───────────────────────────
+    const k = 0.06;
+    for (const key of ["hue", "sat", "amp", "speed", "spin", "glow"]) {
+      this.params[key] += (this.target[key] - this.params[key]) * k;
     }
 
-    this._draw(dt);
-    this._animFrame = requestAnimationFrame(() => this._tick());
-  }
-
-  _draw(dt) {
-    const ctx = this.ctx;
-    const w = this.size;
-    const h = this.size;
-    const t = this.time;
-
-    ctx.clearRect(0, 0, w, h);
-
-    // Eased transition factor
-    const ease = this._easeInOutCubic(this.transitionProgress);
-
-    // State-specific parameters
-    const params = this._getStateParams(ease);
-
-    // Draw layers
-    this._drawOuterGlow(ctx, params);
-    this._drawRings(ctx, params, t);
-    this._drawCore(ctx, params, t);
-    this._drawWaveform(ctx, params, t);
-    this._drawParticles(ctx, params, t);
-    this._drawKernel(ctx, params, t);
-  }
-
-  _getStateParams(ease) {
-    const base = {
-      coreRadius: this.radius,
-      coreAlpha: 1,
-      coreHue: 160, // teal
-      coreSat: 70,
-      coreLight: 55,
-      glowSize: this.radius * 0.6,
-      glowAlpha: 0.15,
-      particleSpeed: 1,
-      particleAlpha: 1,
-      ringAlpha: 1,
-      waveform: false,
-      rotationSpeed: 0.0003,
-      pulseSpeed: 0.001,
-      pulseAmount: 0.03,
-    };
-
-    switch (this.state) {
-      case OrbState.IDLE:
-        base.pulseSpeed = 0.0008;
-        base.pulseAmount = 0.02;
-        base.rotationSpeed = 0.0002;
-        break;
-
-      case OrbState.LISTENING:
-        base.waveform = true;
-        base.coreLight = 60;
-        base.glowAlpha = 0.25;
-        base.pulseSpeed = 0.0012;
-        base.pulseAmount = 0.04;
-        base.particleAlpha = 0.8 + this.audioAmplitude * 0.2;
-        base.rotationSpeed = 0.0004;
-        break;
-
-      case OrbState.THINKING:
-        base.coreHue = 170;
-        base.coreLight = 60;
-        base.glowAlpha = 0.3;
-        base.pulseSpeed = 0.002;
-        base.pulseAmount = 0.05;
-        base.rotationSpeed = 0.001;
-        base.particleSpeed = 1.5;
-        break;
-
-      case OrbState.SPEAKING:
-        base.waveform = true;
-        base.coreHue = 155;
-        base.coreLight = 65;
-        base.glowAlpha = 0.35;
-        base.pulseSpeed = 0.0015;
-        base.pulseAmount = 0.06;
-        base.particleSpeed = 1.2;
-        base.rotationSpeed = 0.0005;
-        break;
-
-      case OrbState.EXECUTING:
-        base.coreHue = 140;
-        base.coreSat = 80;
-        base.coreLight = 58;
-        base.glowAlpha = 0.4;
-        base.glowSize = this.radius * 0.8;
-        base.pulseSpeed = 0.0025;
-        base.pulseAmount = 0.07;
-        base.particleSpeed = 2;
-        base.rotationSpeed = 0.0015;
-        break;
-
-      case OrbState.OFFLINE:
-        base.coreSat = 10;
-        base.coreLight = 30;
-        base.glowAlpha = 0.05;
-        base.particleAlpha = 0.15;
-        base.ringAlpha = 0.1;
-        base.pulseSpeed = 0;
-        base.pulseAmount = 0;
-        base.rotationSpeed = 0;
-        break;
-
-      case OrbState.ERROR:
-        base.coreHue = 0;
-        base.coreSat = 70;
-        base.coreLight = 50;
-        base.glowAlpha = 0.3;
-        base.glowSize = this.radius * 0.7;
-        base.pulseSpeed = 0.003;
-        base.pulseAmount = 0.08;
-        break;
+    // ── retarget scale/halo on an interval; faster + wider when speaking ──
+    const now = this.t / 60;
+    const interval = this.state === "speaking" ? 0.12 : 0.5;
+    if (now - this._lastRetarget > interval) {
+      if (this.state === "speaking") {
+        this.tgtScale = 1.05 + Math.random() * 0.09;
+        this.tgtHalo = 0.85 + Math.random() * 0.35;
+      } else if (this.state === "offline") {
+        this.tgtScale = 0.995 + Math.random() * 0.006;
+        this.tgtHalo = 0.18 + Math.random() * 0.1;
+      } else {
+        this.tgtScale = 1.0 + Math.random() * 0.02;
+        this.tgtHalo = 0.45 + Math.random() * 0.25;
+      }
+      this._lastRetarget = now;
     }
+    const ease = this.state === "speaking" ? 0.34 : 0.12;
+    this.scale += (this.tgtScale - this.scale) * ease;
+    this.halo += (this.tgtHalo - this.halo) * ease;
 
-    // Apply pulse
-    const pulse = Math.sin(t * base.pulseSpeed) * base.pulseAmount;
-    base.coreRadius = this.radius * (1 + pulse);
+    this.spin += this.params.spin * 0.0022;
+    this.amplitude *= this._ampDecay || 0.9;
 
-    return base;
+    // ── expanding pulse rings ────────────────────────────────────────────
+    const limit = 1.9;
+    const pulseSpeed = this.state === "speaking" ? 0.010 : 0.005;
+    this.pulses = this.pulses.map((r) => r + pulseSpeed).filter((r) => r < limit);
+    const spawnChance = this.state === "speaking" ? 0.05 : 0.014;
+    if (this.pulses.length < 3 && Math.random() < spawnChance) this.pulses.push(0.1);
+
+    this._draw();
+    this._frame = requestAnimationFrame(() => this._tick());
   }
 
-  _drawOuterGlow(ctx, params) {
-    const grad = ctx.createRadialGradient(
-      this.cx, this.cy, params.coreRadius * 0.5,
-      this.cx, this.cy, params.coreRadius + params.glowSize
-    );
-    const hue = params.coreHue;
-    const sat = params.coreSat;
-    grad.addColorStop(0, `hsla(${hue}, ${sat}%, ${params.coreLight}%, ${params.glowAlpha * 0.6})`);
-    grad.addColorStop(0.5, `hsla(${hue}, ${sat}%, ${params.coreLight}%, ${params.glowAlpha * 0.2})`);
-    grad.addColorStop(1, `hsla(${hue}, ${sat}%, ${params.coreLight}%, 0)`);
-    ctx.fillStyle = grad;
+  /** Radius of the fluid surface at angle `a`. */
+  _surface(a, t) {
+    const p = this.params;
+    const drive = p.amp + this.amplitude * 0.45;
+    // Layered waveform bands — the "voice" of the shape.
+    let d =
+      Math.sin(a * 3 + t * 1.1) * 0.34 +
+      Math.sin(a * 5 - t * 0.7) * 0.22 +
+      Math.sin(a * 8 + t * 1.6) * 0.13;
+    // Fluid noise — slow, organic wander so it never looks periodic.
+    d += (this.noise[0](a * 1.6 + t * 0.5) - 0.5) * 0.9;
+    d += (this.noise[1](a * 3.1 - t * 0.31) - 0.5) * 0.5;
+    return this.baseR * this.scale * (1 + d * drive);
+  }
+
+  _ringPath(ctx, t, inflate) {
+    const STEPS = 168;
     ctx.beginPath();
-    ctx.arc(this.cx, this.cy, params.coreRadius + params.glowSize, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  _drawCore(ctx, params, t) {
-    const r = params.coreRadius;
-    const hue = params.coreHue;
-    const sat = params.coreSat;
-    const light = params.coreLight;
-
-    // Core gradient
-    const grad = ctx.createRadialGradient(
-      this.cx - r * 0.2, this.cy - r * 0.2, 0,
-      this.cx, this.cy, r
-    );
-    grad.addColorStop(0, `hsla(${hue}, ${sat + 10}%, ${light + 15}%, 0.95)`);
-    grad.addColorStop(0.6, `hsla(${hue}, ${sat}%, ${light}%, 0.85)`);
-    grad.addColorStop(1, `hsla(${hue}, ${sat - 10}%, ${light - 10}%, 0.6)`);
-
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.arc(this.cx, this.cy, r, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Inner highlight
-    const hlGrad = ctx.createRadialGradient(
-      this.cx - r * 0.3, this.cy - r * 0.3, 0,
-      this.cx, this.cy, r * 0.7
-    );
-    hlGrad.addColorStop(0, `hsla(${hue}, 60%, 80%, 0.25)`);
-    hlGrad.addColorStop(1, `hsla(${hue}, 60%, 80%, 0)`);
-    ctx.fillStyle = hlGrad;
-    ctx.beginPath();
-    ctx.arc(this.cx, this.cy, r * 0.7, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  _drawKernel(ctx, params, t) {
-    if (this.state === OrbState.OFFLINE) return;
-
-    // Central bright point
-    const kr = params.coreRadius * 0.15;
-    const hue = params.coreHue;
-    const alpha = 0.5 + Math.sin(t * 0.002) * 0.2;
-
-    const grad = ctx.createRadialGradient(this.cx, this.cy, 0, this.cx, this.cy, kr);
-    grad.addColorStop(0, `hsla(${hue}, 50%, 90%, ${alpha})`);
-    grad.addColorStop(1, `hsla(${hue}, 50%, 90%, 0)`);
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.arc(this.cx, this.cy, kr, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  _drawRings(ctx, params, t) {
-    if (this.state === OrbState.OFFLINE) return;
-
-    ctx.save();
-    ctx.translate(this.cx, this.cy);
-    ctx.rotate(t * 0.0001);
-
-    for (const ring of this.rings) {
-      const r = ring.radius * (1 + Math.sin(t * 0.0005) * 0.02);
-      const alpha = ring.alpha * params.ringAlpha;
-      const hue = params.coreHue;
-
-      ctx.strokeStyle = `hsla(${hue}, 60%, 60%, ${alpha})`;
-      ctx.lineWidth = ring.width;
-      ctx.setLineDash([4 + ring.dashOffset * 0.1, 8]);
-      ctx.lineDashOffset = t * ring.speed * 10;
-      ctx.beginPath();
-      ctx.arc(0, 0, r, 0, Math.PI * 2);
-      ctx.stroke();
-    }
-
-    ctx.setLineDash([]);
-    ctx.restore();
-  }
-
-  _drawParticles(ctx, params, t) {
-    if (this.state === OrbState.OFFLINE && params.particleAlpha < 0.1) return;
-
-    const hue = params.coreHue;
-
-    for (const p of this.particles) {
-      const angle = p.angle + t * p.speed * params.particleSpeed + p.drift * t;
-      const dist = p.dist + Math.sin(t * 0.001 + p.angle) * 3;
-      const x = this.cx + Math.cos(angle) * dist;
-      const y = this.cy + Math.sin(angle) * dist;
-      const alpha = p.alpha * params.particleAlpha;
-
-      ctx.fillStyle = `hsla(${hue}, 60%, 70%, ${alpha})`;
-      ctx.beginPath();
-      ctx.arc(x, y, p.size, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
-
-  _drawWaveform(ctx, params, t) {
-    if (!params.waveform) return;
-
-    const hue = params.coreHue;
-    const amp = this.audioAmplitude;
-    const r = params.coreRadius * 1.15;
-    const segments = 64;
-
-    ctx.save();
-    ctx.translate(this.cx, this.cy);
-    ctx.rotate(t * 0.0003);
-
-    ctx.strokeStyle = `hsla(${hue}, 70%, 65%, ${0.3 + amp * 0.4})`;
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-
-    for (let i = 0; i <= segments; i++) {
-      const angle = (Math.PI * 2 * i) / segments;
-      const wave = Math.sin(angle * 8 + t * 0.005) * amp * 12;
-      const wave2 = Math.sin(angle * 13 - t * 0.003) * amp * 6;
-      const rr = r + wave + wave2;
-      const x = Math.cos(angle) * rr;
-      const y = Math.sin(angle) * rr;
+    for (let i = 0; i <= STEPS; i++) {
+      const a = (i / STEPS) * Math.PI * 2;
+      const r = this._surface(a + this.spin, t) * inflate;
+      const x = this.cx + Math.cos(a) * r;
+      const y = this.cy + Math.sin(a) * r;
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     }
-
     ctx.closePath();
+  }
+
+  _draw() {
+    const ctx = this.ctx;
+    const p = this.params;
+    const t = this.t * 0.01 * (0.5 + p.speed);
+    const H = p.hue;
+    const S = p.sat;
+
+    ctx.clearRect(0, 0, this.w, this.h);
+    ctx.globalCompositeOperation = "lighter";
+
+    // ── ambient halo ─────────────────────────────────────────────────────
+    const haloR = this.baseR * (2.6 + this.halo);
+    const halo = ctx.createRadialGradient(this.cx, this.cy, 0, this.cx, this.cy, haloR);
+    halo.addColorStop(0, `hsla(${H}, ${S}%, 56%, ${0.16 * p.glow})`);
+    halo.addColorStop(0.5, `hsla(${H}, ${S}%, 45%, ${0.05 * p.glow})`);
+    halo.addColorStop(1, "hsla(0,0%,0%,0)");
+    ctx.fillStyle = halo;
+    ctx.fillRect(0, 0, this.w, this.h);
+
+    // ── expanding pulses ─────────────────────────────────────────────────
+    for (const pr of this.pulses) {
+      const alpha = Math.max(0, (1 - pr / 1.9)) * 0.22 * p.glow;
+      if (alpha <= 0.002) continue;
+      ctx.strokeStyle = `hsla(${H}, ${S}%, 68%, ${alpha})`;
+      ctx.lineWidth = 1;
+      this._ringPath(ctx, t, 1 + pr);
+      ctx.stroke();
+    }
+
+    // ── particle field ───────────────────────────────────────────────────
+    const push = this.state === "speaking" ? 0.35 : 0.06;
+    for (const q of this.particles) {
+      q.a += q.drift * (1 + p.spin);
+      q.vr += (Math.random() - 0.5) * 0.05 + this.amplitude * push;
+      q.vr *= 0.97;                                   // damping
+      q.r += q.vr;
+      const min = this.baseR * 1.02;
+      const max = this.baseR * 2.9;
+      if (q.r < min) { q.r = min; q.vr = Math.abs(q.vr) * 0.5; }
+      if (q.r > max) { q.r = max; q.vr = -Math.abs(q.vr) * 0.5; }
+      const x = this.cx + Math.cos(q.a) * q.r;
+      const y = this.cy + Math.sin(q.a) * q.r;
+      const fall = 1 - (q.r - min) / (max - min);
+      const alpha = q.life * fall * 0.85 * p.glow;
+      ctx.fillStyle = `hsla(${H + q.hueShift}, ${S}%, 72%, ${alpha})`;
+      ctx.beginPath();
+      ctx.arc(x, y, q.size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // ── mesh shell: offset contours ──────────────────────────────────────
+    for (let i = 4; i >= 1; i--) {
+      const inflate = 1 + i * 0.075;
+      const alpha = (0.10 - i * 0.015) * p.glow + 0.02;
+      ctx.strokeStyle = `hsla(${H + i * 6}, ${S}%, 62%, ${alpha})`;
+      ctx.lineWidth = 1;
+      this._ringPath(ctx, t - i * 0.05, inflate);
+      ctx.stroke();
+    }
+
+    // ── body ─────────────────────────────────────────────────────────────
+    this._ringPath(ctx, t, 1);
+    const body = ctx.createRadialGradient(
+      this.cx, this.cy, this.baseR * 0.15,
+      this.cx, this.cy, this.baseR * 1.25,
+    );
+    body.addColorStop(0, `hsla(${H + 8}, ${S}%, 62%, ${0.42 * p.glow})`);
+    body.addColorStop(0.55, `hsla(${H}, ${S}%, 46%, ${0.20 * p.glow})`);
+    body.addColorStop(1, `hsla(${H - 10}, ${S}%, 34%, 0.02)`);
+    ctx.fillStyle = body;
+    ctx.fill();
+
+    // rim
+    ctx.strokeStyle = `hsla(${H}, ${S}%, 78%, ${0.65 * p.glow})`;
+    ctx.lineWidth = 1.6;
     ctx.stroke();
-    ctx.restore();
-  }
 
-  _easeInOutCubic(t) {
-    return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+    // ── core ─────────────────────────────────────────────────────────────
+    const coreR = this.baseR * (0.30 + this.amplitude * 0.16);
+    const core = ctx.createRadialGradient(this.cx, this.cy, 0, this.cx, this.cy, coreR);
+    core.addColorStop(0, `hsla(${H + 14}, 100%, 92%, ${0.80 * p.glow})`);
+    core.addColorStop(0.45, `hsla(${H + 6}, ${S}%, 70%, ${0.30 * p.glow})`);
+    core.addColorStop(1, "hsla(0,0%,0%,0)");
+    ctx.fillStyle = core;
+    ctx.beginPath();
+    ctx.arc(this.cx, this.cy, coreR, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.globalCompositeOperation = "source-over";
   }
 }
 
-// Export for ES modules and global
-if (typeof module !== "undefined" && module.exports) {
-  module.exports = { NovaOrb, OrbState };
-} else {
-  window.NovaOrb = NovaOrb;
-  window.OrbState = OrbState;
-}
+window.NovaOrb = NovaOrb;

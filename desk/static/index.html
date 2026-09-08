@@ -7,6 +7,7 @@
   <link rel="icon" type="image/png" href="/static/brand/logo/nova-icon.png">
   <link rel="stylesheet" href="/static/brand.css">
   <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/hud.css">
   <link rel="stylesheet" href="/static/vendor/atom-one-dark.min.css" id="hlcss">
 </head>
 <body>
@@ -51,107 +52,134 @@
        ═══════════════════════════════════════════════════════ -->
   <div class="app" id="app" style="display:none">
 
-    <!-- LEFT PANEL (drawer, toggleable) -->
-    <aside class="left-panel" id="left-panel">
-      <div class="panel-header">
-        <div class="brand-row">
-          <div class="nova-icon" style="width:28px;height:28px;flex-shrink:0;" aria-label="NOVA"></div>
-          <span class="brand-name">NOVA</span>
-        </div>
-        <button class="icon-btn" id="btn-close-panel" title="Close panel" aria-label="Close panel">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="18" y1="6" x2="6" y2="18"></line>
-            <line x1="6" y1="6" x2="18" y2="18"></line>
-          </svg>
-        </button>
+    <!-- ── conversation drawer (secondary surface) ─────────────────── -->
+    <aside class="drawer" id="left-panel">
+      <div class="drawer-head">
+        <span class="drawer-ttl">CONVERSATIONS</span>
+        <button class="icon-btn" id="btn-close-panel" title="Close" aria-label="Close panel">&#10005;</button>
       </div>
-
-      <button class="newchat-btn" id="btn-new">+ New Chat</button>
-
-      <div class="panel-search">
-        <input id="search-convos" type="search" placeholder="Search..." autocomplete="off">
-      </div>
-
+      <button class="newchat-btn" id="btn-new">+ New</button>
+      <div class="drawer-search"><input id="search-convos" type="search" placeholder="Search..." autocomplete="off"></div>
       <nav class="convo-list" id="convo-list"></nav>
-
       <div class="panel-nav" id="panel-nav">
-        <div class="nav-label">Workspace</div>
         <button class="nav-item" data-view="projects"><span class="ico">&#9635;</span> Projects</button>
         <button class="nav-item" data-view="files"><span class="ico">&#9783;</span> Files</button>
         <button class="nav-item" data-view="skills"><span class="ico">&#9881;</span> Skills</button>
         <button class="nav-item" data-view="mind-map"><span class="ico">&#9673;</span> Mind Map</button>
-        <div class="nav-label">Intelligence</div>
         <button class="nav-item" data-view="memory"><span class="ico">&#9670;</span> Memory</button>
         <button class="nav-item" data-view="settings"><span class="ico">&#9881;</span> Settings</button>
       </div>
-
-      <div class="panel-foot">
-        <div class="foot-row">
-          <span id="status-dot" class="status-dot connecting"></span>
-          <span id="status-text">Connecting...</span>
-          <span class="spacer"></span>
-          <span id="status-model" class="chip"></span>
-        </div>
+      <div class="drawer-foot">
+        <span id="status-dot" class="status-dot connecting"></span>
+        <span id="status-text">Connecting...</span>
+        <span id="status-model" class="chip"></span>
       </div>
     </aside>
 
-    <!-- CENTER COLUMN (orb + transcript) -->
-    <main class="center-col">
+    <!-- ── command centre ──────────────────────────────────────────── -->
+    <div class="hud" id="hud">
 
-      <!-- Top bar (minimal) -->
-      <header class="topbar">
-        <button class="icon-btn" id="btn-toggle-panel" title="Toggle panel" aria-label="Toggle panel">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-            <line x1="3" y1="6" x2="21" y2="6"></line>
-            <line x1="3" y1="12" x2="21" y2="12"></line>
-            <line x1="3" y1="18" x2="21" y2="18"></line>
-          </svg>
-        </button>
-        <span class="ttl" id="chat-title">NOVA</span>
-        <div class="spacer"></div>
-        <span class="topbar-status" id="topbar-connection">
-          <span class="conn-dot"></span>
-          <span class="conn-text" id="conn-text">Online</span>
-        </span>
+      <!-- header -->
+      <header class="hud-head">
+        <div class="hud-head-l">
+          <button class="icon-btn ghost" id="btn-toggle-panel" title="Conversations" aria-label="Conversations">&#9776;</button>
+          <div>
+            <div class="sys-name">N.O.V.A. <span class="sys-exp">&middot; NEURAL OPERATIONS &amp; VOICE ASSISTANT</span></div>
+            <div class="sys-obj">OBJECTIVE &nbsp;:&nbsp; <span id="hud-objective">AWAITING INSTRUCTION</span><span id="chat-title" hidden></span></div>
+          </div>
+        </div>
+        <div class="hud-head-r">
+          <div class="hud-clock" id="hud-clock">--:--:--</div>
+          <div class="hud-date" id="hud-date">--</div>
+          <div class="hud-meta">
+            <div>SESSION &nbsp;: <span id="hud-session">----</span></div>
+            <div>ENGINE &nbsp;&nbsp;: <span id="hud-engine">----</span></div>
+            <div>LATENCY &nbsp;: <span id="hud-latency">--</span></div>
+          </div>
+        </div>
       </header>
 
-      <!-- Orb stage (central visual anchor) -->
-      <div class="orb-container" id="orb-container">
-        <canvas id="orb-canvas" width="120" height="120"></canvas>
-        <div class="orb-label" id="orb-label">Ready</div>
+      <div class="hud-pills" id="hud-pills">
+        <span class="pill" id="pill-link"><i></i>LINK</span>
+        <span class="pill" id="pill-tls"><i></i>TLS</span>
+        <span class="pill" id="pill-voice"><i></i>VOICE</span>
+        <span class="pill" id="pill-memory"><i></i>MEMORY</span>
+        <span class="pill" id="pill-brain"><i></i>BRAIN</span>
       </div>
 
-      <!-- Live transcript (appears contextually below orb) -->
-      <div class="live-transcript" id="live-transcript">
-        <div class="transcript-content" id="transcript-content">
-          <p class="transcript-placeholder" id="transcript-placeholder">Speak to NOVA</p>
-          <div class="transcript-messages" id="transcript-messages"></div>
+      <!-- main grid -->
+      <div class="hud-grid">
+
+        <!-- left rail -->
+        <section class="rail rail-l">
+          <div class="panel">
+            <h4>SYSTEM VITALS</h4>
+            <div class="vitals" id="hud-vitals"></div>
+          </div>
+          <div class="panel grow">
+            <h4>TELEMETRY</h4>
+            <div class="logfeed" id="hud-telemetry"></div>
+          </div>
+        </section>
+
+        <!-- stage -->
+        <section class="stage">
+          <div class="orb-container" id="orb-container">
+            <canvas id="orb-canvas"></canvas>
+          </div>
+          <div class="stage-state"><span class="orb-label" id="orb-label">Ready</span></div>
+
+          <div class="voice-cta">
+            <button id="btn-mic" title="Talk to NOVA" aria-label="Talk to NOVA">&#127908;</button>
+            <span id="voice-cta-label">Speak &mdash; NOVA is listening</span>
+          </div>
+
+          <div class="live-transcript" id="live-transcript">
+            <div class="transcript-content" id="transcript-content">
+              <p class="transcript-placeholder" id="transcript-placeholder">Speak to NOVA &mdash; or type below</p>
+              <div class="transcript-messages" id="transcript-messages"></div>
+            </div>
+          </div>
+
+          <div class="command-bar" id="command-bar">
+            <button class="icon-btn" id="btn-voice" title="Voice input" aria-label="Voice input">&#127908;</button>
+            <input id="input" type="text" placeholder="ask naturally&hellip;" autocomplete="off" aria-label="Ask NOVA">
+            <button class="icon-btn primary" id="btn-send" title="Send" aria-label="Send">&#10148;</button>
+          </div>
+        </section>
+
+        <!-- right rail -->
+        <section class="rail rail-r">
+          <div class="panel">
+            <h4>LINK</h4>
+            <div class="radar" id="hud-radar"><canvas id="radar-canvas"></canvas></div>
+            <div class="kv"><span>UP</span><b id="hud-up">--</b></div>
+            <div class="kv"><span>DOWN</span><b id="hud-down">--</b></div>
+          </div>
+          <div class="panel">
+            <h4>AUDIO S/N</h4>
+            <canvas id="wave-canvas" class="wave"></canvas>
+          </div>
+          <div class="panel grow">
+            <h4>ACTIVITY</h4>
+            <div class="agent-field-container" id="agent-field"></div>
+          </div>
+        </section>
+      </div>
+
+      <!-- roll call -->
+      <footer class="rollcall">
+        <div class="rollcall-head">
+          <span class="rc-ttl">ROLL CALL &middot; ACTIVE AGENTS</span>
+          <span class="rc-sub">NOVA COMMAND CENTER / MANAGER AGENT</span>
+          <span class="rc-standby">STANDBY : <b id="hud-standby">--</b></span>
         </div>
-      </div>
+        <div class="rollcall-grid" id="hud-agents"></div>
+      </footer>
+    </div>
 
-      <!-- Command input (bottom bar) -->
-      <div class="command-bar" id="command-bar">
-        <button class="icon-btn" id="btn-voice" title="Voice input" aria-label="Voice input">
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
-            <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-            <line x1="12" y1="19" x2="12" y2="23"></line>
-            <line x1="8" y1="23" x2="16" y2="23"></line>
-          </svg>
-        </button>
-        <input id="input" type="text" placeholder="Type a command..." autocomplete="off" aria-label="Type a command">
-        <button class="icon-btn primary" id="btn-send" title="Send" aria-label="Send">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-            <polygon points="5,3 19,12 5,21"></polygon>
-          </svg>
-        </button>
-      </div>
-    </main>
-
-    <!-- RIGHT AGENT FIELD (borderless, floating elements) -->
-    <aside class="right-field" id="right-field">
-      <div class="agent-field-container" id="agent-field"></div>
-    </aside>
+    <!-- kept for app.js compatibility; the drawer owns this surface now -->
+    <aside class="right-field" id="right-field" hidden></aside>
   </div>
 
   <!-- ═══════════════════════════════════════════════════════
@@ -197,7 +225,7 @@
           <h3>Use my own API key</h3>
           <p class="desc">Bring your own Gemini key. Sealed with Windows DPAPI.</p>
           <div class="field"><label>Gemini API key</label>
-            <input type="password" id="ob-byok-key" placeholder="AIza..." autocomplete="off"></div>
+            <input type="password" id="ob-byok-key" placeholder="Paste your API key" autocomplete="off"></div>
           <button class="btn-sm primary" id="ob-byok-btn">Save key</button>
         </div>
         <div class="card onboard-card">
@@ -265,6 +293,7 @@
   <script src="/static/events.js" defer></script>
   <script src="/static/agent-field.js" defer></script>
   <script src="/static/app.js" defer></script>
+  <script src="/static/hud.js" defer></script>
 
   <!-- Three.js for 3D Mind Map (local vendor bundle) -->
   <script type="importmap">
@@ -276,5 +305,21 @@
   }
   </script>
   <script type="module" src="/static/mind/main.js" defer></script>
+  <script type="module">
+    // Volumetric orb. Falls back silently to the 2D canvas orb if the machine
+    // has no usable WebGL context (app.js checks window.__novaOrb first).
+    import { NovaOrb3D } from "/static/orb3d.js";
+    const host = document.getElementById("orb-container");
+    if (host) {
+      const o = new NovaOrb3D(host);
+      if (o.available) {
+        window.__novaOrb = o;
+        if (window.__novaSetOrb) window.__novaSetOrb(o);
+      } else {
+        o.dispose();   // leaves the 2D canvas orb in place
+      }
+    }
+  </script>
+
 </body>
 </html>

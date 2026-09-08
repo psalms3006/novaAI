@@ -1,0 +1,541 @@
+/* hud.css — NOVA command centre.
+ *
+ * Loaded after style.css and owns the whole application shell; style.css is
+ * left in place because it still styles the modals, settings panes and toasts,
+ * which are unchanged.
+ *
+ * Visual language: near-black navy ground, hairline cyan rules, uppercase
+ * monospace micro-typography, and one large living presence in the middle.
+ * Panels are frames, not cards — no fills, no shadows, no rounded chrome.
+ */
+
+:root {
+  --hud-bg: #04070d;
+  --hud-bg2: #070d18;
+  --hud-line: rgba(86, 190, 255, 0.22);
+  --hud-line-soft: rgba(86, 190, 255, 0.10);
+  --hud-cyan: #57c8ff;
+  --hud-cyan-dim: rgba(87, 200, 255, 0.55);
+  --hud-text: #cfe6f5;
+  --hud-muted: rgba(160, 196, 220, 0.55);
+  --hud-amber: #ffb35c;
+  --hud-good: #4ce0b3;
+  --hud-bad: #ff6b6b;
+  --hud-mono: "SFMono-Regular", "JetBrains Mono", Consolas, "Roboto Mono", monospace;
+}
+
+/* ── shell ─────────────────────────────────────────────────────────────── */
+
+body {
+  background: var(--hud-bg);
+  color: var(--hud-text);
+  overflow: hidden;
+}
+
+#app.app {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+  background:
+    radial-gradient(1200px 700px at 50% 38%, rgba(20, 60, 92, 0.30), transparent 70%),
+    linear-gradient(180deg, var(--hud-bg2), var(--hud-bg) 60%);
+  position: relative;
+}
+
+/* faint grid floor, purely atmospheric and cheap (no repaint cost) */
+#app.app::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(var(--hud-line-soft) 1px, transparent 1px),
+    linear-gradient(90deg, var(--hud-line-soft) 1px, transparent 1px);
+  background-size: 64px 64px;
+  mask-image: radial-gradient(ellipse 80% 60% at 50% 55%, #000 30%, transparent 78%);
+  opacity: 0.5;
+}
+
+.hud {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 14px 18px 12px;
+  gap: 10px;
+  /* No z-index here on purpose: it would create a stacking context, and the
+     orb canvas's screen blend could then only see .hud instead of the page
+     gradient painted on #app — leaving the canvas as a visible black block.
+     Being positioned and later in the DOM already puts it above #app::before. */
+  position: relative;
+}
+
+/* ── header ────────────────────────────────────────────────────────────── */
+
+.hud-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 20px;
+  border-bottom: 1px solid var(--hud-line);
+  padding-bottom: 10px;
+}
+
+.hud-head-l { display: flex; gap: 12px; align-items: flex-start; }
+
+.sys-name {
+  font-family: var(--hud-mono);
+  font-size: 13px;
+  letter-spacing: 0.20em;
+  color: var(--hud-cyan);
+  text-shadow: 0 0 14px rgba(87, 200, 255, 0.45);
+}
+.sys-exp { color: var(--hud-muted); letter-spacing: 0.14em; font-size: 10px; }
+
+.sys-obj {
+  font-family: var(--hud-mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--hud-muted);
+  margin-top: 4px;
+  text-transform: uppercase;
+}
+#hud-objective { color: var(--hud-amber); }
+
+.hud-head-r { text-align: right; font-family: var(--hud-mono); }
+
+.hud-clock {
+  font-size: 26px;
+  letter-spacing: 0.06em;
+  color: var(--hud-text);
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 0 18px rgba(87, 200, 255, 0.25);
+}
+.hud-date { font-size: 10px; letter-spacing: 0.22em; color: var(--hud-muted); margin-top: 3px; }
+.hud-meta { margin-top: 6px; font-size: 9.5px; letter-spacing: 0.10em; color: var(--hud-muted); line-height: 1.5; }
+.hud-meta span { color: var(--hud-cyan-dim); }
+
+/* ── status pills ──────────────────────────────────────────────────────── */
+
+.hud-pills { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.pill {
+  font-family: var(--hud-mono);
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 3px 9px;
+  border: 1px solid var(--hud-line);
+  color: var(--hud-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(10, 22, 38, 0.5);
+}
+.pill i {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--hud-muted);
+  box-shadow: 0 0 6px currentColor;
+}
+.pill.ok    { color: var(--hud-good);  border-color: rgba(76, 224, 179, 0.35); }
+.pill.ok i  { background: var(--hud-good); }
+.pill.warn  { color: var(--hud-amber); border-color: rgba(255, 179, 92, 0.35); }
+.pill.warn i{ background: var(--hud-amber); }
+.pill.bad   { color: var(--hud-bad);   border-color: rgba(255, 107, 107, 0.35); }
+.pill.bad i { background: var(--hud-bad); }
+
+/* ── grid ──────────────────────────────────────────────────────────────── */
+
+.hud-grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 232px minmax(0, 1fr) 232px;
+  gap: 14px;
+  min-height: 0;
+}
+
+.rail { display: flex; flex-direction: column; gap: 12px; min-height: 0; }
+
+.panel {
+  border: 1px solid var(--hud-line);
+  padding: 8px 10px 10px;
+  background: linear-gradient(180deg, rgba(10, 24, 42, 0.55), rgba(6, 14, 26, 0.25));
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.panel.grow { flex: 1; overflow: hidden; }
+
+.panel h4 {
+  font-family: var(--hud-mono);
+  font-size: 9px;
+  letter-spacing: 0.22em;
+  color: var(--hud-cyan);
+  margin: 0 0 8px;
+  font-weight: 500;
+  border-bottom: 1px solid var(--hud-line-soft);
+  padding-bottom: 5px;
+}
+
+/* vitals bars */
+.vitals { display: flex; flex-direction: column; gap: 7px; }
+.vital-row { font-family: var(--hud-mono); font-size: 9px; letter-spacing: 0.10em; }
+.vital-top { display: flex; justify-content: space-between; color: var(--hud-muted); margin-bottom: 3px; }
+.vital-top b { color: var(--hud-text); font-weight: 500; }
+.vital-track { height: 3px; background: rgba(87, 200, 255, 0.10); position: relative; }
+.vital-fill {
+  position: absolute; inset: 0 auto 0 0;
+  background: linear-gradient(90deg, var(--hud-cyan), #9be7ff);
+  box-shadow: 0 0 8px rgba(87, 200, 255, 0.6);
+  transition: width 0.6s ease;
+}
+.vital-fill.hot { background: linear-gradient(90deg, var(--hud-amber), #ffd9a8); box-shadow: 0 0 8px rgba(255,179,92,.6); }
+
+/* log feeds */
+.logfeed {
+  font-family: var(--hud-mono);
+  font-size: 9px;
+  line-height: 1.65;
+  color: var(--hud-muted);
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+.logfeed div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.logfeed .t { color: var(--hud-cyan-dim); margin-right: 6px; }
+.logfeed .ok { color: var(--hud-good); }
+.logfeed .bad { color: var(--hud-bad); }
+
+.kv {
+  display: flex; justify-content: space-between;
+  font-family: var(--hud-mono); font-size: 9px;
+  letter-spacing: 0.12em; color: var(--hud-muted); margin-top: 5px;
+}
+.kv b { color: var(--hud-text); font-weight: 500; }
+
+.radar { position: relative; aspect-ratio: 1; width: 100%; }
+.radar canvas { width: 100%; height: 100%; display: block; }
+.wave { width: 100%; height: 44px; display: block; }
+
+/* ── stage ─────────────────────────────────────────────────────────────── */
+
+.stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  position: relative;
+  gap: 10px;
+}
+
+.orb-container {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#orb-canvas { width: 100%; height: 100%; display: block; }
+
+.stage-state { text-align: center; }
+.orb-label {
+  font-family: var(--hud-mono);
+  font-size: 10px;
+  letter-spacing: 0.30em;
+  text-transform: uppercase;
+  color: var(--hud-cyan);
+  text-shadow: 0 0 12px rgba(87, 200, 255, 0.5);
+}
+
+/* transcript is a caption strip, not a chat log */
+.live-transcript {
+  width: min(760px, 100%);
+  max-height: 22vh;
+  overflow-y: auto;
+  text-align: center;
+  transition: max-height 0.3s ease;
+}
+.transcript-placeholder {
+  font-family: var(--hud-mono);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--hud-muted);
+  text-transform: uppercase;
+}
+.transcript-messages { display: flex; flex-direction: column; gap: 8px; }
+.transcript-msg {
+  font-size: 14px;
+  line-height: 1.55;
+  padding: 6px 12px;
+  text-align: left;
+  border-left: 2px solid transparent;
+}
+.transcript-msg.user  { color: var(--hud-muted); border-left-color: var(--hud-line); }
+.transcript-msg.nova  { color: var(--hud-text);  border-left-color: var(--hud-cyan); }
+
+/* command bar */
+.command-bar {
+  width: min(680px, 100%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--hud-line);
+  background: rgba(8, 18, 32, 0.75);
+  padding: 6px 8px;
+}
+.command-bar input {
+  flex: 1;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  color: var(--hud-text);
+  font-family: var(--hud-mono);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+}
+.command-bar input::placeholder { color: var(--hud-muted); letter-spacing: 0.16em; text-transform: uppercase; font-size: 10px; }
+
+.icon-btn {
+  background: transparent;
+  border: 1px solid var(--hud-line);
+  color: var(--hud-cyan);
+  width: 28px; height: 28px;
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  font-size: 12px;
+  transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+.icon-btn:hover { background: rgba(87, 200, 255, 0.12); box-shadow: 0 0 12px rgba(87,200,255,.25); }
+.icon-btn.ghost { border-color: transparent; }
+.icon-btn.primary { border-color: var(--hud-cyan); }
+.icon-btn.listening { background: rgba(76, 224, 179, .18); border-color: var(--hud-good); color: var(--hud-good); }
+
+/* ── roll call ─────────────────────────────────────────────────────────── */
+
+.rollcall { border-top: 1px solid var(--hud-line); padding-top: 8px; }
+
+.rollcall-head {
+  display: flex; align-items: baseline; gap: 14px;
+  font-family: var(--hud-mono); font-size: 9px; letter-spacing: 0.20em;
+  color: var(--hud-muted); margin-bottom: 7px;
+}
+.rc-ttl { color: var(--hud-cyan); }
+.rc-sub { flex: 1; color: var(--hud-muted); }
+.rc-standby b { color: var(--hud-text); }
+
+.rollcall-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+  gap: 6px;
+}
+.agent-cell {
+  border: 1px solid var(--hud-line-soft);
+  padding: 6px 8px;
+  font-family: var(--hud-mono);
+  background: rgba(10, 22, 38, 0.4);
+  position: relative;
+  overflow: hidden;
+  transition: border-color 0.25s ease, background 0.25s ease;
+}
+.agent-cell .an { font-size: 9.5px; letter-spacing: 0.16em; color: var(--hud-muted); }
+.agent-cell .ar { font-size: 8.5px; letter-spacing: 0.08em; color: rgba(160,196,220,.35); margin-top: 2px;
+                  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.agent-cell.manager { border-color: var(--hud-line); }
+.agent-cell.manager .an { color: var(--hud-cyan); }
+.agent-cell.active {
+  border-color: var(--hud-good);
+  background: rgba(76, 224, 179, 0.10);
+}
+.agent-cell.active .an { color: var(--hud-good); }
+.agent-cell.active::after {
+  content: ""; position: absolute; left: 0; bottom: 0; height: 2px; width: 100%;
+  background: var(--hud-good);
+  animation: rc-scan 1.4s ease-in-out infinite;
+}
+@keyframes rc-scan { 0%,100% { opacity: .25; transform: translateX(-60%); } 50% { opacity: 1; transform: translateX(60%); } }
+
+/* ── conversation drawer ───────────────────────────────────────────────── */
+
+.drawer {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 268px;
+  z-index: 40;
+  background: rgba(5, 11, 20, 0.96);
+  border-right: 1px solid var(--hud-line);
+  backdrop-filter: blur(8px);
+  transform: translateX(-100%);
+  transition: transform 0.24s cubic-bezier(.4,0,.2,1);
+  display: flex; flex-direction: column;
+  padding: 12px 12px 10px;
+  gap: 8px;
+}
+.drawer.open { transform: translateX(0); }
+
+.drawer-head { display: flex; justify-content: space-between; align-items: center; }
+.drawer-ttl { font-family: var(--hud-mono); font-size: 9px; letter-spacing: 0.22em; color: var(--hud-cyan); }
+.drawer-search input {
+  width: 100%; background: rgba(10,22,38,.6); border: 1px solid var(--hud-line-soft);
+  color: var(--hud-text); padding: 5px 8px; font-family: var(--hud-mono); font-size: 10px; outline: 0;
+}
+.newchat-btn {
+  background: transparent; border: 1px solid var(--hud-line); color: var(--hud-cyan);
+  font-family: var(--hud-mono); font-size: 10px; letter-spacing: 0.14em;
+  padding: 6px; cursor: pointer;
+}
+.newchat-btn:hover { background: rgba(87,200,255,.12); }
+.convo-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+.panel-nav { display: flex; flex-direction: column; gap: 1px; border-top: 1px solid var(--hud-line-soft); padding-top: 6px; }
+.nav-item {
+  background: transparent; border: 0; color: var(--hud-muted); text-align: left;
+  font-family: var(--hud-mono); font-size: 10px; letter-spacing: 0.10em;
+  padding: 5px 6px; cursor: pointer;
+}
+.nav-item:hover { color: var(--hud-cyan); background: rgba(87,200,255,.08); }
+.drawer-foot {
+  display: flex; align-items: center; gap: 6px;
+  font-family: var(--hud-mono); font-size: 9px; color: var(--hud-muted);
+  border-top: 1px solid var(--hud-line-soft); padding-top: 7px;
+}
+
+/* ── ambient mode: the whole shell collapses to the orb ────────────────── */
+
+body[data-mode="ambient"] { background: transparent; }
+body[data-mode="ambient"] #app.app { background: transparent; }
+body[data-mode="ambient"] #app.app::before { display: none; }
+body[data-mode="ambient"] .hud-head,
+body[data-mode="ambient"] .hud-pills,
+body[data-mode="ambient"] .rail,
+body[data-mode="ambient"] .rollcall,
+body[data-mode="ambient"] .command-bar,
+body[data-mode="ambient"] .live-transcript,
+body[data-mode="ambient"] .drawer { display: none; }
+body[data-mode="ambient"] .hud-grid { grid-template-columns: 1fr; }
+body[data-mode="ambient"] .hud { padding: 0; }
+
+/* ── responsive: rails fold away before the presence does ─────────────── */
+
+@media (max-width: 1180px) {
+  .hud-grid { grid-template-columns: 200px minmax(0, 1fr); }
+  .rail-r { display: none; }
+}
+@media (max-width: 900px) {
+  .hud-grid { grid-template-columns: minmax(0, 1fr); }
+  .rail-l { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-cell.active::after { animation: none; }
+  .vital-fill { transition: none; }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   VOICE-FIRST HIERARCHY
+   NOVA is a voice assistant, so the presence owns the stage and text is a
+   caption underneath it. The composer only becomes prominent on focus, so
+   typing stays available without advertising itself as the way in.
+   ───────────────────────────────────────────────────────────────────────── */
+
+.stage { justify-content: center; gap: 0; }
+
+/* the form takes the stage */
+.orb-container {
+  flex: 1 1 auto;
+  min-height: 260px;
+  position: relative;
+}
+#orb-canvas { width: 100%; height: 100%; }
+
+.stage-state { margin-top: -6px; }
+.orb-label {
+  font-size: 11px;
+  letter-spacing: 0.42em;
+  opacity: 0.9;
+}
+
+/* voice affordance sits directly under the form and reads as the primary path */
+.voice-cta {
+  margin-top: 10px;
+  font-family: var(--hud-mono);
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--hud-muted);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.voice-cta button {
+  background: transparent;
+  border: 1px solid var(--hud-cyan);
+  color: var(--hud-cyan);
+  width: 40px; height: 40px; border-radius: 50%;
+  cursor: pointer; font-size: 15px;
+  display: inline-flex; align-items: center; justify-content: center;
+  box-shadow: 0 0 0 0 rgba(87, 200, 255, 0.5);
+  transition: box-shadow .3s ease, background .2s ease, transform .2s ease;
+}
+.voice-cta button:hover { background: rgba(87,200,255,.14); transform: scale(1.05); }
+.voice-cta button.live {
+  border-color: var(--hud-good); color: var(--hud-good);
+  animation: mic-pulse 2s ease-out infinite;
+}
+@keyframes mic-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(76,224,179,.45); }
+  70%  { box-shadow: 0 0 0 16px rgba(76,224,179,0); }
+  100% { box-shadow: 0 0 0 0 rgba(76,224,179,0); }
+}
+
+/* transcript demoted to a caption strip: last exchange only, centred, quiet */
+.live-transcript {
+  max-height: 15vh;
+  width: min(720px, 100%);
+  margin-top: 12px;
+  overflow: hidden;
+  mask-image: linear-gradient(to top, #000 60%, transparent);
+}
+.transcript-messages { gap: 4px; }
+.transcript-msg {
+  border-left: 0;
+  text-align: center;
+  font-size: 13px;
+  padding: 2px 0;
+  opacity: 0.55;
+}
+.transcript-msg:last-child { opacity: 1; font-size: 15px; }
+.transcript-msg.user { color: var(--hud-muted); }
+.transcript-msg.nova { color: var(--hud-text); }
+
+/* composer recedes until used */
+.command-bar {
+  margin-top: 10px;
+  width: min(520px, 100%);
+  opacity: 0.42;
+  border-color: var(--hud-line-soft);
+  transition: opacity .2s ease, border-color .2s ease, width .2s ease;
+}
+.command-bar:hover { opacity: 0.75; }
+.command-bar:focus-within {
+  opacity: 1;
+  width: min(680px, 100%);
+  border-color: var(--hud-line);
+}
+.command-bar #btn-voice { display: none; }   /* the CTA above owns voice now */
+
+@media (prefers-reduced-motion: reduce) {
+  .voice-cta button.live { animation: none; }
+}
+
+/* The WebGL orb goes through an EffectComposer, whose final pass writes an
+   opaque alpha — the canvas would otherwise sit on the page as a visible black
+   rectangle. Screen blending drops the black and lets the glow sit on the
+   HUD's own gradient, which also suits the additive look. */
+#orb-canvas-3d {
+  mix-blend-mode: screen;
+  pointer-events: none;
+}
+
+/* Voice-first: the presence gets the room, not the composer. */
+.orb-container { min-height: min(46vh, 460px); }

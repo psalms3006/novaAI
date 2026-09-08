@@ -374,6 +374,10 @@ input, textarea, select { font-family: inherit; }
 .set-row .lbl { font-size: 12px; color: var(--muted); }
 .set-row .lbl small { display: block; font-size: 11px; color: var(--faint); }
 .set-note { font-size: 11px; color: var(--faint); margin-top: 8px; }
+.set-col { display: flex; flex-direction: column; gap: 8px; padding: 6px 0; }
+.set-actions { display: flex; gap: 8px; }
+.btn-sm { cursor: pointer; }
+.btn-sm:disabled { opacity: 0.5; cursor: not-allowed; }
 .onboard-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 16px 0; }
 .onboard-card { padding: 16px; background: var(--surface2); border-radius: var(--radius-sm); border: 1px solid var(--border); }
 .onboard-card h3 { font-size: 14px; margin-bottom: 6px; }

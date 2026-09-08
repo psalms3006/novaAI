@@ -54,6 +54,12 @@ _started_at = time.time()
 _stop_events: dict = {}
 _brain_ready: bool = False  # Set by nova_desktop_app after nova.main() completes
 
+# Live command-centre state, maintained by the event-bus publishers below so
+# /api/system reports what actually happened rather than a plausible guess.
+_active_agents: dict = {}      # agent_id -> {state, action, task_id}
+_last_voice_state: str = 'idle'
+_last_turn_ms: float = 0.0
+
 _workspace: Path | None = None
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -669,6 +675,8 @@ def api_chat():
             desk_trace.mark("stream_end", events=len(events_accum))
             if message or image_path:
                 _persist_turn(cid, message, events_accum, started)
+            global _last_turn_ms
+            _last_turn_ms = round((time.time() - started) * 1000, 1)
             desk_trace.mark("persisted")
             log.info("[TRACE %s] SUMMARY %s", rid, desk_trace.summary())
 
@@ -1372,6 +1380,175 @@ def api_mcp():
 
 # ── tasks ──────────────────────────────────────────────────────────────────────
 
+def _agent_key(agent_id: str, tool: str = "", name: str = "") -> str:
+    """Map a runtime agent/tool id onto one of the roster ids in _AGENT_ROSTER.
+
+    The chat path names agents after the tool they are running
+    ("agent-web_search-3f9c"), so the HUD lights the specialist that actually
+    owns that capability instead of inventing a separate row per tool call.
+    """
+    blob = f"{agent_id} {tool} {name}".lower()
+    for key, patterns in _TOOL_TO_AGENT.items():
+        if any(pat in blob for pat in patterns):
+            return key
+    return "orchestrator"
+
+
+_TOOL_TO_AGENT = {
+    "research": ("web_search", "research", "search"),
+    "browser":  ("browser_control", "browser"),
+    "vision":   ("vision", "screen", "ocr"),
+    "code":     ("self_editor", "code", "file_processor"),
+    "memory":   ("remember_fact", "nova_memory", "memory"),
+    "creative":  ("creative", "write", "document"),
+    "meeting":  ("meeting",),
+    "surveillance": ("surveil", "monitor"),
+    "spawn":    ("spawn", "nova_task", "planner"),
+}
+
+
+# ── command-centre telemetry ──────────────────────────────────────────────────
+#
+# Everything the HUD renders comes from here, and every field is measured. The
+# reference design is dense with readouts; a dense UI full of invented numbers
+# would be worse than no UI, so nothing below is synthesised — if a value is
+# unavailable the field is omitted and the panel renders it as "--".
+
+_AGENT_ROSTER = [
+    ("orchestrator", "NOVA",    "Manager"),
+    ("research",     "RESEARCH", "Web + sources"),
+    ("code",         "CODE",     "Code + analysis"),
+    ("vision",       "VISION",   "Screen + images"),
+    ("browser",      "BROWSER",  "Browser control"),
+    ("memory",       "MEMORY",   "Recall + storage"),
+    ("creative",     "CREATIVE", "Writing + media"),
+    ("meeting",      "MEETING",  "Meetings"),
+    ("surveillance", "SURVEIL",  "Monitoring"),
+    ("spawn",        "SPAWN",    "Sub-agents"),
+]
+
+_net_last = {"t": 0.0, "sent": 0, "recv": 0}
+
+try:  # prime the CPU sampler — the first call always returns 0.0
+    import psutil as _psutil_prime
+    _psutil_prime.cpu_percent(interval=None)
+except Exception:
+    pass
+
+
+def _vitals() -> dict:
+    """Real host metrics. Fields are omitted when the platform cannot supply them."""
+    out: dict = {}
+    try:
+        import psutil
+    except Exception:
+        return out
+    try:
+        out["cpu_pct"] = psutil.cpu_percent(interval=None)
+        vm = psutil.virtual_memory()
+        out["mem_pct"] = vm.percent
+        out["mem_used_gb"] = round(vm.used / 1e9, 2)
+        out["mem_total_gb"] = round(vm.total / 1e9, 2)
+    except Exception:
+        pass
+    try:
+        now = time.time()
+        n = psutil.net_io_counters()
+        if _net_last["t"] and now > _net_last["t"]:
+            dt = now - _net_last["t"]
+            out["up_bps"] = int((n.bytes_sent - _net_last["sent"]) / dt)
+            out["down_bps"] = int((n.bytes_recv - _net_last["recv"]) / dt)
+        _net_last.update(t=now, sent=n.bytes_sent, recv=n.bytes_recv)
+    except Exception:
+        pass
+    try:
+        temps = psutil.sensors_temperatures() or {}
+        for readings in temps.values():
+            if readings and readings[0].current:
+                out["thermal_c"] = round(readings[0].current, 1)
+                break
+    except Exception:
+        pass
+    return out
+
+
+@app.get("/api/system")
+@require_token
+def api_system():
+    """Live telemetry for the command-centre HUD."""
+    import nova
+
+    # ── agents: real roster, real live status from the event bus ─────────────
+    active = dict(_active_agents)
+    agents = []
+    for key, label, role in _AGENT_ROSTER:
+        live = active.get(key)
+        agents.append({
+            "id": key,
+            "label": label,
+            "role": role,
+            "state": (live or {}).get("state", "standby"),
+            "action": (live or {}).get("action", ""),
+            "task_id": (live or {}).get("task_id", ""),
+        })
+
+    # ── tasks: real task manager state ──────────────────────────────────────
+    tasks = []
+    try:
+        tm = _ns("_task_manager")
+        if tm is not None:
+            for t in tm.list()[:12]:
+                d = t.to_dict() if hasattr(t, "to_dict") else {}
+                tasks.append({
+                    "id": d.get("task_id", ""),
+                    "title": d.get("title", ""),
+                    "status": d.get("status", ""),
+                    "steps": len(d.get("steps", []) or []),
+                })
+    except Exception as e:
+        log.debug("task listing failed: %s", e)
+
+    # ── intelligence ────────────────────────────────────────────────────────
+    provider = ""
+    model = ""
+    try:
+        r = getattr(nova, "_nova_router", None)
+        if r is not None:
+            provider = getattr(r, "_last_provider_used", "") or ""
+            prov = r.get_provider(provider) if provider else None
+            if prov is not None:
+                model = str(getattr(prov, "model", "") or getattr(prov, "_model", "") or "")
+    except Exception:
+        pass
+
+    conn = "unknown"
+    try:
+        r = getattr(nova, "_nova_router", None)
+        if r is not None:
+            conn = r.connectivity.state.value
+    except Exception:
+        pass
+
+    return jsonify({
+        "ts": time.time(),
+        "uptime_s": round(time.time() - _started_at, 1),
+        "vitals": _vitals(),
+        "agents": agents,
+        "tasks": tasks,
+        "intelligence": {
+            "provider": provider,
+            "model": model,
+            "connectivity": conn,
+            "brain_ready": _brain_ready,
+            "last_turn_ms": _last_turn_ms,
+        },
+        "voice": {
+            "state": _last_voice_state,
+        },
+        "tls": _tls_status(),
+    })
+
+
 @app.get("/api/tasks")
 @require_token
 def api_tasks():
@@ -1943,6 +2120,8 @@ def run_desk_server(meta, port: int | None = None) -> None:
                 _event_clients.remove(cws)
 
     def publish_voice_state(state: str, **extra):
+        global _last_voice_state
+        _last_voice_state = state
         publish_event({"type": "voice_state", "state": state, "ts": time.time(), **extra})
 
     def publish_transcript(text: str, role: str = "nova"):
@@ -1955,12 +2134,20 @@ def run_desk_server(meta, port: int | None = None) -> None:
         publish_event({"type": "task_done", "task_id": task_id, "ok": ok, "summary": summary, "ts": time.time()})
 
     def publish_agent_start(agent_id: str, task_id: str, name: str, action: str = "", tool: str = ""):
+        _active_agents[_agent_key(agent_id, tool, name)] = {
+            "state": "active", "action": action or name, "task_id": task_id,
+        }
         publish_event({"type": "agent_start", "agent_id": agent_id, "task_id": task_id, "name": name, "action": action, "tool": tool, "ts": time.time()})
 
     def publish_agent_progress(agent_id: str, action: str = "", tool: str = ""):
+        key = _agent_key(agent_id, tool)
+        if key in _active_agents:
+            _active_agents[key]["action"] = action
         publish_event({"type": "agent_progress", "agent_id": agent_id, "action": action, "tool": tool, "ts": time.time()})
 
     def publish_agent_done(agent_id: str, ok: bool = True, summary: str = ""):
+        for k in [k for k, v in _active_agents.items() if agent_id.endswith(k) or k in agent_id]:
+            _active_agents.pop(k, None)
         publish_event({"type": "agent_done", "agent_id": agent_id, "ok": ok, "summary": summary, "ts": time.time()})
 
     def publish_orb_state(state: str):
@@ -1987,9 +2174,17 @@ def run_desk_server(meta, port: int | None = None) -> None:
             _event_clients.append(cws)
         try:
             while True:
-                data = cws.receive(timeout=30)
+                # receive() returning None is an *idle* timeout, not a close.
+                # Breaking on it tore down every event client every few seconds
+                # and reconnected in a loop, so agent/task/voice events were
+                # regularly lost. Keep the socket open and ping to hold it.
+                data = cws.receive(timeout=20)
                 if data is None:
-                    break
+                    try:
+                        cws.send('{"type":"ping"}')
+                    except Exception:
+                        break          # peer really is gone
+                    continue
         except Exception:
             pass
         finally:

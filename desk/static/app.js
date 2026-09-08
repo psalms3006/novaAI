@@ -175,7 +175,7 @@ function renderTranscript() {
 async function loadSettings() {
   try {
     const j = await api_json("/api/settings");
-    state.settings = j;
+    state.settings = j.settings || j;
     applySettings();
   } catch (e) {
     console.warn("[nova] loadSettings:", e);
@@ -344,6 +344,19 @@ function playAudioChunk(b64) {
     for (let i = 0; i < samples.length; i++) {
       float32[i] = samples[i] / 32768.0;
     }
+    // Drive the orb and the AUDIO S/N panel from the real signal, so the
+    // surface tracks NOVA's actual voice instead of animating on a timer.
+    let peak = 0;
+    for (let i = 0; i < float32.length; i += 16) {
+      const a = float32[i] < 0 ? -float32[i] : float32[i];
+      if (a > peak) peak = a;
+    }
+    window.__novaAudioLevel = peak;
+    if (orb && orb.setAmplitude) orb.setAmplitude(peak);
+    setTimeout(() => {
+      if (window.__novaAudioLevel === peak) window.__novaAudioLevel = 0;
+    }, 260);
+
     const audioBuf = ctx.createBuffer(1, float32.length, 24000);
     audioBuf.getChannelData(0).set(float32);
     const src = ctx.createBufferSource();
@@ -398,6 +411,7 @@ async function sendText(text, imagePath) {
       } else if (ev.type === "done") {
         // Turn complete
       } else if (ev.type === "error") {
+        console.error("[nova] chat error event:", ev);
         toast(ev.message || "Error");
       }
     });
@@ -419,11 +433,34 @@ async function sendText(text, imagePath) {
 
 /* ── Orb State Management ──────────────────────────── */
 let orb = null;
+
+/* The WebGL orb is an ES module and may finish loading after boot() has already
+ * stood up the 2D fallback. Rather than race, let it hand itself in and swap
+ * cleanly — the 2D orb is stopped and its canvas hidden. */
+window.__novaSetOrb = function (next) {
+  try {
+    if (orb === next) return;
+    if (orb && typeof orb.stop === "function") orb.stop();
+    const old2d = document.getElementById("orb-canvas");
+    if (old2d) old2d.style.display = "none";
+    orb = next;
+    next.start();
+    next.setState(window.__lastOrbState || "idle");
+    console.log("[NOVA] 3D orb active");
+    if (window.hudLog) window.hudLog("volumetric orb active", "ok");
+  } catch (e) {
+    console.warn("[NOVA] orb swap failed:", e);
+  }
+};
 let agentField = null;
 let eventClient = null;
 
 function setOrb(st) {
   if (orb) orb.setState(st);
+  if (window.hudLog && st !== window.__lastOrbState) {
+    window.__lastOrbState = st;
+    window.hudLog("state -> " + st, st === "error" ? "bad" : "");
+  }
 
   // Update label
   const label = $("orb-label");
@@ -515,8 +552,41 @@ const SETTINGS_TABS = {
           <label class="switch"><input type="checkbox" id="set-memory" ${s.memory_enabled !== false ? "checked" : ""}><span class="slider"></span></label></div>
       </div>`;
   },
-  account(host) { host.innerHTML = '<p class="set-note">Configure your API key in Settings > Account.</p>'; },
-  permissions(host) { host.innerHTML = '<p class="set-note">Tool permissions are managed by NOVA\'s safety system.</p>'; },
+  account(host) {
+    const a = (state.statusData || {}).auth || {};
+    const mode = a.mode || "unknown";
+    const hasKey = !!(a.has_credential || a.byok_present);
+    const masked = a.byok_masked || "";
+    const modeLabel = {
+      env: "API key from environment (.env)",
+      byok: "Your own Gemini API key (sealed with Windows DPAPI)",
+      cloud: "NOVA Cloud account",
+      offline: "No AI model configured",
+      unknown: "Unknown",
+    }[mode] || mode;
+    host.innerHTML = `
+      <div class="settings-sec"><h3>AI connection</h3>
+        <p class="set-note">Mode: <strong>${escapeHtml(mode)}</strong> — ${escapeHtml(modeLabel)}</p>
+        ${masked ? `<p class="set-note">Key on file: ${escapeHtml(masked)}</p>` : ""}
+      </div>
+      <div class="settings-sec"><h3>Gemini API key</h3>
+        <div class="set-col">
+          <input type="password" id="set-api-key" placeholder="Paste your API key" autocomplete="off" style="width:100%">
+          <div class="set-actions">
+            <button class="btn-sm primary" id="set-api-key-save">Save key</button>
+            ${hasKey ? '<button class="btn-sm" id="set-api-key-remove">Remove key</button>' : ""}
+          </div>
+          <p class="set-note" id="set-api-key-status"></p>
+        </div>
+      </div>
+      <div class="settings-sec"><h3>Offline</h3>
+        <div class="set-row"><div class="lbl">Use the local brain only</div>
+          <button class="btn-sm" id="set-offline-mode">Go offline</button></div>
+      </div>`;
+  },
+  permissions(host) {
+    host.innerHTML = '<p class="set-note">Tool permissions are managed by NOVA\'s safety system.</p>';
+  },
   advanced(host) {
     const s = state.settings;
     host.innerHTML = `
@@ -539,7 +609,7 @@ function showSettingsTab(tab) {
 function wireSettingsListeners(host, tab) {
   const save = (key, value) => {
     state.settings[key] = value;
-    api("/api/settings", { method: "POST", body: JSON.stringify({ key, value }) })
+    api("/api/settings", { method: "POST", body: JSON.stringify({ [key]: value }) })
       .then(() => toast("Settings saved"))
       .catch(() => toast("Failed to save"));
   };
@@ -570,6 +640,59 @@ function wireSettingsListeners(host, tab) {
 
   const offline = host.querySelector("#set-offline");
   if (offline) offline.addEventListener("change", () => save("offline_fallback", offline.checked));
+
+  // ── Account tab ────────────────────────────────────────────────
+  const apiKeySave = host.querySelector("#set-api-key-save");
+  const apiKeyInput = host.querySelector("#set-api-key");
+  if (apiKeySave) apiKeySave.addEventListener("click", async () => {
+    const key = (apiKeyInput ? apiKeyInput.value : "").trim();
+    const statusEl = host.querySelector("#set-api-key-status");
+    if (!key) {
+      if (statusEl) statusEl.textContent = "Please paste a Gemini API key first.";
+      toast("Enter an API key first");
+      return;
+    }
+    apiKeySave.disabled = true;
+    try {
+      await api_json("/api/onboarding/byok", { method: "POST", body: JSON.stringify({ api_key: key }) });
+      if (statusEl) statusEl.textContent = "Key saved.";
+      toast("API key saved");
+      await refreshStatus();
+      showSettingsTab("account");
+    } catch (e) {
+      if (statusEl) statusEl.textContent = "Failed: " + (e.message || e);
+      toast("Failed: " + (e.message || e));
+    } finally {
+      apiKeySave.disabled = false;
+    }
+  });
+
+  const apiKeyRemove = host.querySelector("#set-api-key-remove");
+  if (apiKeyRemove) apiKeyRemove.addEventListener("click", async () => {
+    apiKeyRemove.disabled = true;
+    try {
+      await api_json("/api/onboarding/byok", { method: "DELETE" });
+      toast("API key removed");
+      await refreshStatus();
+      showSettingsTab("account");
+    } catch (e) {
+      toast("Failed: " + (e.message || e));
+    } finally {
+      apiKeyRemove.disabled = false;
+    }
+  });
+
+  const offlineMode = host.querySelector("#set-offline-mode");
+  if (offlineMode) offlineMode.addEventListener("click", async () => {
+    try {
+      await api_json("/api/onboarding/offline", { method: "POST", body: "{}" });
+      toast("Switched to offline mode");
+      await refreshStatus();
+      showSettingsTab("account");
+    } catch (e) {
+      toast("Failed: " + (e.message || e));
+    }
+  });
 }
 
 
@@ -643,11 +766,18 @@ async function runInitSequence() {
   function _initOrb() {
     if (!orbCanvas) return;
     try {
-      if (window.NovaOrb) {
+      // Prefer the volumetric WebGL form; the 2D canvas orb is only a fallback
+      // for machines without a working WebGL context.
+      if (window.__novaOrb) {
+        orb = window.__novaOrb;
+        orb.start();
+        setOrb("idle");
+        console.log("[NOVA] 3D orb initialized");
+      } else if (window.NovaOrb) {
         orb = new NovaOrb(orbCanvas, 140);
         orb.start();
         setOrb("idle");
-        console.log("[NOVA] Canvas orb initialized");
+        console.log("[NOVA] Canvas orb initialized (WebGL unavailable)");
       } else {
         console.warn("[NOVA] NovaOrb not loaded — using CSS fallback");
         orbCanvas.style.display = "none";
@@ -663,14 +793,14 @@ async function runInitSequence() {
       orbCanvas.parentNode.insertBefore(fb, orbCanvas);
     }
   }
-  if (window.NovaOrb) {
+  if (window.__novaOrb || window.NovaOrb) {
     _initOrb();
   } else {
     // Retry up to 2s for deferred scripts
     let retries = 0;
     const iv = setInterval(() => {
       retries++;
-      if (window.NovaOrb || retries > 20) { clearInterval(iv); _initOrb(); }
+      if (window.__novaOrb || window.NovaOrb || retries > 20) { clearInterval(iv); _initOrb(); }
     }, 100);
   }
 
@@ -811,7 +941,50 @@ if (sendBtn) {
   });
 }
 
-// Voice button
+// Primary voice control. NOVA is voice-first, so this is the main affordance
+// on the stage; #btn-voice is kept for compatibility but hidden by the HUD.
+const micBtn = $("btn-mic");
+const micLabel = $("voice-cta-label");
+
+function _setMicUI(live) {
+  if (micBtn) micBtn.classList.toggle("live", !!live);
+  if (micLabel) {
+    micLabel.textContent = live
+      ? "Listening — just talk"
+      : "Tap to talk, or type below";
+  }
+}
+
+async function toggleVoice() {
+  if (state.listening) {
+    await liveDisconnect();
+    _setMicUI(false);
+    setOrb("idle");
+    if (window.hudLog) window.hudLog("voice session stopped", "");
+    return;
+  }
+  setOrb("thinking");
+  if (window.hudLog) window.hudLog("opening voice session...", "");
+  const ok = await liveStart();
+  if (ok) {
+    state.voiceMode = true;
+    state.liveEngine = "live";
+    _setMicUI(true);
+    setOrb("listening");
+    if (window.hudLog) window.hudLog("voice session live", "ok");
+  } else {
+    _setMicUI(false);
+    setOrb("error");
+    toast("Voice unavailable — check the Gemini key and microphone");
+    if (window.hudLog) window.hudLog("voice session failed to start", "bad");
+    setTimeout(() => setOrb("idle"), 2500);
+  }
+}
+
+if (micBtn) micBtn.addEventListener("click", toggleVoice);
+window.novaToggleVoice = toggleVoice;
+
+// Voice button (legacy control, hidden in the HUD layout)
 const voiceBtn = $("btn-voice");
 if (voiceBtn) {
   voiceBtn.addEventListener("click", () => {
@@ -833,6 +1006,7 @@ document.querySelectorAll(".nav-item").forEach(btn =>
   btn.addEventListener("click", () => {
     const view = btn.dataset.view;
     if (view === "settings") {
+      refreshStatus();
       $("settings-modal").classList.add("open");
       showSettingsTab("general");
     } else {
@@ -857,7 +1031,7 @@ if (searchInput) {
 const settingsBtn = $("btn-settings");
 if (settingsBtn) {
   settingsBtn.addEventListener("click", async () => {
-    await loadSettings();
+    await Promise.allSettled([loadSettings(), refreshStatus()]);
     $("settings-modal").classList.add("open");
     showSettingsTab("general");
   });
