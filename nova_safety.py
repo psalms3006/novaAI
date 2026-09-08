@@ -40,10 +40,30 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+# ── Runtime data location ────────────────────────────────────────────────────
+# Relative paths resolve against the working directory, which for the packaged
+# app is the install directory — not writable under Program Files for a standard
+# user, and contrary to the installer's guarantee that user data never lives
+# inside the install directory.
+
+def _runtime_data_dir() -> Path:
+    import os
+    import sys
+    if getattr(sys, "frozen", False):
+        base = os.getenv("APPDATA")
+        d = Path(base) / "NOVA" if base else Path.home() / ".nova"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return Path(".")
+        return d
+    return Path(".")
+
+
 # ── Config (can be overridden by nova_config.toml) ───────────────────────────
-AUDIT_FILE       = Path("nova_audit.log")
+AUDIT_FILE       = _runtime_data_dir() / "nova_audit.log"
 AUDIT_MAX_LINES  = 500   # rotate after this many entries
-COST_FILE        = Path("nova_cost.json")
+COST_FILE        = _runtime_data_dir() / "nova_cost.json"
 COST_PER_1K_IN  = 0.0   # Gemini Flash free tier
 COST_PER_1K_OUT = 0.0   # update if on paid tier
 

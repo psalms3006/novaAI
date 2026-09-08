@@ -295,6 +295,12 @@ class OllamaProvider:
             "model": self._model,
             "messages": msgs,
             "stream": False,
+            # Keep the model resident between turns. Ollama unloads after 5
+            # minutes by default, and reloading a multi-GB model costs more
+            # than the whole request budget — a cold mistral:latest exceeded a
+            # 120s timeout on this machine, so the local fallback appeared
+            # broken when it was only cold.
+            "keep_alive": os.getenv("NOVA_OLLAMA_KEEP_ALIVE", "") or "30m",
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,
