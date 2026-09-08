@@ -648,3 +648,19 @@ body[data-mode="ambient"] #orb-canvas-3d { mix-blend-mode: normal; }
    ignores layered-window colour keying). A second CSS mask only shrank the orb
    inside that circle and left a dark ring. */
 body[data-mode="ambient"] #orb-canvas-3d { mix-blend-mode: normal; }
+
+/* Mute is a secondary control: present, unobtrusive, never the way in. */
+.mute-btn {
+  background: transparent;
+  border: 1px solid var(--hud-line-soft);
+  color: var(--hud-muted);
+  font-family: var(--hud-mono);
+  font-size: 9px;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  padding: 3px 10px;
+  cursor: pointer;
+  transition: color .15s ease, border-color .15s ease;
+}
+.mute-btn:hover { color: var(--hud-cyan); border-color: var(--hud-line); }
+.mute-btn.muted { color: var(--hud-amber); border-color: rgba(255,179,92,.4); }

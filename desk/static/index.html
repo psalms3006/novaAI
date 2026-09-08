@@ -129,9 +129,13 @@
           </div>
           <div class="stage-state"><span class="orb-label" id="orb-label">Ready</span></div>
 
+          <!-- Voice is not a mode you enter: the mic is hot once NOVA has
+               initialised. This is a status line plus a secondary mute, never
+               a "press to talk" control. -->
           <div class="voice-cta">
-            <button id="btn-mic" title="Talk to NOVA" aria-label="Talk to NOVA">&#127908;</button>
-            <span id="voice-cta-label">Speak &mdash; NOVA is listening</span>
+            <span id="voice-cta-label">Initialising&hellip;</span>
+            <button id="btn-mute" class="mute-btn" title="Mute microphone"
+                    aria-label="Mute microphone" aria-pressed="false">Mute</button>
           </div>
 
           <div class="live-transcript" id="live-transcript">

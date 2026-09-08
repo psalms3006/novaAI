@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import numpy as np
+
+import nova_voice
 import sounddevice as sd
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -284,17 +286,19 @@ class NOVALive:
             _diag("MIC", "🔴 ABORT: out_queue is None — cannot start mic capture")
             raise RuntimeError("out_queue not initialized")
 
-        _silence_chunk: bytes = bytes(CHUNK_SIZE * 2)  # 16-bit = 2 bytes/sample
         _cb_count = {"n": 0, "dropped": 0}
         _rms_window = {"sum": 0.0, "n": 0, "max": 0.0}
-        # Barge-in detection: sustained speech while NOVA is talking.
-        _BARGE_IN_RMS    = 350.0     # int16 RMS above this counts as "speech"
-        _BARGE_IN_CHUNKS = 2         # consecutive loud chunks before interrupting
-        _speech_runs = {"n": 0}
 
         def _request_barge_in() -> None:
             if self._loop is not None:
                 self._loop.call_soon_threadsafe(self._barge_in)
+
+        # Listening policy lives in nova_voice so the terminal and the desktop
+        # cannot drift apart. The thresholds below are the ones this file used
+        # to define inline; they now have one home.
+        self._gate = nova_voice.VoiceGate(
+            chunk_samples=CHUNK_SIZE, on_barge_in=_request_barge_in,
+        )
 
         def _callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
             _cb_count["n"] += 1
@@ -304,40 +308,21 @@ class NOVALive:
                 _diag("MIC", f"⚠️ PortAudio status flag on callback #{_cb_count['n']}: {status} "
                               f"(input_overflow means chunks were dropped by the OS before we ever saw them)")
 
-            with self._speaking_lock:
-                speaking = self._is_speaking
-                too_soon = (time.time() - self._last_speak_end) < 0.25
+            # nova_voice.VoiceGate decides what actually goes on the wire.
+            payload = self._gate.process(np.asarray(indata).reshape(-1))
+            data = {"data": payload, "mime_type": "audio/pcm;rate=16000"}
+            speaking = self._gate.speaking
 
-            if speaking or too_soon:
-                # NOVA is talking. Mute by default, BUT keep an ear out: if the user
-                # starts speaking over NOVA, barge in (stop playback + send real audio
-                # so Gemini cuts off its own output too).
-                rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
-                if rms > _BARGE_IN_RMS:
-                    _speech_runs["n"] += 1
-                    if _speech_runs["n"] >= _BARGE_IN_CHUNKS:
-                        _speech_runs["n"] = 0
-                        _request_barge_in()
-                        speaking = False
-                        self._diag_mic_chunks_sent += 1
-                        data = {"data": indata.tobytes(), "mime_type": "audio/pcm;rate=16000"}
-                    else:
-                        self._diag_mic_chunks_muted += 1
-                        data = {"data": _silence_chunk, "mime_type": "audio/pcm;rate=16000"}
-                else:
-                    _speech_runs["n"] = 0
-                    self._diag_mic_chunks_muted += 1
-                    # Send silence to keep Gemini WS alive (prevents 1011 keepalive timeout)
-                    data = {"data": _silence_chunk, "mime_type": "audio/pcm;rate=16000"}
-            else:
+            # Keep the signal diagnostics that made mic problems debuggable:
+            # they report on the audio actually being transmitted.
+            if not speaking:
                 self._diag_mic_chunks_sent += 1
-                data = {"data": indata.tobytes(), "mime_type": "audio/pcm;rate=16000"}
-                # RMS of the REAL (non-muted) samples actually being sent — tests
-                # whether the mic is capturing usable signal at all.
                 rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
                 _rms_window["sum"] += rms
                 _rms_window["n"] += 1
                 _rms_window["max"] = max(_rms_window["max"], rms)
+            else:
+                self._diag_mic_chunks_muted += 1
 
             if _cb_count["n"] == 1:
                 _diag("MIC", f"first callback fired — frames={frames}, dtype={indata.dtype}, "

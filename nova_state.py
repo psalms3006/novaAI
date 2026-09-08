@@ -19,3 +19,6 @@ _rest_backoff_secs: float = 0.0
 _mcp_bridge: Optional[Any] = None  # nova_mcp.bridge.MCPBridge instance, set in main()
 _living_memory: Optional[Any] = None  # living_memory.LivingMemory, set in main()
 _task_manager: Optional[Any] = None   # task_manager.TaskManager, set in main()
+
+# Heartbeat instance, so any surface can ask for missed notices.
+_heartbeat = None

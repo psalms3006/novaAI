@@ -281,16 +281,29 @@ function liveConnect() {
 function handleLiveEvent(ev) {
   switch (ev.type) {
     case "state":
-      if (ev.state === "connected" || ev.state === "streaming") {
+      // NOVA Core owns the voice state; this surface only reflects it.
+      if (window.novaSetVoiceLabel) window.novaSetVoiceLabel(ev.state);
+      if (ev.state === "connected" || ev.state === "streaming" || ev.state === "listening") {
         setOrb("listening");
         state.listening = true;
+      } else if (ev.state === "speaking") {
+        setOrb("speaking");
+        state.listening = true;      // mic stays hot while NOVA talks (barge-in)
+      } else if (ev.state === "connecting") {
+        setOrb("thinking");
       } else if (ev.state === "error") {
         setOrb("error");
         state.listening = false;
+      } else if (ev.state === "muted") {
+        setOrb("idle");
       } else {
         setOrb("idle");
         state.listening = false;
       }
+      break;
+    case "audio_level":
+      window.__novaAudioLevel = ev.level || 0;
+      if (orb && orb.setAmplitude) orb.setAmplitude(ev.level || 0);
       break;
     case "user_transcript":
       addTranscript(ev.text, "user");
@@ -299,7 +312,13 @@ function handleLiveEvent(ev) {
       addTranscript(ev.text, "nova");
       break;
     case "audio":
-      playAudioChunk(ev.data_b64);
+      // NOVA Core owns playback (server-side sounddevice). If this ever fires
+      // again it means two surfaces would speak at once, so ignore it.
+      break;
+    case "audio_level":
+      // Amplitude only — the orb visualises what Core is actually playing.
+      window.__novaAudioLevel = ev.level || 0;
+      if (orb && orb.setAmplitude) orb.setAmplitude(ev.level || 0);
       break;
   }
 }
@@ -941,48 +960,45 @@ if (sendBtn) {
   });
 }
 
-// Primary voice control. NOVA is voice-first, so this is the main affordance
-// on the stage; #btn-voice is kept for compatibility but hidden by the HUD.
-const micBtn = $("btn-mic");
+// Voice is continuous. NOVA Core owns the session and the mic is hot from the
+// moment initialisation completes — nothing here starts or stops listening for
+// a turn. The only control is mute, which is secondary by design.
+const muteBtn = $("btn-mute");
 const micLabel = $("voice-cta-label");
 
-function _setMicUI(live) {
-  if (micBtn) micBtn.classList.toggle("live", !!live);
-  if (micLabel) {
-    micLabel.textContent = live
-      ? "Listening — just talk"
-      : "Tap to talk, or type below";
+const VOICE_LABEL = {
+  connecting: "Connecting…",
+  connected: "Listening — just talk",
+  streaming: "Listening — just talk",
+  listening: "Listening — just talk",
+  speaking: "NOVA is speaking",
+  thinking: "Thinking…",
+  muted: "Microphone muted",
+  error: "Voice unavailable",
+  closed: "Voice offline",
+};
+
+function setVoiceLabel(state) {
+  if (micLabel) micLabel.textContent = VOICE_LABEL[state] || "Listening — just talk";
+}
+window.novaSetVoiceLabel = setVoiceLabel;
+
+async function toggleMute() {
+  try {
+    const r = await api_json("/api/live/mute", { method: "POST", body: "{}" });
+    const muted = !!r.muted;
+    if (muteBtn) {
+      muteBtn.classList.toggle("muted", muted);
+      muteBtn.setAttribute("aria-pressed", String(muted));
+      muteBtn.textContent = muted ? "Unmute" : "Mute";
+    }
+    setVoiceLabel(muted ? "muted" : "listening");
+    if (window.hudLog) window.hudLog(muted ? "microphone muted" : "microphone live", muted ? "" : "ok");
+  } catch (e) {
+    toast("Could not change microphone state");
   }
 }
-
-async function toggleVoice() {
-  if (state.listening) {
-    await liveDisconnect();
-    _setMicUI(false);
-    setOrb("idle");
-    if (window.hudLog) window.hudLog("voice session stopped", "");
-    return;
-  }
-  setOrb("thinking");
-  if (window.hudLog) window.hudLog("opening voice session...", "");
-  const ok = await liveStart();
-  if (ok) {
-    state.voiceMode = true;
-    state.liveEngine = "live";
-    _setMicUI(true);
-    setOrb("listening");
-    if (window.hudLog) window.hudLog("voice session live", "ok");
-  } else {
-    _setMicUI(false);
-    setOrb("error");
-    toast("Voice unavailable — check the Gemini key and microphone");
-    if (window.hudLog) window.hudLog("voice session failed to start", "bad");
-    setTimeout(() => setOrb("idle"), 2500);
-  }
-}
-
-if (micBtn) micBtn.addEventListener("click", toggleVoice);
-window.novaToggleVoice = toggleVoice;
+if (muteBtn) muteBtn.addEventListener("click", toggleMute);
 
 // Voice button (legacy control, hidden in the HUD layout)
 const voiceBtn = $("btn-voice");

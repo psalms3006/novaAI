@@ -23,6 +23,8 @@ from typing import Any
 
 import numpy as np
 
+import nova_voice
+
 try:
     import sounddevice as sd
     HAS_SD = True
@@ -151,6 +153,22 @@ class LiveManager:
         self._audio_bytes_in: int = 0
         self._has_greeted: bool = False
 
+        # One shared voice policy — identical rules to the terminal path.
+        self._gate = nova_voice.VoiceGate(
+            chunk_samples=1024, on_barge_in=self._barge_in,
+        )
+        # NOVA Core owns playback. The UI surfaces receive amplitude/state and
+        # only visualise it, so the fullscreen window and the ambient orb can
+        # never play the same audio twice.
+        self._play_q: queue.Queue = queue.Queue(maxsize=200)
+        self._play_thread: threading.Thread | None = None
+        self._play_stop = threading.Event()
+        self._turn_done_flag = False
+        # Set on barge-in. Without it, each newly arriving audio chunk
+        # re-armed 'speaking', the echo tripped the detector again, and
+        # NOVA interrupted herself in a loop several times a second.
+        self._interrupted_turn = False
+
     # ── public API ────────────────────────────────────────────────────────
 
     def start(self) -> dict:
@@ -241,14 +259,117 @@ class LiveManager:
 
     # ── mic ───────────────────────────────────────────────────────────────
 
+    # ── playback (Core-owned) ─────────────────────────────────────────────
+
+    def _start_playback(self) -> None:
+        if self._play_thread is not None or not HAS_SD:
+            return
+        self._play_stop.clear()
+
+        def _worker():
+            try:
+                stream = sd.RawOutputStream(
+                    samplerate=nova_voice.RECEIVE_RATE,
+                    channels=nova_voice.CHANNELS,
+                    dtype="int16",
+                    blocksize=4096,
+                    latency="low",
+                )
+                stream.start()
+            except Exception as e:
+                _log("[LIVE] speaker open failed: %s", e)
+                return
+            _log("[LIVE] speaker ready (%d Hz)", nova_voice.RECEIVE_RATE)
+            try:
+                while not self._play_stop.is_set():
+                    try:
+                        chunk = self._play_q.get(timeout=0.2)
+                    except queue.Empty:
+                        # Queue drained and the model finished its turn: NOVA
+                        # has stopped talking, so reopen the mic.
+                        if self._gate.speaking and self._turn_done_flag:
+                            self._gate.set_speaking(False)
+                            self._turn_done_flag = False
+                            self._publish(LiveEvent("state", state="listening"))
+                        continue
+                    if chunk is None:
+                        break
+                    try:
+                        stream.write(chunk)
+                    except Exception as e:
+                        _log("[LIVE] speaker write failed: %s", e)
+            finally:
+                try:
+                    stream.stop(); stream.close()
+                except Exception:
+                    pass
+
+        self._play_thread = threading.Thread(target=_worker, name="nova-speaker", daemon=True)
+        self._play_thread.start()
+
+    def _stop_playback(self) -> None:
+        self._play_stop.set()
+        try:
+            self._play_q.put_nowait(None)
+        except Exception:
+            pass
+        self._play_thread = None
+
+    def _enqueue_audio(self, audio: bytes) -> None:
+        """Play a chunk and tell the surfaces how loud it is."""
+        if self._interrupted_turn:
+            # The user cut in. Discard the rest of this turn instead of
+            # resuming playback and immediately re-triggering the detector.
+            return
+        self._gate.set_speaking(True)
+        try:
+            self._play_q.put_nowait(audio)
+        except queue.Full:
+            pass
+        # Amplitude drives the orb on every surface. Cheap: one pass over a
+        # decimated view, not the whole buffer.
+        try:
+            samples = np.frombuffer(audio, dtype=np.int16)[::16]
+            level = float(np.abs(samples).max()) / 32768.0 if samples.size else 0.0
+        except Exception:
+            level = 0.0
+        self._publish(LiveEvent("audio_level", level=round(level, 4)))
+
+    def _barge_in(self) -> None:
+        """User spoke over NOVA — stop immediately and stay stopped."""
+        self._interrupted_turn = True
+        # Clear speaking here too, not just in VoiceGate.process. "Stop
+        # talking" has to be self-sufficient: any caller of _barge_in should
+        # leave NOVA genuinely stopped, not rely on the detector having
+        # already done half the work.
+        self._gate.set_speaking(False)
+        dropped = nova_voice.drain(self._play_q)
+        _log("[LIVE] barge-in — dropped %d queued chunks", dropped)
+        self._publish(LiveEvent("interrupted", reason="barge_in"))
+        self._publish(LiveEvent("state", state="listening"))
+
+    def set_muted(self, value: bool) -> dict:
+        self._gate.set_muted(bool(value))
+        self._publish(LiveEvent("state", state="muted" if value else "listening"))
+        return {"ok": True, "muted": self._gate.muted}
+
+    @property
+    def muted(self) -> bool:
+        return self._gate.muted
+
     def _start_mic(self) -> None:
         if not HAS_SD or self._mic_active:
             return
 
         def _cb(indata, frames, time_info, status):
+            # Every rule about what reaches the model lives in nova_voice:
+            # mute-while-speaking, silence keepalive, barge-in detection.
             try:
-                self._mic_queue.put_nowait(bytes(indata))
+                payload = self._gate.process(np.asarray(indata).reshape(-1))
+                self._mic_queue.put_nowait(payload)
             except queue.Full:
+                pass
+            except Exception:
                 pass
 
         try:
@@ -362,6 +483,7 @@ class LiveManager:
                     self._publish(LiveEvent("state", state="connected", connect_time_s=round(dt, 2)))
 
                     self._start_mic()
+                    self._start_playback()
 
                     # Greet once per session, not on every reconnect. The Live
                     # socket drops on keepalive timeout roughly every minute of
@@ -387,6 +509,7 @@ class LiveManager:
                 self._publish(LiveEvent("state", state="error", error=str(e)))
             finally:
                 self._stop_mic()
+                self._stop_playback()
                 self._session = None
 
             # Reconnect on transient drops (keepalive timeout, network blip, 5xx)
@@ -417,22 +540,43 @@ class LiveManager:
             await asyncio.sleep(delay)
 
     async def _send_greeting(self, session: Any) -> None:
-        """Send a proactive greeting after connecting, like the terminal does."""
-        await asyncio.sleep(0.5)  # let receiver start consuming first
-        meta = _load_meta()
-        user_name = (meta.get("user_name") or "").strip()
-        name_part = user_name if user_name else "there"
-        prompt = (
-            f"The user just opened this desktop session. Greet {name_part} right now, out loud, "
-            "in 1-2 short spoken sentences — warm, natural, helpful. "
-            "Vary your phrasing. End by asking what you can help with. "
-            "Do not wait for them to speak first. Speak immediately."
-        )
+        """Say something worth saying — or just say hello.
+
+        The greeting is NOVA Core's, not the session's. Core is asked whether it
+        has anything genuinely worth surfacing (missed notices, system events);
+        if it does, that becomes the opening line, otherwise NOVA gives a short
+        natural greeting. Either way she then goes straight back to listening.
+        """
+        await asyncio.sleep(0.5)  # let the receiver start consuming first
+
+        surfaced = ""
+        try:
+            import nova_core_voice
+            surfaced = nova_core_voice.opening_line(_load_meta()) or ""
+        except Exception as e:
+            _log("[LIVE] opening line unavailable: %s", e)
+
+        if surfaced:
+            prompt = (
+                "You have just come online and you have something worth telling the "
+                f"user right now. Say it out loud, naturally, in one or two short "
+                f"sentences, then ask what they need. Here is what to convey:\n\n{surfaced}"
+            )
+        else:
+            meta = _load_meta()
+            name = (meta.get("user_name") or "").strip() or "there"
+            prompt = (
+                f"The user just opened this session. Greet {name} right now, out loud, "
+                "in 1-2 short spoken sentences — warm, a little informal, varying your "
+                "phrasing rather than reusing a stock line. End by asking what they need. "
+                "Do not wait for them to speak first."
+            )
+
         try:
             await session.send_client_content(
                 turns={"role": "user", "parts": [{"text": prompt}]}, turn_complete=True
             )
-            _log("[LIVE] greeting sent")
+            _log("[LIVE] opening sent (%s)", "proactive" if surfaced else "greeting")
         except Exception as e:
             _log("[LIVE] greeting failed: %s", e)
 
@@ -467,11 +611,15 @@ class LiveManager:
                         inline = getattr(part, "inline_data", None)
                         if inline is not None and getattr(inline, "data", None):
                             audio = inline.data
-                            b64 = base64.b64encode(audio).decode("ascii")
                             self._audio_bytes_out += len(audio)
                             if self._t_first_audio == 0.0:
                                 self._t_first_audio = time.time()
-                            self._publish(LiveEvent("audio", data_b64=b64, size=len(audio)))
+                            # NOVA Core owns playback. Previously the raw PCM
+                            # was shipped to the browser, which meant any
+                            # surface with the page open played it — with the
+                            # fullscreen window and the ambient orb both open
+                            # that is the same audio twice.
+                            self._enqueue_audio(audio)
 
                 if sc.input_transcription and sc.input_transcription.text:
                     text = sc.input_transcription.text.strip()
@@ -484,10 +632,13 @@ class LiveManager:
                         self._publish(LiveEvent("nova_transcript", text=text))
 
                 if sc.interrupted:
+                    self._interrupted_turn = False   # model acknowledged; new turn follows
                     self._publish(LiveEvent("interrupted"))
                     self._turn_count += 1
 
                 if sc.turn_complete:
+                    self._turn_done_flag = True
+                    self._interrupted_turn = False   # next turn may speak again
                     self._turn_count += 1
                     self._publish(LiveEvent("turn_complete", turn_count=self._turn_count))
 

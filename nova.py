@@ -1756,6 +1756,52 @@ def _run_desk_server_lazy(meta):
 
 run_desk_server = _run_desk_server_lazy
 
+def _start_ambient_intelligence(meta: dict):
+    """Start ProactiveAgent + Heartbeat and route their speech into NOVA's voice.
+
+    Both were previously terminal-only. They speak through the live voice
+    session when one exists, so a notice is heard on whichever surface the user
+    is looking at; when voice is unavailable the text still reaches the UI event
+    bus rather than being dropped.
+    """
+    global _proactive
+
+    def _speak(text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        try:
+            from desk import live_session as _live
+            mgr = _live.get_live_manager()
+            if mgr.status().get("state") in ("connected", "streaming"):
+                mgr.send_text(text)
+                return
+        except Exception:
+            pass
+        try:
+            import desk.bridge as _br
+            _br.publish_transcript(text, "nova")
+        except Exception:
+            log.info("[PROACTIVE] %s", text)
+
+    try:
+        _proactive = ProactiveAgent(speak_fn=_speak, meta=meta, planner=nova_state._planner)
+        _proactive.start()
+        log.info("[DESK] proactive agent started")
+    except Exception as e:
+        log.warning("Proactive agent failed to start: %s", e)
+
+    try:
+        from nova_heartbeat import Heartbeat
+        hb = Heartbeat(speak_fn=_speak, meta=meta, planner=nova_state._planner)
+        hb.start()
+        nova_state._heartbeat = hb
+        log.info("[DESK] heartbeat started (quiet hours respected)")
+    except Exception as e:
+        nova_state._heartbeat = None
+        log.warning("Heartbeat failed to start: %s", e)
+
+
 def main() -> None:
     global _TOOL_AVAILABILITY, _proactive, _nova_memory, _nova_router
 
@@ -2045,6 +2091,12 @@ def main() -> None:
 
     if DESK_MODE:
         print("🖥  NOVA Desktop mode — local embedded backend + WebView2 window.")
+        # There is one NOVA. The desktop used to return here, before the
+        # proactive agent and heartbeat were ever created, so the desktop had
+        # no unprompted notices, no quiet hours and no missed-notice catch-up
+        # while the terminal had all three. Start them for both, speaking
+        # through whatever surface is live.
+        _start_ambient_intelligence(meta)
         run_desk_server(meta)
         return
 

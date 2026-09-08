@@ -951,6 +951,22 @@ def api_live_stop():
     return jsonify(r)
 
 
+@app.post("/api/live/mute")
+@require_token
+def api_live_mute():
+    """Mute/unmute the microphone.
+
+    A secondary control, not the way NOVA is operated: the mic is hot from the
+    moment initialisation finishes and stays that way. Default is unmuted and
+    mute is not persisted across restarts.
+    """
+    data = request.get_json(silent=True) or {}
+    mgr = desk_live.get_live_manager()
+    if "muted" in data:
+        return jsonify(mgr.set_muted(bool(data.get("muted"))))
+    return jsonify(mgr.set_muted(not mgr.muted))
+
+
 @app.get("/api/live/status")
 @require_token
 def api_live_status():
