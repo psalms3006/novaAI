@@ -16,6 +16,7 @@ import threading
 import time
 from typing import Any, Dict, List, Tuple
 
+from . import trace as desk_trace
 import nova as _nova
 
 log = _nova.log
@@ -276,6 +277,7 @@ def run_turn(
       {"type":"error","message":...}
     """
     started = time.time()
+    desk_trace.mark("turn_start", msgs=len(messages))
     import uuid as _uuid
     task_id = str(_uuid.uuid4())[:8]
 
@@ -302,7 +304,9 @@ def run_turn(
 
     # 1. First model round (streaming preferred, full-response fallback)
     followup_msgs = list(messages)
+    desk_trace.mark("first_round_start")
     r_text, tool_calls, tokens = _first_round(followup_msgs, stop_event, streaming)
+    desk_trace.mark("first_round_done", chars=len(r_text or ""), tools=len(tool_calls or []), token_events=len(tokens or []))
     for t in tokens:
         yield t
         # Publish progress for thinking agent while streaming tokens
@@ -556,12 +560,14 @@ def _router_round(router, messages, use_tools, stop_event=None, streaming=True):
     # Round with tools: non-streaming (need full response for tool calls)
     if use_tools:
         try:
+            desk_trace.mark("model_call_start", mode="complete", tools=True)
             result = router.complete(
                 messages=router_msgs,
                 system=system,
                 tools=TOOL_DECLARATIONS,
                 require_tools=True,
             )
+            desk_trace.mark("model_call_done", provider=result.provider, model=result.model, model_ms=int(result.latency_ms), chars=len(result.text or ""), tool_calls=len(result.tool_calls or []), err=(result.error or "")[:60])
             # Emit any text as tokens so the UI shows it
             tokens = []
             if result.text:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -23,6 +24,9 @@ OLLAMA_DEFAULT_URL = "http://localhost:11434"
 
 class OllamaProvider:
     """Ollama local inference provider."""
+
+    #: How long an availability probe stays valid (seconds).
+    AVAIL_TTL_S = 60.0
 
     #: Inference runs on this machine — the router uses this for network-aware
     #: routing rather than matching on the provider's name.
@@ -51,6 +55,10 @@ class OllamaProvider:
         )
         self._last_check_time = 0.0
         self._last_check_result = False
+        self._avail_check_time = 0.0
+        self._avail_check_result = False
+        self._avail_lock = threading.Lock()
+        self._avail_refreshing = False
 
     @property
     def name(self) -> str:
@@ -71,6 +79,7 @@ class OllamaProvider:
     @model.setter
     def model(self, value: str) -> None:
         self._model = value
+        self._invalidate_availability()
 
     def is_running(self) -> bool:
         """Is the Ollama process reachable? Uses 5s cache to avoid repeated timeouts."""
@@ -86,17 +95,62 @@ class OllamaProvider:
         return self._last_check_result
 
     def is_available(self) -> bool:
-        """Quick check: is Ollama running and does it have the model?"""
-        if not self.is_running():
-            return False
-        try:
-            r = requests.get(f"{self._base_url}/api/tags", timeout=3)
-            if r.status_code != 200:
-                return False
-            models = [m.get("name", "") for m in r.json().get("models", [])]
-            return any(self._model in m for m in models)
-        except Exception:
-            return False
+        """Is Ollama running and does it have the model? Cached.
+
+        The router calls this on every provider for every request. Uncached,
+        the extra /api/tags round trip cost 2-4 s of pure pre-flight latency
+        per chat turn on a machine with models installed — more than the model
+        call itself for a short prompt. The installed-model set changes rarely,
+        so a short TTL is safe; downloads/removals invalidate it explicitly.
+        """
+        now = time.time()
+        fresh = (now - self._avail_check_time) < self.AVAIL_TTL_S
+
+        if self._avail_check_time == 0.0:
+            # Never probed: this one has to block, but only once per process.
+            self._probe_availability()
+            return self._avail_check_result
+
+        if not fresh:
+            # Serve the last known answer immediately and refresh behind the
+            # request. A stale answer only affects ranking order for one turn —
+            # a provider that has actually gone away still fails over — whereas
+            # blocking here put a 2-4 s probe on the critical path of a chat
+            # turn every time the TTL happened to lapse between messages.
+            self._refresh_availability_async()
+        return self._avail_check_result
+
+    def _probe_availability(self) -> bool:
+        result = False
+        if self.is_running():
+            try:
+                r = requests.get(f"{self._base_url}/api/tags", timeout=3)
+                if r.status_code == 200:
+                    models = [m.get("name", "") for m in r.json().get("models", [])]
+                    result = any(self._model in m for m in models)
+            except Exception:
+                result = False
+        self._avail_check_result = result
+        self._avail_check_time = time.time()
+        return result
+
+    def _refresh_availability_async(self) -> None:
+        with self._avail_lock:
+            if self._avail_refreshing:
+                return
+            self._avail_refreshing = True
+
+        def _run():
+            try:
+                self._probe_availability()
+            finally:
+                with self._avail_lock:
+                    self._avail_refreshing = False
+
+        threading.Thread(target=_run, name="ollama-avail", daemon=True).start()
+
+    def _invalidate_availability(self) -> None:
+        self._avail_check_time = 0.0
 
     def list_models(self) -> List[Dict[str, Any]]:
         """List all locally installed Ollama models."""
@@ -251,6 +305,7 @@ class OllamaProvider:
                     except json.JSONDecodeError:
                         pass
             log.info("[OLLAMA] model %s downloaded", model_name)
+            self._invalidate_availability()
             return True
         except Exception as e:
             log.error("[OLLAMA] download failed: %s", e)
@@ -263,6 +318,7 @@ class OllamaProvider:
                 json={"name": model_name},
                 timeout=10,
             )
+            self._invalidate_availability()
             return r.status_code == 200
         except Exception:
             return False

@@ -41,6 +41,7 @@ from . import confirm as desk_confirm
 from . import projects as desk_projects
 from . import settings as desk_settings
 from . import store as desk_store
+from . import trace as desk_trace
 from . import voice as desk_voice
 from . import live_session as desk_live
 
@@ -215,13 +216,19 @@ def _system_prompt(query: str, meta: dict, cid: str | None = None) -> str:
 
 def _persist_turn(cid: str, user_text: str, events: list, started: float):
     """Save the assistant message + tool meta; set an automatic title."""
-    assistant_parts = []
+    # The turn emits streamed "token" events AND a final "assistant" event that
+    # already carries the complete text. Concatenating both stored every reply
+    # twice ("ALPHA" -> "ALPHAALPHA"), which is what the conversation history
+    # then replayed back to the user. The assistant event is authoritative;
+    # tokens are only a fallback for a turn that never emitted one.
+    streamed_parts = []
+    final_text = None
     tools = []
     for ev in events:
         if ev.get("type") == "token":
-            assistant_parts.append(ev.get("text", ""))
+            streamed_parts.append(ev.get("text", ""))
         elif ev.get("type") == "assistant":
-            assistant_parts.append(ev.get("text", ""))
+            final_text = ev.get("text", "")
         elif ev.get("type") == "tool_start":
             tools.append({
                 "name": ev.get("name"), "label": ev.get("label"),
@@ -230,7 +237,7 @@ def _persist_turn(cid: str, user_text: str, events: list, started: float):
         elif ev.get("type") == "tool_done":
             if tools:
                 tools[-1].update({"ok": bool(ev.get("ok")), "summary": ev.get("summary", "")})
-    content = "".join(assistant_parts).strip()
+    content = (final_text if final_text is not None else "".join(streamed_parts)).strip()
     mid = desk_store.upsert_last_assistant(cid, content, {"tools": tools, "latency": round(time.time() - started, 2)})
     convo = desk_store.get_conversation(cid)
     if convo and convo["title"] in ("New chat", ""):
@@ -590,7 +597,13 @@ def _run_chat(cid, message, image_path, streaming):
     meta = _meta_dict()
     msgs = [{"role": "system", "content": _system_prompt(message, meta, cid)}]
     msgs += _history_messages(cid, int(desk_settings.get("history_turns", 10)))
-    msgs.append({"role": "user", "content": message})
+    # api_chat() already stored this user message before calling us, so
+    # _history_messages() above has just returned it. Appending it again
+    # sent every prompt to the model TWICE — which inflated context on
+    # every turn and made the model echo itself ("ALPHA" -> "ALPHAALPHA").
+    if not (msgs and msgs[-1].get("role") == "user"
+            and (msgs[-1].get("content") or "").strip() == (message or "").strip()):
+        msgs.append({"role": "user", "content": message})
     ev = stop_event(cid)
     ev.clear()
     return desk_chat.run_turn(msgs, meta, image_path=image_path or "",
@@ -619,13 +632,24 @@ def api_chat():
     events_accum: list = []
     started = time.time()
 
+    rid = desk_trace.start(f"chat cid={cid[:8]} streaming={streaming_on} chars={len(message)}")
+    desk_trace.mark("http_receive")
+
     # Publish orb state: thinking when chat starts
     publish_event({"type": "orb_state", "state": "thinking", "ts": time.time()})
 
     def event_gen():
+        first_emit = True
         try:
+            # Hand the request id to the browser so a UI trace can be
+            # correlated with server-side stage timings for the same turn.
+            yield 'data: ' + json.dumps({'type': 'meta', 'rid': rid}) + '\n\n'
+
             for ev in _run_chat(cid, message, image_path, streaming_on):
                 events_accum.append(ev)
+                if first_emit:
+                    desk_trace.mark("first_event_emitted", type=ev.get("type"))
+                    first_emit = False
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 # Update orb state based on events
                 if ev.get("type") == "tool_start":
@@ -642,8 +666,11 @@ def api_chat():
         finally:
             # Return orb to idle
             publish_event({"type": "orb_state", "state": "idle", "ts": time.time()})
+            desk_trace.mark("stream_end", events=len(events_accum))
             if message or image_path:
                 _persist_turn(cid, message, events_accum, started)
+            desk_trace.mark("persisted")
+            log.info("[TRACE %s] SUMMARY %s", rid, desk_trace.summary())
 
     resp = Response(event_gen(), mimetype="text/event-stream")
     resp.headers["Cache-Control"] = "no-cache"
