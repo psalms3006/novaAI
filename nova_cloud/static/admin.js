@@ -164,6 +164,7 @@
           card("New (7d)", m.users_new_7d),
           card("Active (24h)", m.users_active_24h),
           card("Active (7d)", m.users_active_7d),
+          card("Suspended", m.users_suspended),
           card("Disabled", m.users_disabled)
         ]),
         el("div", { class: "section-title", text: "Devices and sessions" }),
@@ -254,6 +255,10 @@
 
       var actions = el("div", { class: "actions" });
       if (can("users.disable") && u.status === "active") {
+        actions.appendChild(el("button", { class: "ghost", text: "Suspend account",
+          onclick: function () { confirmThen("Suspend " + u.email + "? They will be signed out until reactivated.",
+            function () { return api("/users/" + u.id + "/status", { method: "POST", body: { status: "suspended" } }); },
+            function () { render({ userId: u.id }); }); } }));
         actions.appendChild(el("button", { class: "danger", text: "Disable account",
           onclick: function () { confirmThen("Disable " + u.email + "? They will be signed out on every device.",
             function () { return api("/users/" + u.id + "/status", { method: "POST", body: { status: "disabled" } }); },

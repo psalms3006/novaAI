@@ -25,6 +25,7 @@ from sqlalchemy import select
 
 from . import security as sec
 from .db import RateLimited, rate_limit, session_scope
+from . import mailer as mail
 from .models import (
     AuthSession, Device, EmailToken, Profile, User, UserStatus, now,
 )
@@ -119,6 +120,80 @@ def _register_device(s, user: User, body: dict) -> tuple[Device, str]:
     return dev, "reconnected"
 
 
+def _issue_email_token(s, user_id: str, kind: str, ttl_s: int) -> str:
+    """Mint a single-use email token and store only its hash."""
+    token = sec.new_opaque_token(24)
+    s.add(EmailToken(user_id=user_id, kind=kind,
+                     token_hash=sec.token_hash(token),
+                     expires_at=now() + ttl_s))
+    return token
+
+
+def _delivery_state(mc) -> dict:
+    """What the server can honestly say about email delivery.
+
+    Deliberately independent of whether any particular account exists, so it
+    can be returned on every response without turning the reset endpoint into
+    an account-existence oracle.
+    """
+    return {"email_configured": bool(mc.configured),
+            "email_provider": mc.cfg.provider if mc.configured else "none"}
+
+
+def _sent_state(mc) -> dict:
+    """Delivery state including whether *this* message went out.
+
+    Only safe on endpoints where the caller already knows the account exists.
+    Never use it on password reset: there, a `sent` flag that is true for real
+    addresses and false for unknown ones is an account-existence oracle.
+    """
+    return {**_delivery_state(mc), "sent": False}
+
+
+def _deliver(mc, address: str, template, token: str, kind: str,
+             wrap_key: str | None = "email_delivery") -> dict:
+    """Send one account email and report truthfully what happened.
+
+    When nothing is configured NOVA does not pretend: no "check your inbox",
+    and outside production the token is handed back so a developer can finish
+    the flow. That fallback is refused in production even if someone sets
+    NOVA_ENV wrongly, because it is gated on the provider being absent *and*
+    the environment not being production.
+    """
+    cfg = current_app.config["NOVA_CFG"]
+    state = _delivery_state(mc)
+    if mc.configured:
+        try:
+            subject, text, html_body = template(mc.cfg, token)
+            mc.send(address, subject, text, html_body, kind=kind)
+            state["sent"] = True
+        except Exception:
+            # Queued delivery already retries; a failure here means the message
+            # never even got queued.
+            state["sent"] = False
+            state["error"] = "delivery_unavailable"
+    else:
+        state["sent"] = False
+        if not cfg.is_production:
+            state["dev_token"] = token
+    return {wrap_key: state} if wrap_key else state
+
+
+def _notify_new_device(address: str, device) -> None:
+    """Security notice for a first sign-in on an unfamiliar device."""
+    mc = mail.mailer()
+    if not mc.configured:
+        return
+    try:
+        when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+        subject, text, html_body = mail.new_device_email(
+            mc.cfg, device.name, device.platform, when)
+        mc.send(address, subject, text, html_body, kind="new_device")
+    except Exception:
+        # A security notice failing must never fail the sign-in itself.
+        pass
+
+
 @bp.post("/signup")
 def signup():
     body = request.get_json(silent=True) or {}
@@ -178,16 +253,19 @@ def signup():
             "device": {"id": device.id, "name": device.name},
             **tokens,
         }
-        if cfg.require_email_verification:
-            token = sec.new_opaque_token(24)
-            s.add(EmailToken(user_id=user.id, kind="verify_email",
-                             token_hash=sec.token_hash(token),
-                             expires_at=now() + 86400))
-            # Delivery is the deployment's job. Surfaced here only outside
-            # production so a developer can complete the flow without a mail
-            # server; never returned from a production deployment.
-            if not cfg.is_production:
-                payload["dev_verification_token"] = token
+        # Verification is offered whenever email is configured, not only when
+        # it is mandatory: an unverified account should still be able to prove
+        # its address.
+        mc = mail.mailer()
+        if cfg.require_email_verification or mc.configured:
+            token = _issue_email_token(s, user.id, "verify_email", 86400)
+            payload.update(_deliver(mc, user.email, mail.verification_email,
+                                    token, "verify_email"))
+        else:
+            # Always say what the server can and cannot do, so a client never
+            # has to guess whether an email is coming.
+            payload["email_delivery"] = _sent_state(mc)
+        payload["verification_required"] = bool(cfg.require_email_verification)
         return jsonify(payload), 201
 
 
@@ -233,6 +311,9 @@ def login():
         if how == "registered":
             record_event(s, "DEVICE_REGISTERED", user_id=user.id,
                          device_id=device.id, platform=device.platform)
+            # Signing in on a machine this account has never used is exactly
+            # the event a user needs to hear about if it was not them.
+            _notify_new_device(user.email, device)
 
         prof = s.get(Profile, user.id)
         return jsonify({
@@ -356,18 +437,31 @@ def forgot_password():
             resp = _fail("Too many requests.", 429, "rate_limited")
             return resp[0], resp[1], {"Retry-After": str(e.retry_after)}
 
+        mc = mail.mailer()
+        cfg = current_app.config["NOVA_CFG"]
         user = s.scalar(select(User).where(User.email == email))
-        out: dict = {"ok": True}
+        # Configuration facts only. Deliberately no per-message outcome: a
+        # `sent` flag here would be true for real addresses and false for
+        # unknown ones, which is exactly the oracle the generic message exists
+        # to prevent.
+        out: dict = {"ok": True, **_delivery_state(mc)}
         if user is not None and user.status == UserStatus.ACTIVE.value:
-            token = sec.new_opaque_token(24)
-            s.add(EmailToken(user_id=user.id, kind="reset_password",
-                             token_hash=sec.token_hash(token),
-                             expires_at=now() + 3600))
-            cfg = current_app.config["NOVA_CFG"]
-            if not cfg.is_production:
+            token = _issue_email_token(s, user.id, "reset_password", 3600)
+            if mc.configured:
+                try:
+                    subject, text, html_body = mail.reset_email(mc.cfg, token)
+                    mc.send(user.email, subject, text, html_body,
+                            kind="reset_password")
+                except Exception:
+                    pass
+            elif not cfg.is_production:
+                # Nothing can be delivered, so hand the token back so a
+                # developer can finish the flow. Refused in production.
                 out["dev_reset_token"] = token
         # Identical response either way: this endpoint must not reveal which
-        # addresses have accounts.
+        # addresses have accounts. The delivery keys added above are the same
+        # regardless, because they describe the server's configuration rather
+        # than whether this particular account exists.
         out["message"] = "If that address has an account, a reset link is on its way."
         return jsonify(out)
 
@@ -424,6 +518,37 @@ def verify_email():
         user.email_verified = True
         record_event(s, "EMAIL_VERIFIED", user_id=user.id)
         return jsonify({"ok": True})
+
+
+@bp.post("/email/resend")
+def resend_verification():
+    """Ask for another verification email.
+
+    Exists because a first attempt can fail for reasons the user cannot see --
+    a provider blip, a typo they have since fixed, or delivery not being
+    configured when they signed up.
+    """
+    from .auth_guard import require_user
+    err = require_user()
+    if err:
+        return err
+    with session_scope() as s:
+        user = s.get(User, g.user_id)
+        if user is None:
+            return _fail("Not signed in.", 401, "unauthorised")
+        if user.email_verified:
+            return jsonify({"ok": True, "already_verified": True})
+        try:
+            rate_limit(s, f"resend:{user.id}", limit=5, window_s=3600)
+        except RateLimited as e:
+            resp = _fail("Too many requests. Try again shortly.", 429,
+                         "rate_limited")
+            return resp[0], resp[1], {"Retry-After": str(e.retry_after)}
+        token = _issue_email_token(s, user.id, "verify_email", 86400)
+        return jsonify({"ok": True,
+                        **_deliver(mail.mailer(), user.email,
+                                   mail.verification_email, token,
+                                   "verify_email")})
 
 
 @bp.get("/me")

@@ -20,7 +20,13 @@ import uuid
 from sqlalchemy import (
     Boolean, Column, Float, ForeignKey, Index, Integer, JSON, String, Text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, relationship
+
+# JSONB on Postgres (indexable, binary, the sensible choice for the platform
+# database); plain JSON everywhere else so SQLite development still works
+# without a second code path.
+JSONCol = JSON().with_variant(JSONB(), "postgresql")
 
 
 class Base(DeclarativeBase):
@@ -39,8 +45,17 @@ def now() -> float:
 
 class UserStatus(str, enum.Enum):
     ACTIVE = "active"
+    # Suspended and disabled both block access. They are distinct so an
+    # operator can tell a temporary hold (billing, review, abuse
+    # investigation) apart from a deliberate shutdown, which matters when
+    # deciding whether to restore an account.
+    SUSPENDED = "suspended"
     DISABLED = "disabled"
     DELETED = "deleted"
+
+    @classmethod
+    def blocks_access(cls, value: str) -> bool:
+        return value != cls.ACTIVE.value
 
 
 class User(Base):
@@ -164,7 +179,7 @@ class Preference(Base):
     user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"),
                      primary_key=True)
     key = Column(String(64), primary_key=True)
-    value = Column(JSON, nullable=True)
+    value = Column(JSONCol, nullable=True)
     updated_at = Column(Float, nullable=False, default=now)
     updated_by_device = Column(String(36), nullable=True)
     version = Column(Integer, nullable=False, default=1)
@@ -184,7 +199,7 @@ class ActivityEvent(Base):
     app_version = Column(String(32), nullable=True)
     platform = Column(String(32), nullable=True)
     # Bounded metadata, sanitised on ingest. See api_telemetry.
-    attrs = Column(JSON, nullable=True)
+    attrs = Column(JSONCol, nullable=True)
 
 
 Index("ix_activity_user_ts", ActivityEvent.user_id, ActivityEvent.ts)
@@ -236,7 +251,7 @@ class ErrorEvent(Base):
     ts = Column(Float, nullable=False, default=now, index=True)
     app_version = Column(String(32), nullable=True)
     platform = Column(String(32), nullable=True)
-    context = Column(JSON, nullable=True)
+    context = Column(JSONCol, nullable=True)
 
 
 # -- feature flags -----------------------------------------------------------
@@ -318,7 +333,7 @@ class AdminAuditLog(Base):
     ts = Column(Float, nullable=False, default=now, index=True)
     ip_hash = Column(String(64), nullable=True)
     result = Column(String(16), nullable=False, default="success")
-    detail = Column(JSON, nullable=True)
+    detail = Column(JSONCol, nullable=True)
 
 
 class RateLimitBucket(Base):

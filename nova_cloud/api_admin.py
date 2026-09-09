@@ -245,6 +245,7 @@ def dashboard():
             "users_active_24h": active_24h,
             "users_active_7d": active_7d,
             "users_disabled": count(User, User.status == UserStatus.DISABLED.value),
+            "users_suspended": count(User, User.status == UserStatus.SUSPENDED.value),
             "devices_total": count(Device, Device.revoked_at.is_(None)),
             "devices_revoked": count(Device, Device.revoked_at.is_not(None)),
             "devices_seen_24h": count(Device, Device.last_seen_at > t - DAY),
@@ -284,7 +285,10 @@ def list_users():
     with session_scope() as s:
         stmt = select(User)
         if q:
-            stmt = stmt.where(User.email.like(f"%{q}%"))
+            # ilike, not like: SQLite's LIKE is case-insensitive for ASCII
+            # but Postgres' is not, so a plain LIKE would quietly stop matching
+            # once the platform moved to a real database.
+            stmt = stmt.where(User.email.ilike(f"%{q}%"))
         total = int(s.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
         rows = s.scalars(stmt.order_by(User.created_at.desc())
                          .limit(limit).offset(offset)).all()
@@ -351,21 +355,23 @@ def user_detail(user_id: str):
 @admin_required("users.disable")
 def set_user_status(user_id: str):
     want = (request.get_json(silent=True) or {}).get("status", "")
-    if want not in (UserStatus.ACTIVE.value, UserStatus.DISABLED.value):
+    allowed = (UserStatus.ACTIVE.value, UserStatus.SUSPENDED.value,
+               UserStatus.DISABLED.value)
+    if want not in allowed:
         return jsonify({"ok": False, "error": "bad_request",
-                        "message": "status must be active or disabled"}), 400
+                        "message": f"status must be one of {', '.join(allowed)}"}), 400
     with session_scope() as s:
         u = s.get(User, user_id)
         if u is None:
             return jsonify({"ok": False, "error": "not_found"}), 404
-        if want == UserStatus.DISABLED.value and not sec.role_can(
+        if want != UserStatus.ACTIVE.value and not sec.role_can(
                 g.admin_role, "users.disable"):
             return jsonify({"ok": False, "error": "forbidden"}), 403
         if want == UserStatus.ACTIVE.value and not sec.role_can(
                 g.admin_role, "users.enable"):
             return jsonify({"ok": False, "error": "forbidden"}), 403
         u.status = want
-        if want == UserStatus.DISABLED.value:
+        if UserStatus.blocks_access(want):
             # Disabling must actually cut access, not just set a flag.
             u.token_epoch = int(u.token_epoch) + 1
             for a in s.scalars(select(AuthSession).where(
