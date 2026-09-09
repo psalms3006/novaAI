@@ -44,6 +44,7 @@ from . import store as desk_store
 from . import trace as desk_trace
 from . import voice as desk_voice
 from . import live_session as desk_live
+from . import account_api as desk_account
 
 log = _nova.log
 APP_VERSION = "1.0.0"
@@ -1748,6 +1749,10 @@ def api_settings_post():
         desk_settings.set_many({"permissions": data["permissions"]})
         data.pop("permissions", None)
     desk_settings.set_many(data)
+    # The setting has already been applied locally. Syncing it to the account
+    # happens afterwards, on a background thread, so changing a preference is
+    # never gated on the network.
+    desk_account.push_preferences_async(data)
     return jsonify({"ok": True, "settings": desk_settings.all()})
 
 
@@ -2163,6 +2168,37 @@ def ws_observe(ws):
                 _observer_clients.remove(ws)
 
 
+def _start_account_session() -> None:
+    """Restore the signed-in account, adopt its name, and start telemetry.
+
+    Everything here is either local (reading the cached session from the OS
+    keystore) or dispatched to a background thread. Startup never waits on the
+    network: a machine with no connection reaches the same voice-ready state,
+    just without a fresh preference pull.
+    """
+    import nova_account
+    acct = nova_account.account()
+    if not acct.configured:
+        log.info("[DESK] no NOVA Cloud configured; running local-only")
+        return
+    if not acct.signed_in:
+        log.info("[DESK] NOVA Cloud configured; no account signed in")
+        return
+
+    name = acct.display_name
+    if name:
+        # NOVA already knows who this is; the user should not be asked again.
+        desk_settings.set_many({"user_name": name})
+        _META["user_name"] = name
+
+    acct.start_background()
+    acct.emit("NOVA_STARTED", surface="desktop",
+              app_version=nova_account.APP_VERSION)
+    desk_account.pull_preferences_async()
+    log.info("[DESK] signed in as %s (%s)", name or "?",
+             "online" if acct.online else "cached")
+
+
 def run_desk_server(meta, port: int | None = None) -> None:
     """Entrypoint called by nova.py --desk. Blocks (serves until stopped)."""
     global _META, run_token, _started_at, _server
@@ -2176,6 +2212,16 @@ def run_desk_server(meta, port: int | None = None) -> None:
 
     ok, msg = desk_confirm.install(ui_mode=True)
     log.info("[DESK] %s", msg)
+
+    # Account surface. Registered before the server starts so the SPA can ask
+    # who is signed in on its very first request. If no NOVA Cloud backend is
+    # configured this still answers -- with configured:false -- and NOVA runs
+    # entirely locally.
+    try:
+        desk_account.register(app, require_token, _META)
+        _start_account_session()
+    except Exception as e:                       # never block startup on this
+        log.warning("[DESK] account surface unavailable: %s", e)
 
     if port is None:
         port = int(os.getenv("NOVA_DESK_PORT", "") or 8765)

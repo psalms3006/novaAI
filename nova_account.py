@@ -415,9 +415,41 @@ class NovaAccount:
                                             name="nova-account-sync", daemon=True)
         self._tel_thread.start()
 
-    def stop_background(self) -> None:
+    def flush(self, timeout: float = 5.0) -> int:
+        """Send whatever is queued, now. Returns the number of events sent.
+
+        Called on shutdown. Without it every event still sitting in the batch
+        window is lost when NOVA closes -- which would include NOVA_STOPPED,
+        the one event guaranteed to be queued at exactly that moment.
+        """
+        pending: list[dict] = []
+        while True:
+            try:
+                pending.append(self._tel_q.get_nowait())
+            except queue.Empty:
+                break
+        if not pending or not self.signed_in:
+            return 0
+        try:
+            tok = self.ensure_access_token()
+            if not tok:
+                return 0
+            self._request("POST", "/v1/telemetry/events",
+                          body={"events": pending}, token=tok, timeout=timeout)
+            return len(pending)
+        except Exception:
+            return 0
+
+    def stop_background(self, flush: bool = True) -> None:
+        thread = self._tel_thread
         self._stop.set()
         self._tel_thread = None
+        if thread is not None:
+            # Wait for the batcher to hand back whatever it was holding,
+            # otherwise flush() races it and finds an empty queue.
+            thread.join(timeout=3.0)
+        if flush:
+            self.flush()
 
     def _background(self) -> None:
         """Batch telemetry and refresh the session, entirely off the hot path."""
@@ -444,6 +476,13 @@ class NovaAccount:
             except Exception:
                 # Telemetry loss is acceptable; blocking or crashing is not.
                 pass
+        # Asked to stop: hand anything still batched to flush() rather than
+        # dropping it on the floor.
+        for item in batch:
+            try:
+                self._tel_q.put_nowait(item)
+            except queue.Full:
+                break
 
     def _notify(self) -> None:
         if self._on_change:
@@ -468,4 +507,50 @@ def account() -> NovaAccount:
 
 
 __all__ = ["NovaAccount", "AccountError", "Offline", "account",
-           "device_identity", "device_descriptor", "APP_VERSION"]
+           "device_identity", "device_descriptor", "installation_identity",
+           "forget_device_identity", "APP_VERSION",
+           "emit", "emit_model_call", "emit_agent_run", "emit_error", "shutdown"]
+
+
+# -- module-level helpers ----------------------------------------------------
+#
+# Call sites across the runtime use these rather than reaching for the
+# singleton, so telemetry can never raise into NOVA's own code paths and
+# instrumenting a module costs one import and one line.
+
+def emit(event_type: str, **attrs) -> None:
+    try:
+        account().emit(event_type, **attrs)
+    except Exception:
+        pass
+
+
+def emit_model_call(provider: str, model: str, **kw) -> None:
+    try:
+        account().emit_model_call(provider, model, **kw)
+    except Exception:
+        pass
+
+
+def emit_agent_run(agent: str, **kw) -> None:
+    try:
+        account().emit_agent_run(agent, **kw)
+    except Exception:
+        pass
+
+
+def emit_error(code: str, **context) -> None:
+    try:
+        account().emit_error(code, **context)
+    except Exception:
+        pass
+
+
+def shutdown(reason: str = "") -> None:
+    """Flush telemetry on the way out. Safe to call more than once."""
+    try:
+        a = account()
+        a.emit("NOVA_STOPPED", reason=reason or "normal")
+        a.stop_background()
+    except Exception:
+        pass

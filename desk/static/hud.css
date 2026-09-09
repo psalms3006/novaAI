@@ -664,3 +664,58 @@ body[data-mode="ambient"] #orb-canvas-3d { mix-blend-mode: normal; }
 }
 .mute-btn:hover { color: var(--hud-cyan); border-color: var(--hud-line); }
 .mute-btn.muted { color: var(--hud-amber); border-color: rgba(255,179,92,.4); }
+
+/* ── account gate ─────────────────────────────────────────────────────────
+   Shown only when a NOVA Cloud backend is configured and nobody is signed
+   in. A local-only NOVA never renders any of this. */
+.acct-gate {
+  position: fixed; inset: 0; z-index: 9000;
+  display: grid; place-items: center;
+  background: rgba(6, 8, 12, .94);
+  backdrop-filter: blur(10px);
+}
+.acct-card {
+  width: min(380px, 92vw);
+  background: var(--panel, #12151d);
+  border: 1px solid var(--line, #232838);
+  border-radius: 14px; padding: 30px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.acct-brand {
+  font-size: 20px; font-weight: 600; letter-spacing: .14em; text-align: center;
+}
+.acct-sub {
+  color: var(--muted, #8b93a7); font-size: 13px; text-align: center;
+  margin: 0 0 12px;
+}
+.acct-card input {
+  background: rgba(0, 0, 0, .35); border: 1px solid var(--line, #232838);
+  color: var(--text, #e6e9f0); border-radius: 8px; padding: 11px 13px;
+  font: inherit; width: 100%;
+}
+.acct-card input:focus { outline: 2px solid var(--accent, #6ea8ff); outline-offset: -1px; }
+.acct-primary {
+  background: var(--accent, #6ea8ff); color: #06101f; border: 0;
+  border-radius: 8px; padding: 11px 14px; font: inherit; font-weight: 600;
+  cursor: pointer; margin-top: 6px;
+}
+.acct-primary:disabled { opacity: .55; cursor: default; }
+.acct-links { display: flex; justify-content: space-between; gap: 12px; margin-top: 6px; }
+.acct-link {
+  background: none; border: 0; color: var(--muted, #8b93a7);
+  font: inherit; font-size: 12px; cursor: pointer; padding: 4px 0;
+}
+.acct-link:hover { color: var(--text, #e6e9f0); }
+.acct-error { color: #ff6b6b; font-size: 13px; margin: 8px 0 0; }
+.acct-error.acct-info { color: var(--accent, #6ea8ff); }
+.acct-note { color: var(--muted, #8b93a7); font-size: 12px; margin: 8px 0 0; line-height: 1.5; }
+.acct-kv { display: grid; grid-template-columns: 150px 1fr; gap: 6px 14px; font-size: 13px; margin: 0 0 16px; }
+.acct-kv dt { color: var(--muted, #8b93a7); }
+.acct-kv dd { margin: 0; }
+.acct-device {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 9px 0; border-bottom: 1px solid var(--line, #232838); font-size: 13px;
+}
+.acct-device:last-child { border-bottom: 0; }
+.acct-dim { color: var(--muted, #8b93a7); font-size: 12px; }
+[hidden] { display: none !important; }

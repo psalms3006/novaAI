@@ -21,6 +21,29 @@ from .provider import (
 log = logging.getLogger(__name__)
 
 
+def _telemetry_call(provider, started: float, local: bool, *, status: str,
+                    error_code: str | None = None) -> None:
+    """Record one provider request. Never raises, never blocks."""
+    try:
+        import nova_account
+        nova_account.emit_model_call(
+            provider.name,
+            getattr(provider, "model", "") or getattr(provider, "model_name", "")
+            or provider.name,
+            latency_ms=int((time.time() - started) * 1000),
+            status=status, error_code=error_code, offline=local)
+    except Exception:
+        pass
+
+
+def _telemetry_event(event: str, **attrs) -> None:
+    try:
+        import nova_account
+        nova_account.emit(event, **attrs)
+    except Exception:
+        pass
+
+
 class IntelligenceRouter:
     """Selects and delegates to the best available intelligence provider.
 
@@ -210,8 +233,11 @@ class IntelligenceRouter:
             )
 
         errors: List[str] = []
+        first_choice = ranked[0].name
         for provider in ranked:
             self._note_provider_used(provider.name)
+            started = time.time()
+            local = provider_is_local(provider)
             try:
                 result = provider.complete(
                     messages=messages,
@@ -227,11 +253,15 @@ class IntelligenceRouter:
                     provider.health.record_failure(str(e))
                 except Exception:
                     pass
+                _telemetry_call(provider, started, local, status="error",
+                                error_code=type(e).__name__)
                 errors.append(f"{provider.name}: {e}")
                 log.warning("[ROUTER] %s raised, trying next provider: %s", provider.name, e)
                 continue
 
             if result.error:
+                _telemetry_call(provider, started, local, status="error",
+                                error_code="provider_error")
                 errors.append(f"{provider.name}: {result.error}")
                 log.warning(
                     "[ROUTER] %s returned error, trying next provider: %s",
@@ -239,6 +269,12 @@ class IntelligenceRouter:
                 )
                 continue
 
+            _telemetry_call(provider, started, local, status="success")
+            if provider.name != first_choice and local:
+                # The preferred provider did not answer and a local model did.
+                # That is the offline path, and it is worth being able to see
+                # how often it happens.
+                _telemetry_event("OFFLINE_FALLBACK", provider=provider.name)
             return result
 
         log.error("[ROUTER] all providers failed: %s", errors)

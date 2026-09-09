@@ -49,6 +49,18 @@ SPEAKING_WATCHDOG_S = 3.0
 LIVE_RATE = 24000  # Gemini Live outputs 24 kHz 16-bit mono PCM
 
 
+def _telemetry(event: str, **attrs) -> None:
+    """Operational telemetry. Metadata only -- no transcripts, no audio, ever.
+
+    Wrapped so a telemetry problem can never affect the voice pipeline.
+    """
+    try:
+        import nova_account
+        nova_account.emit(event, **{k: v for k, v in attrs.items() if v is not None})
+    except Exception:
+        pass
+
+
 class LiveState(str, Enum):
     IDLE = "idle"
     CONNECTING = "connecting"
@@ -206,6 +218,7 @@ class LiveManager:
             self._has_greeted = False
         self._thread = threading.Thread(target=self._run_loop, name="nova-live", daemon=True)
         self._thread.start()
+        _telemetry("VOICE_SESSION_STARTED", surface="desktop")
         return {"ok": True, "message": "connecting"}
 
     def stop(self) -> dict:
@@ -226,6 +239,10 @@ class LiveManager:
         with self._state_lock:
             self._state = LiveState.CLOSED
         self._publish(LiveEvent("state", state="closed"))
+        _telemetry("VOICE_SESSION_ENDED", surface="desktop",
+                   duration_ms=int((time.time() - self._start_time) * 1000)
+                   if self._start_time else None,
+                   count=self._turn_count)
         return {"ok": True, "message": "stopped"}
 
     def send_text(self, text: str) -> dict:
