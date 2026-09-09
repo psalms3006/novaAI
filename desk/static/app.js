@@ -528,6 +528,17 @@ function closeOnboarding() {
 
 /* ── Settings Modal ────────────────────────────────── */
 const SETTINGS_TABS = {
+  account(host) {
+    // The Account tab existed in the markup with nothing behind it. It is now
+    // rendered by account.js, which owns the account state; on a local-only
+    // NOVA it says so plainly rather than showing controls that do nothing.
+    if (window.NovaAccount && typeof window.NovaAccount.renderPanel === "function") {
+      window.NovaAccount.renderPanel(host);
+    } else {
+      host.innerHTML = '<div class="settings-sec"><p class="acct-note">' +
+        'This NOVA runs entirely on this computer. No account is in use.</p></div>';
+    }
+  },
   general(host) {
     const s = state.settings;
     host.innerHTML = `
