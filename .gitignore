@@ -146,3 +146,6 @@ dist_build/
 build_tmp/
 dist_v2/
 build_tmp2/
+
+# Archived dead/duplicate modules (kept out of builds; see archive/README.md)
+archive/

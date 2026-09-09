@@ -344,10 +344,13 @@ class _LiveSession:
         assert self._audio_in is not None
 
         async for response in self._session.receive():
-            if response.data:
-                await self._audio_in.put(response.data)
-
             sc = response.server_content
+            if sc and sc.model_turn and sc.model_turn.parts:
+                for part in sc.model_turn.parts:
+                    inline = getattr(part, "inline_data", None)
+                    if inline is not None and getattr(inline, "data", None):
+                        await self._audio_in.put(inline.data)
+
             if not sc:
                 continue
 

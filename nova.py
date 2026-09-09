@@ -408,19 +408,23 @@ log = logging.getLogger(__name__)
 import nova_state  # _embedder, _memory_texts, _planner, _rest_backoff_*, _mcp_bridge live here now
 
 try:
-    from mcp.bridge import new_bridge as _new_mcp_bridge
+    # nova_mcp, not mcp: a local package named `mcp` collides with the MCP SDK
+    # of the same name, and mcp/client_manager.py imports *from* that SDK. The
+    # collision meant `from mcp.bridge import ...` resolved to site-packages
+    # and always failed, so MCP tools were silently disabled on every run.
+    from nova_mcp.bridge import new_bridge as _new_mcp_bridge
     try:
-        from mcp.models import ServerConfig as _MCPServerConfig, TransportType as _MCPTransportType
+        from nova_mcp.models import ServerConfig as _MCPServerConfig, TransportType as _MCPTransportType
     except Exception:  # ImportError or other issues
         _MCPServerConfig = None
         _MCPTransportType = None
         HAS_MCP = False
         log = logging.getLogger(__name__)
-        log.warning("mcp.models not found or could not be imported — MCP tools disabled. pip install mcp to enable.")
+        log.warning("nova_mcp.models could not be imported — MCP tools disabled.")
     HAS_MCP = True
 except ImportError:
     HAS_MCP = False
-    log.warning("nova/mcp package not found — MCP tools disabled. pip install mcp to enable.")
+    log.warning("nova_mcp package not found — MCP tools disabled. pip install mcp to enable.")
 _faiss_index:       Optional[Any]  = None
 # Reentrant: add_memory_fact() holds this lock and then calls
 # _atomic_save_memory(), which takes it again. With a plain Lock that is a

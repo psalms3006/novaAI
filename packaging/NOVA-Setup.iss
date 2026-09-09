@@ -44,7 +44,7 @@ Name: "autostart"; Description: "Start {#MyAppName} when Windows starts"; \
     GroupDescription: "Startup:"; Flags: unchecked
 
 [Files]
-Source: "..\dist\NOVADesktop\*"; DestDir: "{app}"; \
+Source: "..\dist\NOVADesktop2\*"; DestDir: "{app}"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
 ; NOTE: deliberately NOT packaged: any ".env" file, "byok.bin", "device.json",
 ; "settings.json" or "*.log". Those are user-machine artifacts and never ship.

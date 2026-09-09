@@ -1,1 +1,23 @@
-[]
+[
+  {
+    "id": "mem_a9c9d850f59d",
+    "text": "my Fembol audit marker is cobalt-seahorse-1788699046",
+    "type": "fact",
+    "importance": 0.9,
+    "confidence": 1.0,
+    "source": "test",
+    "project": "",
+    "confirmed": true,
+    "created": 1788699046.1203432,
+    "updated": 1788699046.1203432,
+    "last_accessed": 1788901929.955248,
+    "access_count": 51,
+    "decay": {
+      "active": false,
+      "expires": null
+    },
+    "superseded_by": null,
+    "versions": [],
+    "meta": {}
+  }
+]
