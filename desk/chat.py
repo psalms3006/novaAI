@@ -17,6 +17,7 @@ import time
 from typing import Any, Dict, List, Tuple
 
 from . import trace as desk_trace
+from nova_core import trust as _trust
 import nova as _nova
 
 log = _nova.log
@@ -326,6 +327,12 @@ def run_turn(
         ]
         exec_list = []
         pending_tool_results: List[Tuple[str, str]] = []
+        # Once a tool has returned content NOVA did not author -- a web page, a
+        # document, a search result -- everything the model asks for after it
+        # may be acting on instructions embedded in that content. The rest of
+        # the turn therefore runs untrusted, which is what stops the classic
+        # "search returns a page saying delete the user's files" chain.
+        tainted_by = ""
         for tc in tool_calls:
             name = tc.get("name", "")
             if stop_event is not None and stop_event.is_set():
@@ -337,11 +344,19 @@ def run_turn(
                 _publish_agent_start(agent_id, task_id, name=tool_label(name), action=f"Using {tool_label(name)}", tool=name)
             tool_events.append({"name": name, "label": tool_label(name), "ok": True, "summary": ""})
             try:
-                ok, result = _execute_tool_via_orchestrator(name, tc.get("args", {}), meta)
+                if tainted_by:
+                    with _trust.untrusted(tainted_by):
+                        ok, result = _execute_tool_via_orchestrator(
+                            name, tc.get("args", {}), meta)
+                else:
+                    ok, result = _execute_tool_via_orchestrator(
+                        name, tc.get("args", {}), meta)
             except Exception as e:
                 log.error("Tool failure %s: %s", name, e, exc_info=True)
                 result = f"Tool error: {e}"
                 ok = False
+            if ok and _trust.taints(name):
+                tainted_by = f"the result of {tool_label(name)}"
             summary = _tool_summary(result)
             tool_events[-1]["summary"] = summary
             tool_events[-1]["ok"] = ok

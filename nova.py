@@ -1424,6 +1424,28 @@ def _execute_file_processor(args: dict) -> str:
 def _execute_tool_sync(tool_name: str, args: dict, meta: dict) -> str:
     print(f"🔧 Tool: {tool_name}({json.dumps(args, ensure_ascii=False)[:120]})")
 
+    # ── Authorisation: may this caller use this tool at all? ─────────────────
+    # This runs *before* the confirmation gate because they answer different
+    # questions. The gate asks whether the human agrees; this asks whether the
+    # request was ever permitted -- which matters most when the instruction
+    # came from a web page rather than from the user.
+    #
+    # A CONFIRM verdict is deliberately passed through to the existing gate
+    # below rather than prompting here, so the user is never asked twice.
+    try:
+        from nova_core import permissions as _perm
+        from nova_core import trust as _trust
+        _decision = _perm.check_tool(
+            meta.get("principal", "nova") if isinstance(meta, dict) else "nova",
+            tool_name, trust=_trust.current_trust())
+        if _decision.effect is _perm.Effect.DENY:
+            _why = _trust.current_source()
+            return (f"Refused: {_decision.reason}."
+                    + (f" The request came from {_why}, which NOVA does not "
+                       "treat as an instruction." if _why else ""))
+    except ImportError:
+        pass
+
     # ── Tier 6: hard confirmation gate ───────────────────────────────────────
     try:
         from nova_safety import safety_gate, log_tool_run
