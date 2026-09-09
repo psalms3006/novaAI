@@ -101,8 +101,32 @@ def email_config() -> EmailConfig:
 
 # -- providers ---------------------------------------------------------------
 
+_tls_ready = False
+
+
+def _ensure_tls() -> None:
+    """Route outbound HTTPS through the OS trust store.
+
+    Antivirus products and corporate proxies that inspect TLS present their
+    own certificate, which certifi does not know about, so every request to
+    the mail provider fails with CERTIFICATE_VERIFY_FAILED. This is the same
+    fix the desktop already applies; without it, email works on some machines
+    and silently fails on others.
+    """
+    global _tls_ready
+    if _tls_ready:
+        return
+    try:
+        import nova_tls
+        nova_tls.ensure_tls_trust()
+    except Exception:
+        pass                      # certifi still works where nothing intercepts
+    _tls_ready = True
+
+
 def _send_resend(cfg: EmailConfig, to: str, subject: str,
                  text: str, html_body: str) -> None:
+    _ensure_tls()
     import requests
     r = requests.post(
         "https://api.resend.com/emails",

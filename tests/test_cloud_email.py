@@ -408,3 +408,83 @@ def test_an_error_context_cannot_carry_private_content(env):
         row = s.scalar(select(ErrorEvent))
     stored = row.context or {}
     assert "transcript" not in stored and "prompt" not in stored
+
+
+# -- the pages people actually click (section 9) -----------------------------
+
+def test_the_verification_link_lands_on_a_real_page(env, monkeypatch):
+    """The templates point at {APP_BASE_URL}/verify. Without that route every
+    verification email leads to a 404, which looks exactly like a broken
+    account."""
+    fake = configure_email(monkeypatch)
+    from nova_cloud import mailer
+    j = signup(env).get_json()
+    mailer.mailer().flush(timeout=10)
+    _unverify(j["user"]["id"])
+
+    token = fake.messages[0]["text"].split("token=")[1].split()[0].strip()
+    r = env.get(f"/verify?token={token}")
+    assert r.status_code == 200
+    body = r.get_data(as_text=True)
+    assert "Email confirmed" in body
+
+    me = env.get("/v1/auth/me", headers=auth(j["access_token"])).get_json()
+    assert me["user"]["email_verified"] is True
+
+
+def test_a_verification_link_works_once(env, monkeypatch):
+    fake = configure_email(monkeypatch)
+    from nova_cloud import mailer
+    j = signup(env).get_json()
+    mailer.mailer().flush(timeout=10)
+    _unverify(j["user"]["id"])
+    token = fake.messages[0]["text"].split("token=")[1].split()[0].strip()
+
+    assert env.get(f"/verify?token={token}").status_code == 200
+    again = env.get(f"/verify?token={token}")
+    assert again.status_code == 400
+    assert "did not work" in again.get_data(as_text=True)
+
+
+def test_a_bad_verification_token_explains_itself(env):
+    r = env.get("/verify?token=not-a-real-token")
+    assert r.status_code == 400
+    body = r.get_data(as_text=True)
+    assert "no longer valid" in body
+
+
+def test_the_verification_page_escapes_its_message(env):
+    """The token comes from a URL; nothing derived from it may reach the page
+    unescaped."""
+    r = env.get("/verify?token=<script>alert(1)</script>")
+    body = r.get_data(as_text=True)
+    assert "<script>alert(1)</script>" not in body
+
+
+def test_the_reset_page_is_served(env):
+    r = env.get("/reset?token=anything")
+    assert r.status_code == 200
+    assert "Reset your NOVA password" in r.get_data(as_text=True)
+
+
+def test_the_reset_page_refuses_a_missing_token(env):
+    r = env.get("/reset")
+    assert r.status_code == 400
+
+
+def test_the_reset_page_never_puts_a_password_in_a_url():
+    """The token travels in the URL; the new password must not."""
+    import io
+    js = io.open("nova_cloud/static/reset.js", encoding="utf-8").read()
+    assert "location.search" in js          # token read from the URL
+    assert 'method: "POST"' in js           # password sent in the body
+    assert "password" in js and "?password=" not in js
+
+
+def test_health_reports_email_and_distinguishes_unconfigured_from_broken(env):
+    """A deployment may legitimately run without email. It is only an outage
+    when verification is mandatory and therefore cannot complete."""
+    j = env.get("/health").get_json()
+    assert "email" in j["checks"]
+    assert j["checks"]["email"]["status"] in (
+        "healthy", "not_configured", "degraded", "unknown")

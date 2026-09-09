@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,15 +18,19 @@ from pathlib import Path
 # quoting is a trap: PowerShell interpolates $ inside double quotes, so a
 # password containing $74 is silently mangled. A gitignored .env file avoids
 # both problems and survives reopening the terminal.
-try:
-    from dotenv import load_dotenv as _load_dotenv
-    for _candidate in (Path.cwd() / ".env",
-                       Path(__file__).resolve().parents[1] / ".env"):
-        if _candidate.exists():
-            _load_dotenv(_candidate, override=False)
-            break
-except ImportError:
-    pass
+# Never under pytest. A test run that inherits production credentials would
+# point the suite at the live database and the real mail provider, and the
+# first sign of it would be test data in production.
+if "PYTEST_CURRENT_TEST" not in os.environ and "pytest" not in sys.modules:
+    try:
+        from dotenv import load_dotenv as _load_dotenv
+        for _candidate in (Path.cwd() / ".env",
+                           Path(__file__).resolve().parents[1] / ".env"):
+            if _candidate.exists():
+                _load_dotenv(_candidate, override=False)
+                break
+    except ImportError:
+        pass
 
 
 def _bool(name: str, default: bool) -> bool:

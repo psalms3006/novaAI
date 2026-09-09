@@ -114,10 +114,54 @@ def create_app(cfg=None) -> Flask:
             "checks": checks,
         }), (200 if ok else 503)
 
+    # -- links people click from email ------------------------------------
+    #
+    # The templates point at {APP_BASE_URL}/verify and /reset. Those are the
+    # URLs a human opens in a browser, so they have to be real pages: without
+    # them every verification email leads to a 404, which looks exactly like a
+    # broken account.
+
+    @app.get("/verify")
+    def verify_page():
+        from .api_auth import _consume_email_token
+        token = (request.args.get("token") or "").strip()
+        ok, message = _consume_email_token(token, "verify_email")
+        return _outcome_page(
+            "Email confirmed" if ok else "This link did not work",
+            message, ok), (200 if ok else 400)
+
+    @app.get("/reset")
+    def reset_page():
+        """Password reset is a form, not a one-click action: the new password
+        has to come from the person, and it must never travel in a URL."""
+        token = (request.args.get("token") or "").strip()
+        if not token:
+            return _outcome_page("This link did not work",
+                                 "The reset link is missing its token.",
+                                 False), 400
+        return send_from_directory(app.static_folder, "reset.html")
+
     @app.get("/admin")
     @app.get("/admin/")
     def admin_index():
         return send_from_directory(app.static_folder, "admin.html")
+
+    def _outcome_page(heading: str, message: str, ok: bool) -> str:
+        import html as _html
+        colour = "#1f9d55" if ok else "#c53030"
+        return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{_html.escape(heading)}</title></head>
+<body style="margin:0;background:#f5f6f8;font-family:-apple-system,Segoe UI,
+Roboto,sans-serif;display:grid;place-items:center;min-height:100vh">
+<div style="max-width:420px;background:#fff;border:1px solid #e4e6eb;
+border-radius:12px;padding:32px;text-align:center">
+<div style="font-weight:600;letter-spacing:.08em;font-size:18px">NOVA</div>
+<h1 style="font-size:19px;margin:20px 0 10px;color:{colour}">
+{_html.escape(heading)}</h1>
+<p style="font-size:14px;line-height:1.6;color:#4a5160;margin:0">
+{_html.escape(message)}</p>
+</div></body></html>"""
 
     @app.errorhandler(404)
     def _404(_e):

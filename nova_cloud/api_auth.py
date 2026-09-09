@@ -499,6 +499,31 @@ def reset_password():
         return jsonify({"ok": True, "message": "Password updated. Sign in again."})
 
 
+def _consume_email_token(token: str, kind: str) -> tuple[bool, str]:
+    """Redeem a single-use email token. Shared by the API and the web page,
+    so a link clicked in a browser and a POST from the desktop behave
+    identically."""
+    if not token:
+        return False, "The link is missing its token."
+    with session_scope() as s:
+        row = s.scalar(select(EmailToken).where(
+            EmailToken.token_hash == sec.token_hash(token),
+            EmailToken.kind == kind))
+        if row is None or row.used_at is not None or row.expires_at < now():
+            return False, ("This link is no longer valid. It may already have "
+                           "been used, or it may have expired.")
+        user = s.get(User, row.user_id)
+        if user is None:
+            return False, "This link is no longer valid."
+        row.used_at = now()
+        if kind == "verify_email":
+            user.email_verified = True
+            record_event(s, "EMAIL_VERIFIED", user_id=user.id)
+            return True, ("Your email address is confirmed. You can return to "
+                          "NOVA and carry on.")
+        return True, "Token accepted."
+
+
 @bp.post("/email/verify")
 def verify_email():
     body = request.get_json(silent=True) or {}
