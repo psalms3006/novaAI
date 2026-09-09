@@ -140,3 +140,7 @@ env/
 *.spec
 # NOVA Cloud local development data (database, dev keys, traffic scripts)
 .devcloud/
+
+# PyInstaller alternate build paths used when dist/ is locked by a running app
+dist_build/
+build_tmp/
