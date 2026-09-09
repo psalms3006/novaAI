@@ -165,6 +165,110 @@ def retention(args) -> int:
     return 0
 
 
+def test_email(args) -> int:
+    """Prove the email configuration works before relying on it.
+
+    Sends synchronously so a misconfiguration surfaces here rather than
+    silently failing behind the background sender.
+    """
+    from . import mailer as mail
+    cfg = mail.email_config()
+    print(f"provider   : {cfg.provider}")
+    print(f"from       : {cfg.from_address or '(unset)'}")
+    print(f"support    : {cfg.support_email or '(unset)'}")
+    print(f"base url   : {cfg.base_url or '(unset)'}")
+    if not cfg.configured:
+        print()
+        print("Not configured. Set EMAIL_PROVIDER and its credentials; see "
+              "nova_cloud/.env.example.", file=sys.stderr)
+        return 1
+    if not cfg.base_url:
+        print()
+        print("APP_BASE_URL is unset: verification and reset links would "
+              "point nowhere.", file=sys.stderr)
+        return 1
+
+    mc = mail.Mailer(cfg)
+    subject, text, html_body = mail.verification_email(cfg, "test-token-not-valid")
+    try:
+        mc.send_now(args.to, "[test] " + subject, text, html_body)
+    except Exception as e:
+        print()
+        print(f"FAILED: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+    print()
+    print(f"Sent a test verification email to {args.to}.")
+    print("If it does not arrive, check the provider dashboard and your SPF/"
+          "DKIM records.")
+    return 0
+
+
+def check(_args) -> int:
+    """Report whether this deployment is actually ready to serve users."""
+    from . import mailer as mail
+    from sqlalchemy import text as _text
+    from .db import engine as _engine
+
+    cfg = config()
+    problems, warnings = [], []
+
+    print(f"environment        : {cfg.env}")
+    print(f"database           : {_redact(cfg.database_url)}")
+
+    try:
+        with _engine().connect() as c:
+            c.execute(_text("SELECT 1"))
+        print("database connection: ok")
+    except Exception as e:
+        problems.append(f"cannot reach the database: {type(e).__name__}")
+        print("database connection: FAILED")
+
+    if cfg.database_url.startswith("sqlite") and cfg.is_production:
+        problems.append("production is using SQLite; point DATABASE_URL at Postgres")
+
+    mc = mail.email_config()
+    print(f"email provider     : {mc.provider}"
+          f"{'' if mc.configured else '  (not configured)'}")
+    if cfg.require_email_verification and not mc.configured:
+        problems.append("email verification is required but no provider is "
+                        "configured; new users could not finish signing up")
+    if mc.configured and not mc.base_url:
+        problems.append("APP_BASE_URL is unset; email links would point nowhere")
+
+    print(f"admin MFA required : {cfg.admin_require_mfa}")
+    if not cfg.admin_require_mfa:
+        warnings.append("admin MFA is disabled")
+
+    init_db()
+    with session_scope() as s:
+        admins = s.scalars(select(AdminUser)).all()
+    print(f"administrators     : {len(admins)}")
+    if not admins:
+        problems.append("no administrator exists; run create-admin")
+    elif cfg.admin_require_mfa and not any(a.mfa_enabled for a in admins):
+        problems.append("no administrator has enrolled in MFA, so none can "
+                        "sign in; run enrol-mfa")
+
+    for name in ("NOVA_SECRET_KEY", "NOVA_ADMIN_SECRET_KEY"):
+        if cfg.is_production and not os.getenv(name):
+            problems.append(f"{name} is not set")
+
+    print()
+    for w in warnings:
+        print(f"WARNING  {w}")
+    for p in problems:
+        print(f"PROBLEM  {p}")
+    if not problems:
+        print("Ready." if not warnings else "Ready, with warnings above.")
+    return 1 if problems else 0
+
+
+def _redact(url: str) -> str:
+    """Never print a database password, not even to the operator's terminal."""
+    import re
+    return re.sub(r"://([^:]+):([^@]+)@", r"://\g<1>:***@", url or "")
+
+
 def serve(args) -> int:
     from .app import create_app
     app = create_app()
@@ -193,6 +297,12 @@ def main(argv=None) -> int:
     c.add_argument("--email", required=True)
     c.add_argument("--role", required=True)
     c.set_defaults(fn=set_role)
+
+    c = sub.add_parser("test-email")
+    c.add_argument("--to", required=True)
+    c.set_defaults(fn=test_email)
+
+    sub.add_parser("check").set_defaults(fn=check)
 
     c = sub.add_parser("retention")
     c.add_argument("--dry-run", action="store_true")

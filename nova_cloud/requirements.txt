@@ -1,0 +1,27 @@
+# NOVA Cloud backend dependencies.
+#
+#   pip install -r nova_cloud/requirements.txt
+#
+# Deliberately small. This service does identity, sync, telemetry and the
+# admin console -- it does not import any of NOVA's voice, model or desktop
+# stack, and must not start depending on them.
+
+# web
+flask>=3.0,<4
+gunicorn>=21.2                 # production WSGI server (Linux hosts)
+waitress>=3.0                  # production WSGI server (Windows hosts)
+
+# database
+SQLAlchemy>=2.0,<3
+psycopg[binary]>=3.1           # Postgres driver (Supabase); binary needs no toolchain
+
+# authentication
+argon2-cffi>=23.1              # Argon2id password hashing
+PyJWT>=2.8                     # signed access tokens
+pyotp>=2.9                     # admin TOTP second factor
+
+# outbound HTTP (Resend); SMTP needs nothing beyond the standard library
+requests>=2.31
+
+# configuration
+python-dotenv>=1.0
