@@ -165,6 +165,133 @@ def retention(args) -> int:
     return 0
 
 
+def set_db(args) -> int:
+    """Store DATABASE_URL in a gitignored .env, correctly encoded.
+
+    Exists because setting it in the shell is error-prone in exactly the ways
+    that waste an afternoon:
+
+      * a shell variable lives only in the window that set it, so reopening
+        the terminal loses it;
+      * PowerShell interpolates ``$`` inside double quotes, so a password
+        containing ``$74`` is silently mangled into something shorter;
+      * ``&``, ``$``, ``@`` and ``#`` must be percent-encoded inside a URI,
+        and Supabase generates passwords containing them routinely.
+
+    The URI is read with getpass, so it never appears on screen, in shell
+    history, or in the process list.
+    """
+    import getpass
+    import re
+    NEWLINE = chr(10)
+    from pathlib import Path
+    from urllib.parse import quote, urlsplit, urlunsplit
+
+    raw = (os.getenv("NOVA_DB_URL", "") or "").strip()
+    if not raw:
+        print("Paste the Supabase connection URI. It will not be displayed.")
+        print("  Supabase -> Project Settings -> Database -> Connection string")
+        print("  Use the pooler (port 6543) for the API.")
+        raw = getpass.getpass("Connection URI: ").strip()
+    if not raw:
+        print("Nothing entered; no changes made.", file=sys.stderr)
+        return 2
+
+    # Split manually rather than with urlsplit first: an unencoded password
+    # containing '@' or '/' breaks a standards-compliant parse, and that is
+    # precisely the input this command exists to repair.
+    m = re.match(r"^(?P<scheme>[a-zA-Z0-9+.\-]+)://(?P<rest>.*)$", raw)
+    if not m:
+        print("That does not look like a connection URI.", file=sys.stderr)
+        return 2
+    scheme, rest = m.group("scheme"), m.group("rest")
+
+    if "@" not in rest:
+        print("The URI has no credentials before '@'.", file=sys.stderr)
+        return 2
+    userinfo, _, hostpart = rest.rpartition("@")     # rpartition: the last @
+    user, _, password = userinfo.partition(":")
+
+    if scheme in ("postgres", "postgresql"):
+        scheme = "postgresql+psycopg"
+        print("  scheme       -> postgresql+psycopg (psycopg 3)")
+    elif scheme != "postgresql+psycopg":
+        print(f"  scheme        {scheme} (left unchanged)")
+
+    # Percent-encode the password. safe="" so every reserved character is
+    # escaped, including the ones people forget.
+    encoded = quote(password, safe="")
+    if encoded != password:
+        changed = sorted({c for c in password if quote(c, safe="") != c})
+        print(f"  password      re-encoded ({len(changed)} character(s) "
+              f"needed escaping)")
+    else:
+        print("  password      already URL-safe")
+
+    url = f"{scheme}://{quote(user, safe='')}:{encoded}@{hostpart}"
+
+    # Prove it parses and points where we expect before writing anything.
+    from sqlalchemy.engine import make_url
+    try:
+        parsed = make_url(url)
+    except Exception as e:
+        print(f"The repaired URI still does not parse ({type(e).__name__}).",
+              file=sys.stderr)
+        return 2
+    if parsed.password != password:
+        print("Encoding check failed: the password does not round-trip.",
+              file=sys.stderr)
+        return 2
+
+    print(f"  host          {_mask_host(parsed.host)}")
+    print(f"  port          {parsed.port}")
+    print(f"  database      {parsed.database}")
+    if parsed.port == 5432:
+        print("  note          5432 is the direct connection; the pooler "
+              "(6543) is better for the API")
+
+    env_path = Path(args.env or ".env").resolve()
+    lines, replaced = [], False
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("DATABASE_URL="):
+                lines.append(f"DATABASE_URL={url}")
+                replaced = True
+            else:
+                lines.append(line)
+    if not replaced:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append("# NOVA Cloud database. Never commit this file.")
+        lines.append(f"DATABASE_URL={url}")
+    env_path.write_text(NEWLINE.join(lines) + NEWLINE, encoding="utf-8")
+    try:
+        _os_chmod_600(env_path)
+    except Exception:
+        pass
+
+    print()
+    print(f"Written to {env_path}")
+    print("  (.env is gitignored; the URI was never echoed)")
+    print()
+    print("Next:  python tools/check_db.py")
+    return 0
+
+
+def _os_chmod_600(path) -> None:
+    import stat
+    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+
+
+def _mask_host(host) -> str:
+    if not host:
+        return "(none)"
+    parts = str(host).split(".")
+    if len(parts) > 2:
+        return f"{parts[0][:6]}***." + ".".join(parts[-3:])
+    return str(host)
+
+
 def test_email(args) -> int:
     """Prove the email configuration works before relying on it.
 
@@ -297,6 +424,11 @@ def main(argv=None) -> int:
     c.add_argument("--email", required=True)
     c.add_argument("--role", required=True)
     c.set_defaults(fn=set_role)
+
+    c = sub.add_parser("set-db")
+    c.add_argument("--env", default=".env",
+                   help="file to write (default: .env)")
+    c.set_defaults(fn=set_db)
 
     c = sub.add_parser("test-email")
     c.add_argument("--to", required=True)

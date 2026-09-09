@@ -11,6 +11,22 @@ import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Load .env before anything reads the environment.
+#
+# A shell variable lives only in the window that set it, and on Windows the
+# quoting is a trap: PowerShell interpolates $ inside double quotes, so a
+# password containing $74 is silently mangled. A gitignored .env file avoids
+# both problems and survives reopening the terminal.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    for _candidate in (Path.cwd() / ".env",
+                       Path(__file__).resolve().parents[1] / ".env"):
+        if _candidate.exists():
+            _load_dotenv(_candidate, override=False)
+            break
+except ImportError:
+    pass
+
 
 def _bool(name: str, default: bool) -> bool:
     v = os.getenv(name)

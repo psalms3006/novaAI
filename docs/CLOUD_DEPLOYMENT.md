@@ -35,18 +35,29 @@ at: running and backing up the database.
    shown once.
 3. **Project Settings → Database → Connection string → URI**.
 
-Take the **Connection pooler** string (port `6543`), not the direct one:
+Take the **Connection pooler** string (port `6543`), not the direct one, then
+hand it to NOVA:
 
+```bash
+python -m nova_cloud.manage set-db
 ```
-DATABASE_URL=postgresql+psycopg://postgres.PROJECTREF:PASSWORD@aws-0-REGION.pooler.supabase.com:6543/postgres
-```
 
-Two details that will otherwise cost you an afternoon:
+It prompts for the URI without echoing it, and writes a gitignored `.env`.
+Do that rather than exporting a shell variable, because three things go wrong
+otherwise and all of them look like a wrong password:
 
-* The scheme must be `postgresql+psycopg` (psycopg 3). A bare `postgresql://`
-  makes SQLAlchemy look for psycopg2, which is not installed.
-* Use the pooler (6543) for the web app; use the direct host (5432) only for
-  migrations and long-lived connections.
+* A shell variable lives only in the window that set it. Reopen the terminal
+  and it is gone.
+* **PowerShell interpolates `$` inside double quotes.** A password containing
+  `$74` is silently truncated to something shorter. Single quotes are
+  required, and it is easy to forget.
+* `&`, `$`, `@`, `#` and `/` must be percent-encoded inside a URI. Supabase
+  generates passwords containing them routinely. `set-db` does the encoding
+  and verifies the password round-trips before writing anything.
+
+It also upgrades a bare `postgresql://` to `postgresql+psycopg://`; without
+that, SQLAlchemy looks for psycopg2, which NOVA does not install. Use the
+pooler (6543) for the API; the direct host (5432) is for migrations.
 
 ### Creating the tables
 

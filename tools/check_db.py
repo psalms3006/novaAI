@@ -20,6 +20,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+# Read .env, so this works in any shell rather than only the one that
+# happened to export DATABASE_URL.
+try:
+    from dotenv import load_dotenv
+    for candidate in (Path.cwd() / ".env", ROOT / ".env"):
+        if candidate.exists():
+            load_dotenv(candidate, override=False)
+            break
+except ImportError:
+    pass
+
 #: Characters that must be percent-encoded inside the password of a URI.
 #: Supabase generates passwords containing them regularly, and an unencoded
 #: one is the single most common reason a correct password appears wrong.
@@ -32,8 +43,15 @@ _ENCODINGS = {"@": "%40", "/": "%2F", "?": "%3F", "#": "%23", "[": "%5B",
 def main() -> int:
     raw = os.getenv("DATABASE_URL", "").strip()
     if not raw:
-        print("DATABASE_URL is not set in this shell.", file=sys.stderr)
-        print("Set it, then run this again from the same shell.", file=sys.stderr)
+        print("DATABASE_URL is not set, and no .env file supplied it.",
+              file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Set it once, without exposing it to the shell:", file=sys.stderr)
+        print("    python -m nova_cloud.manage set-db", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("That prompts for the connection URI without echoing it, fixes "
+              "the percent-encoding, and writes a gitignored .env.",
+              file=sys.stderr)
         return 1
 
     from sqlalchemy import create_engine, text
