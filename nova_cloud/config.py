@@ -1,0 +1,120 @@
+"""nova_cloud.config — environment-driven configuration.
+
+Every secret comes from the environment. Nothing sensitive is committed, and
+the app refuses to start in production without real secrets rather than
+silently falling back to a default that would be identical on every install.
+"""
+from __future__ import annotations
+
+import os
+import secrets
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+def _bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+@dataclass
+class Config:
+    env: str = field(default_factory=lambda: os.getenv("NOVA_ENV", "development"))
+
+    # Storage. SQLite by default so a developer can run the whole platform with
+    # no infrastructure; point DATABASE_URL at Postgres for deployment.
+    database_url: str = field(default_factory=lambda: os.getenv("DATABASE_URL", ""))
+
+    # Signing keys.
+    secret_key: str = field(default_factory=lambda: os.getenv("NOVA_SECRET_KEY", ""))
+    admin_secret_key: str = field(default_factory=lambda: os.getenv("NOVA_ADMIN_SECRET_KEY", ""))
+
+    # Token lifetimes.
+    access_ttl_s: int = field(default_factory=lambda: _int("NOVA_ACCESS_TTL", 900))          # 15 min
+    refresh_ttl_s: int = field(default_factory=lambda: _int("NOVA_REFRESH_TTL", 60 * 86400))  # 60 d
+    admin_session_ttl_s: int = field(default_factory=lambda: _int("NOVA_ADMIN_TTL", 1800))    # 30 min
+
+    # How long a device may keep operating locally with no contact with the
+    # backend before it must re-authenticate. See docs: offline behaviour.
+    offline_grace_s: int = field(default_factory=lambda: _int("NOVA_OFFLINE_GRACE", 30 * 86400))
+
+    # Retention, in days, per category. 0 means "keep indefinitely".
+    retention_auth_events_d: int = field(default_factory=lambda: _int("NOVA_RET_AUTH", 180))
+    retention_telemetry_d: int = field(default_factory=lambda: _int("NOVA_RET_TELEMETRY", 90))
+    retention_errors_d: int = field(default_factory=lambda: _int("NOVA_RET_ERRORS", 90))
+    retention_admin_audit_d: int = field(default_factory=lambda: _int("NOVA_RET_AUDIT", 730))
+
+    require_email_verification: bool = field(
+        default_factory=lambda: _bool("NOVA_REQUIRE_EMAIL_VERIFICATION", False))
+    admin_require_mfa: bool = field(default_factory=lambda: _bool("NOVA_ADMIN_REQUIRE_MFA", True))
+
+    def __post_init__(self) -> None:
+        if not self.database_url:
+            self.database_url = "sqlite:///" + str(self.default_db_path())
+        prod = self.env in ("production", "prod", "staging")
+        for name, attr in (("NOVA_SECRET_KEY", "secret_key"),
+                           ("NOVA_ADMIN_SECRET_KEY", "admin_secret_key")):
+            if not getattr(self, attr):
+                if prod:
+                    raise RuntimeError(
+                        f"{name} must be set in {self.env}. Refusing to start with a "
+                        "generated key: sessions would be invalidated on every restart "
+                        "and would differ between workers."
+                    )
+                # Development: ephemeral key, kept in a file so a restart does
+                # not log the developer out on every reload.
+                setattr(self, attr, self._dev_key(name))
+        if self.secret_key == self.admin_secret_key:
+            raise RuntimeError("user and admin signing keys must differ: "
+                               "a user token must never validate as an admin token")
+
+    @staticmethod
+    def default_db_path() -> Path:
+        d = Path(os.getenv("NOVA_CLOUD_DATA", "")) if os.getenv("NOVA_CLOUD_DATA") else \
+            Path.home() / ".nova" / "cloud"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / "nova_cloud.db"
+
+    @staticmethod
+    def _dev_key(name: str) -> str:
+        d = Path.home() / ".nova" / "cloud"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"dev_{name.lower()}.key"
+        if p.exists():
+            return p.read_text(encoding="utf-8").strip()
+        k = secrets.token_urlsafe(48)
+        p.write_text(k, encoding="utf-8")
+        try:
+            os.chmod(p, 0o600)
+        except Exception:
+            pass
+        return k
+
+    @property
+    def is_production(self) -> bool:
+        return self.env in ("production", "prod")
+
+
+_cfg: Config | None = None
+
+
+def config() -> Config:
+    global _cfg
+    if _cfg is None:
+        _cfg = Config()
+    return _cfg
+
+
+def reset_config() -> None:
+    """Test hook: re-read the environment."""
+    global _cfg
+    _cfg = None
