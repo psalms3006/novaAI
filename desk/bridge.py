@@ -2223,6 +2223,15 @@ def run_desk_server(meta, port: int | None = None) -> None:
     except Exception as e:                       # never block startup on this
         log.warning("[DESK] account surface unavailable: %s", e)
 
+    # Document library. Registered here so the SPA can list and add documents;
+    # the tool path reaches the same library through nova_core.rag.api.
+    try:
+        from nova_core.rag import api as rag_api
+        rag_api.register(app, require_token)
+        log.info("[DESK] document library ready")
+    except Exception as e:
+        log.warning("[DESK] document library unavailable: %s", e)
+
     if port is None:
         port = int(os.getenv("NOVA_DESK_PORT", "") or 8765)
     try:

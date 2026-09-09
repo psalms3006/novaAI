@@ -719,3 +719,47 @@ body[data-mode="ambient"] #orb-canvas-3d { mix-blend-mode: normal; }
 .acct-device:last-child { border-bottom: 0; }
 .acct-dim { color: var(--muted, #8b93a7); font-size: 12px; }
 [hidden] { display: none !important; }
+
+/* ── document library ─────────────────────────────────────────────────── */
+.doc-note { color: var(--muted, #8b93a7); font-size: 12.5px; margin: 8px 0; line-height: 1.55; }
+.doc-note.warn { color: #f0b429; }
+.doc-dim { color: var(--muted, #8b93a7); font-size: 12px; }
+.doc-drop {
+  border: 1px dashed var(--line, #232838); border-radius: 10px;
+  padding: 26px; text-align: center; color: var(--muted, #8b93a7);
+  cursor: pointer; margin: 12px 0; font-size: 13px; transition: border-color .15s;
+}
+.doc-drop:hover, .doc-drop.over {
+  border-color: var(--accent, #6ea8ff); color: var(--text, #e6e9f0);
+}
+.doc-list { margin-top: 10px; }
+.doc-row {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 9px 0; border-bottom: 1px solid var(--line, #232838); font-size: 13px;
+}
+.doc-row:last-child { border-bottom: 0; }
+.doc-link {
+  background: none; border: 0; color: var(--muted, #8b93a7);
+  font: inherit; font-size: 12px; cursor: pointer;
+}
+.doc-link:hover { color: #ff6b6b; }
+.doc-chooser h3 { font-size: 14px; margin: 0 0 4px; }
+.doc-choices { display: grid; gap: 10px; margin: 12px 0; }
+.doc-choice {
+  text-align: left; background: rgba(0,0,0,.22);
+  border: 1px solid var(--line, #232838); border-radius: 10px;
+  padding: 13px 15px; cursor: pointer; font: inherit; color: inherit;
+}
+.doc-choice:hover { border-color: var(--accent, #6ea8ff); }
+.doc-choice.selected { border-color: var(--accent, #6ea8ff); background: rgba(110,168,255,.09); }
+.doc-choice-title { font-weight: 600; font-size: 13px; }
+.doc-choice-desc { color: var(--muted, #8b93a7); font-size: 12px; margin-top: 4px; line-height: 1.5; }
+.doc-choice-state { font-size: 11px; margin-top: 7px; }
+.doc-choice-state.ok { color: #3ecf8e; }
+.doc-choice-state.warn { color: #f0b429; }
+.doc-download {
+  background: transparent; border: 1px solid var(--accent, #6ea8ff);
+  color: var(--accent, #6ea8ff); border-radius: 8px; padding: 9px 13px;
+  font: inherit; font-size: 12.5px; cursor: pointer;
+}
+.doc-download:disabled { opacity: .6; cursor: default; }

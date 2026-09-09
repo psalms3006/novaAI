@@ -186,8 +186,9 @@ DEFAULT_GRANTS: dict[str, Grant] = {
     "RESEARCH": Grant(
         "RESEARCH",
         _caps(C.NETWORK_READ, C.BROWSER_READ, C.FILE_READ, C.MEMORY_READ,
-              C.MEMORY_WRITE),
-        description="Reads the web. Cannot interact with it.",
+              C.MEMORY_WRITE, C.USER_DATA),
+        description="Reads the web and the user's library. Cannot interact "
+                    "with the web.",
     ),
     "BROWSER": Grant(
         "BROWSER",
@@ -273,6 +274,11 @@ TOOL_CAPABILITIES: dict[str, frozenset[Capability]] = {
     "remember": _caps(C.MEMORY_WRITE),
     "recall": _caps(C.MEMORY_READ),
     "memory*": _caps(C.MEMORY_READ),
+    # Searching the user's own documents reads their data; adding one writes
+    # to the library.
+    "rag_search": _caps(C.MEMORY_READ, C.USER_DATA),
+    "rag_add": _caps(C.MEMORY_WRITE, C.USER_DATA, C.FILE_READ),
+    "document*": _caps(C.MEMORY_READ, C.USER_DATA),
     "knowledge*": _caps(C.MEMORY_READ),
     "nova_task": _caps(C.MEMORY_READ, C.MEMORY_WRITE),
     "planner": _caps(C.MEMORY_READ),

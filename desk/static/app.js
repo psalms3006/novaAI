@@ -539,6 +539,15 @@ const SETTINGS_TABS = {
         'This NOVA runs entirely on this computer. No account is in use.</p></div>';
     }
   },
+  documents(host) {
+    // Owned by documents.js, which also holds the embedding-backend choice.
+    if (window.NovaDocuments && typeof window.NovaDocuments.renderPanel === "function") {
+      window.NovaDocuments.renderPanel(host);
+    } else {
+      host.innerHTML = '<div class="settings-sec"><p class="doc-note">' +
+        'The document library is not available in this build.</p></div>';
+    }
+  },
   general(host) {
     const s = state.settings;
     host.innerHTML = `

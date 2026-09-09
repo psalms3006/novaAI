@@ -38,6 +38,13 @@ _DEFAULTS = {
     "streaming": True,              # SSE streaming vs single completion
     "response_style": "balanced",   # concise | balanced | detailed (enters system prompt)
     "memory_enabled": True,         # gates memory context + auto-extraction
+    # How NOVA searches the user's documents. Chosen during setup:
+    #   onnx    a small model on this machine (semantic, offline, ~90 MB)
+    #   cloud   embeddings from the AI provider (best quality, needs network)
+    #   lexical keyword search only (nothing downloaded, nothing sent)
+    # "auto" prefers local, then cloud, then keyword. NOVA reports which is
+    # actually in use rather than implying semantic search it does not have.
+    "embedding_backend": "auto",
     "history_turns": 10,            # turns of context sent to the model
     "show_tool_activity": True,     # render tool activity cards in the thread
     "developer_mode": False,        # gates advanced/debug UI

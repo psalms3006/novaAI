@@ -62,7 +62,7 @@ def as_trust(trust: Trust, source: str = "") -> Iterator[None]:
 TAINTING_TOOLS = frozenset({
     "web_search", "fetch_url", "browser_read", "browser_control",
     "file_processor", "read_file", "file_read", "knowledge_search",
-    "zim_search", "rag_search",
+    "zim_search", "rag_search", "rag_add", "document_search",
 })
 
 

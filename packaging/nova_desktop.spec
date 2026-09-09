@@ -36,6 +36,17 @@ hidden = [
     # named explicitly or the packaged app silently falls back to the file
     # store even where a real keystore exists.
     "nova_account", "nova_secure_store",
+    # Runtime spine + document library. onnxruntime is ~15 MB and lets the
+    # packaged app run the same embedding model that previously needed torch
+    # (~2 GB) and was therefore excluded, degrading semantic search to
+    # keywords in the EXE only. The model itself is downloaded to the user's
+    # data directory, not bundled.
+    "nova_core", "nova_core.permissions", "nova_core.trust",
+    "nova_core.rag", "nova_core.rag.parsers", "nova_core.rag.chunking",
+    "nova_core.rag.embeddings", "nova_core.rag.store",
+    "nova_core.rag.library", "nova_core.rag.api",
+    "onnxruntime", "tokenizers",
+    "pypdf", "docx", "openpyxl", "pptx",
     "keyring", "keyring.backends", "keyring.backends.Windows",
     "keyring.backends.macOS", "keyring.backends.SecretService",
     "keyring.backends.chainer", "keyring.backends.fail",
