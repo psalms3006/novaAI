@@ -19,7 +19,7 @@ from __future__ import annotations
 import time
 
 from flask import Blueprint, g, jsonify, request
-from sqlalchemy import distinct, func, select
+from sqlalchemy import distinct, func, or_, select
 
 from . import security as sec
 from .auth_guard import admin_required, invalidate_auth_cache
@@ -285,10 +285,25 @@ def list_users():
     with session_scope() as s:
         stmt = select(User)
         if q:
-            # ilike, not like: SQLite's LIKE is case-insensitive for ASCII
-            # but Postgres' is not, so a plain LIKE would quietly stop matching
+            # Search what an operator actually has to hand: an address from a
+            # support email, a name, or an id copied out of a log or a crash
+            # report. Restricting this to email would mean a device id from an
+            # error report could not be traced back to an account at all.
+            #
+            # ilike, not like: SQLite's LIKE is case-insensitive for ASCII but
+            # Postgres' is not, so a plain LIKE would quietly stop matching
             # once the platform moved to a real database.
-            stmt = stmt.where(User.email.ilike(f"%{q}%"))
+            like = f"%{q}%"
+            owns_device = select(Device.user_id).where(
+                Device.id.ilike(like)).scalar_subquery()
+            named = select(Profile.user_id).where(
+                Profile.display_name.ilike(like)).scalar_subquery()
+            stmt = stmt.where(or_(
+                User.email.ilike(like),
+                User.id.ilike(like),
+                User.id.in_(owns_device),
+                User.id.in_(named),
+            ))
         total = int(s.scalar(select(func.count()).select_from(stmt.subquery())) or 0)
         rows = s.scalars(stmt.order_by(User.created_at.desc())
                          .limit(limit).offset(offset)).all()

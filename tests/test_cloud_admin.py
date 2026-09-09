@@ -337,3 +337,53 @@ def test_the_two_signing_keys_must_differ(monkeypatch):
     with pytest.raises(RuntimeError, match="must differ"):
         cfgmod.config()
     cfgmod.reset_config()
+
+
+# -- admin search (section 52) -----------------------------------------------
+
+def _make_user(env, email, name, device_id):
+    return env.post("/v1/auth/signup", json={
+        "email": email, "password": PASSWORD, "display_name": name,
+        "device_id": device_id, "device_secret": "s-" + device_id,
+        "platform": "linux", "app_version": "0.2.0"}).get_json()
+
+
+def test_admin_can_search_by_email_name_account_id_and_device_id(env):
+    t = admin_token(env)
+    a = _make_user(env, "ada@example.org", "Ada Lovelace", "dev-ada-001")
+    _make_user(env, "kai@example.org", "Kai Nakamura", "dev-kai-002")
+
+    def search(q):
+        j = env.get(f"/admin/api/users?q={q}", headers=auth(t)).get_json()
+        return {u["email"] for u in j["users"]}
+
+    assert search("ada@example.org") == {"ada@example.org"}
+    assert search("Lovelace") == {"ada@example.org"}, "cannot search by name"
+    assert search(a["user"]["id"]) == {"ada@example.org"}, \
+        "cannot search by account id"
+    assert search("dev-ada-001") == {"ada@example.org"}, \
+        "cannot trace a device id back to its account"
+
+
+def test_search_is_case_insensitive(env):
+    t = admin_token(env)
+    _make_user(env, "ada@example.org", "Ada Lovelace", "dev-ada-001")
+    j = env.get("/admin/api/users?q=ADA@EXAMPLE.ORG", headers=auth(t)).get_json()
+    assert len(j["users"]) == 1, "search is case-sensitive"
+
+
+def test_searching_is_recorded_in_the_audit_log(env):
+    t = admin_token(env)
+    _make_user(env, "ada@example.org", "Ada", "dev-ada-001")
+    env.get("/admin/api/users?q=ada", headers=auth(t))
+    entries = env.get("/admin/api/audit", headers=auth(t)).get_json()["entries"]
+    assert any(e["action"] == "users.search" for e in entries), \
+        "searching the user base is not audited"
+
+
+def test_an_empty_search_returns_everyone(env):
+    t = admin_token(env)
+    _make_user(env, "ada@example.org", "Ada", "dev-ada-001")
+    _make_user(env, "kai@example.org", "Kai", "dev-kai-002")
+    j = env.get("/admin/api/users", headers=auth(t)).get_json()
+    assert j["total"] == 2

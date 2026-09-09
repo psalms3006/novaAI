@@ -33,6 +33,25 @@ KNOWN_EVENTS = {
     "PREFERENCES_SYNCED", "ACCOUNT_DELETED",
 }
 
+# The error taxonomy. A defined set beats free-form strings: it keeps the
+# admin Errors page groupable, makes "did this start after 0.3.1?" answerable,
+# and stops one client's typo fragmenting a real problem across ten rows.
+# An unrecognised code is stored under UNKNOWN_ERROR with the original kept in
+# context, so a newer client is never silently lost.
+ERROR_CODES = {
+    # authentication and account
+    "AUTH_ERROR", "AUTH_FAILURE", "SESSION_EXPIRED", "DEVICE_REVOKED",
+    # platform
+    "DATABASE_ERROR", "SYNC_ERROR", "NETWORK_ERROR", "EMAIL_DELIVERY_FAILED",
+    # runtime
+    "VOICE_ERROR", "VOICE_MICROPHONE_ERROR", "VOICE_SPEAKER_ERROR",
+    "MODEL_ERROR", "MODEL_TIMEOUT", "MODEL_UNAVAILABLE",
+    "AGENT_ERROR", "AGENT_FAILURE", "TOOL_ERROR", "TOOL_FAILURE",
+    "MEMORY_ERROR", "KNOWLEDGE_ERROR",
+    # catch-all
+    "UNKNOWN_ERROR",
+}
+
 # Attribute keys accepted on an activity event. Anything else is discarded.
 ALLOWED_ATTRS = {
     "platform", "app_version", "reason", "scope", "sessions", "provider",
@@ -132,15 +151,24 @@ def record_error(session: Session, *, user_id: str | None, device_id: str | None
                  code: str, app_version: str | None = None,
                  platform: str | None = None,
                  context: dict | None = None) -> ErrorEvent:
+    raw = str(code)[:48]
+    known = raw in ERROR_CODES
+    ctx = dict(context or {})
+    if not known:
+        # Keep what the client actually said, but do not let it create a new
+        # indexed category.
+        ctx["source"] = raw[:40]
     row = ErrorEvent(
-        user_id=user_id, device_id=device_id, code=str(code)[:48],
+        user_id=user_id, device_id=device_id,
+        code=raw if known else "UNKNOWN_ERROR",
         app_version=(str(app_version)[:32] if app_version else None),
         platform=(str(platform)[:32] if platform else None),
-        context=sanitise_attrs(context) or None,
+        context=sanitise_attrs(ctx) or None,
     )
     session.add(row)
     return row
 
 
-__all__ = ["KNOWN_EVENTS", "ALLOWED_ATTRS", "sanitise_attrs", "record_event",
-           "record_model_call", "record_agent_run", "record_error"]
+__all__ = ["KNOWN_EVENTS", "ERROR_CODES", "ALLOWED_ATTRS", "sanitise_attrs",
+           "record_event", "record_model_call", "record_agent_run",
+           "record_error"]

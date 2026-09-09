@@ -356,3 +356,55 @@ def test_production_never_hands_back_a_token(env, monkeypatch):
     assert "dev_reset_token" not in j
     body = str(j)
     assert "token" not in body.lower() or "dev" not in body.lower()
+
+
+# -- error taxonomy (section 50) ---------------------------------------------
+
+def test_a_known_error_code_is_stored_as_itself(env):
+    j = signup(env).get_json()
+    env.post("/v1/telemetry/events", headers=auth(j["access_token"]), json={
+        "events": [{"kind": "error", "code": "MODEL_TIMEOUT",
+                    "context": {"provider": "gemini"}}]})
+    from nova_cloud.db import session_scope
+    from nova_cloud.models import ErrorEvent
+    from sqlalchemy import select
+    with session_scope() as s:
+        row = s.scalar(select(ErrorEvent))
+    assert row.code == "MODEL_TIMEOUT"
+    assert row.context["provider"] == "gemini"
+
+
+def test_an_unknown_code_does_not_create_a_new_category(env):
+    """One client's typo must not fragment a real problem across rows."""
+    j = signup(env).get_json()
+    env.post("/v1/telemetry/events", headers=auth(j["access_token"]), json={
+        "events": [{"kind": "error", "code": "MODLE_TIMEOTU"}]})
+    from nova_cloud.db import session_scope
+    from nova_cloud.models import ErrorEvent
+    from sqlalchemy import select
+    with session_scope() as s:
+        row = s.scalar(select(ErrorEvent))
+    assert row.code == "UNKNOWN_ERROR"
+    # ...but what the client actually said is not lost.
+    assert row.context["source"] == "MODLE_TIMEOTU"
+
+
+def test_email_delivery_failure_is_a_recognised_error_code():
+    from nova_cloud.telemetry_sink import ERROR_CODES
+    assert "EMAIL_DELIVERY_FAILED" in ERROR_CODES
+
+
+def test_an_error_context_cannot_carry_private_content(env):
+    j = signup(env).get_json()
+    env.post("/v1/telemetry/events", headers=auth(j["access_token"]), json={
+        "events": [{"kind": "error", "code": "VOICE_ERROR",
+                    "context": {"transcript": "something private",
+                                "prompt": "also private",
+                                "platform": "windows"}}]})
+    from nova_cloud.db import session_scope
+    from nova_cloud.models import ErrorEvent
+    from sqlalchemy import select
+    with session_scope() as s:
+        row = s.scalar(select(ErrorEvent))
+    stored = row.context or {}
+    assert "transcript" not in stored and "prompt" not in stored

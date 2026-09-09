@@ -47,7 +47,6 @@ unreachable.
 | `nova_cloud/mailer.py` | Account email: Resend or SMTP. |
 | `nova_cloud/manage.py` | Operator CLI: admins, MFA, retention, `check`, `test-email`. |
 | `nova_cloud/static/admin.*` | The admin control plane, served at `/admin`. |
-| `nova_cloud/manage.py` | Operator CLI: create admins, enrol MFA, retention, serve. |
 | `nova_account.py` | The desktop's account client. Owns session state, sync and telemetry. |
 | `nova_secure_store.py` | Cross-platform secret storage. |
 | `desk/account_api.py` | Desktop HTTP surface (`/api/account/*`). |

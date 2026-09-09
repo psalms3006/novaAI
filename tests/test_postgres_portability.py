@@ -58,9 +58,13 @@ def test_user_search_is_explicitly_case_insensitive():
     """
     import io
     src = io.open("nova_cloud/api_admin.py", encoding="utf-8").read()
-    search = re.search(r"stmt = stmt\.where\(User\.email\.(\w+)\(", src)
-    assert search, "could not find the admin user search clause"
-    assert search.group(1) == "ilike", (
+    block = src[src.index("def list_users"):src.index("def user_detail")]
+
+    # Every comparison the search performs must be case-insensitive. Checking
+    # the whole block rather than one line, so restructuring the query cannot
+    # quietly reintroduce a case-sensitive match.
+    assert ".ilike(" in block, "admin user search is not case-insensitive"
+    assert re.search(r"\.like\(", block) is None, (
         "admin user search uses .like(); on Postgres that is case-sensitive "
         "and the search will silently stop working")
 

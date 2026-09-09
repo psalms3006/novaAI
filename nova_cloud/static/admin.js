@@ -220,7 +220,7 @@
       });
     }
 
-    var search = el("input", { type: "search", placeholder: "Search by email…",
+    var search = el("input", { type: "search", placeholder: "Search email, name, account ID or device ID…",
       oninput: function (e) { q = e.target.value; clearTimeout(load._t); load._t = setTimeout(load, 250); } });
 
     header("Users", "Identity and operational metadata. Conversation content is not accessible here.")
