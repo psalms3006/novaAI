@@ -16,6 +16,13 @@ env/
 .env
 .env.*
 
+# API keys / credentials (NEVER commit)
+config/api_keys.json
+api_keys.json
+byok.bin
+*.key
+*.pem
+
 # IDE
 .vscode/
 .idea/
@@ -131,3 +138,5 @@ env/
 
 # PyInstaller
 *.spec
+# NOVA Cloud local development data (database, dev keys, traffic scripts)
+.devcloud/
