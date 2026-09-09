@@ -77,6 +77,35 @@ def create_app(cfg=None) -> Flask:
             ok = False
             checks["database"] = {"status": "degraded", "error": type(e).__name__}
         checks["api"] = {"status": "healthy"}
+
+        # Email is reported, not assumed. "configured" means credentials are
+        # present and a provider is selected -- it does not claim a message
+        # has ever been delivered, which only a real send can establish.
+        try:
+            from .mailer import email_config
+            mc = email_config()
+            if mc.configured:
+                checks["email"] = {"status": "healthy", "provider": mc.provider,
+                                   "sender_configured": bool(mc.from_address)}
+            else:
+                # Not an outage: a deployment may legitimately run without
+                # email. It becomes degraded only when verification is
+                # mandatory and therefore cannot complete.
+                mandatory = cfg.require_email_verification
+                checks["email"] = {
+                    "status": "degraded" if mandatory else "not_configured",
+                    "provider": mc.provider,
+                    "detail": ("email verification is required but no provider "
+                               "is configured, so no one can finish signing up"
+                               if mandatory else
+                               "no provider configured; verification and reset "
+                               "emails will not be sent"),
+                }
+                if mandatory:
+                    ok = False
+        except Exception as e:
+            checks["email"] = {"status": "unknown", "error": type(e).__name__}
+
         return jsonify({
             "ok": ok,
             "status": "healthy" if ok else "degraded",

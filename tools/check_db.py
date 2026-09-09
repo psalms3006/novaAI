@@ -87,8 +87,19 @@ def main() -> int:
               "pooler (6543) is the right choice for a web app")
 
     # Detect an unencoded special character without revealing the password.
-    pw = url.password or ""
-    offenders = sorted({c for c in pw if c in _MUST_ENCODE})
+    #
+    # Check the RAW string, not url.password: SQLAlchemy hands back the
+    # decoded value, so a correctly encoded "%26" arrives here as "&" and a
+    # working configuration would be reported as broken.
+    userinfo = ""
+    if "://" in raw and "@" in raw:
+        userinfo = raw.split("://", 1)[1].rsplit("@", 1)[0]
+    raw_pw = userinfo.partition(":")[2]
+    # Remove well-formed %XX escapes first, or the '%' of a correct "%26"
+    # is itself reported as an unencoded character.
+    import re as _re
+    residue = _re.sub(r"%[0-9A-Fa-f]{2}", "", raw_pw)
+    offenders = sorted({c for c in residue if c in _MUST_ENCODE})
     if offenders:
         hint = ", ".join(f"{c!r} -> {_ENCODINGS[c]}" for c in offenders)
         problems.append(

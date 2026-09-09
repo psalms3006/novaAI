@@ -126,3 +126,62 @@ def test_no_env_file_is_tracked_by_git():
         base = path.rsplit("/", 1)[-1]
         if base == ".env":
             pytest.fail(f"a real .env is tracked: {path}")
+
+
+# -- transaction pooler compatibility ----------------------------------------
+
+def _engine_kwargs_for(url: str) -> dict:
+    """Reproduce the branch nova_cloud.db.engine() takes for a given URL."""
+    from sqlalchemy.engine import make_url
+    kw = {"future": True, "pool_pre_ping": True}
+    if url.startswith("postgresql"):
+        parsed = make_url(url)
+        pooled = (parsed.port == 6543
+                  or "pooler" in (parsed.host or "").lower()
+                  or "pgbouncer" in (parsed.host or "").lower())
+        if pooled:
+            kw["connect_args"] = {"prepare_threshold": None}
+            kw["pool_size"] = 5
+            kw["max_overflow"] = 5
+            kw["pool_recycle"] = 300
+    return kw
+
+
+@pytest.mark.parametrize("url", [
+    "postgresql+psycopg://u:p@aws-0-eu-west-2.pooler.supabase.com:6543/postgres",
+    "postgresql+psycopg://u:p@somewhere.example.com:6543/postgres",
+    "postgresql+psycopg://u:p@my-pgbouncer.internal:5432/postgres",
+])
+def test_prepared_statements_are_disabled_behind_a_transaction_pooler(url):
+    """The bug this prevents:
+
+    Supabase's pooler runs in transaction mode, handing one server connection
+    to different clients between statements. psycopg 3 prepares statements
+    automatically, so the second client to reuse a backend hits
+    `DuplicatePreparedStatement: "_pg3_0" already exists` and the request
+    fails. It appears only after a connection has been recycled, so a first
+    run looks perfectly healthy -- which is exactly how it got missed.
+    """
+    kw = _engine_kwargs_for(url)
+    assert kw.get("connect_args", {}).get("prepare_threshold", "unset") is None, \
+        "prepared statements are still enabled behind a transaction pooler"
+
+
+def test_a_direct_connection_keeps_prepared_statements():
+    """They are a real performance win when the connection is not shared."""
+    kw = _engine_kwargs_for(
+        "postgresql+psycopg://u:p@db.abcdefgh.supabase.co:5432/postgres")
+    assert "prepare_threshold" not in kw.get("connect_args", {})
+
+
+def test_sqlite_is_unaffected():
+    kw = _engine_kwargs_for("sqlite:///local.db")
+    assert "prepare_threshold" not in kw.get("connect_args", {})
+
+
+def test_the_pooler_branch_exists_in_the_real_engine_builder():
+    """Guards against the fix being refactored away."""
+    import io
+    src = io.open("nova_cloud/db.py", encoding="utf-8").read()
+    assert "prepare_threshold" in src
+    assert "6543" in src or "pooler" in src

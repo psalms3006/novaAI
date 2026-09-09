@@ -1,6 +1,7 @@
 """nova_cloud.db — engine, sessions, schema creation and rate limiting."""
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from contextlib import contextmanager
@@ -11,6 +12,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from .config import config
 from .models import Base, RateLimitBucket
+
+log = logging.getLogger("nova.db")
 
 _engine = None
 _SessionLocal = None
@@ -23,6 +26,32 @@ def engine():
         if _engine is None:
             url = config().database_url
             kw: dict = {"future": True, "pool_pre_ping": True}
+
+            if url.startswith("postgresql"):
+                from sqlalchemy.engine import make_url
+                parsed = make_url(url)
+                pooled = (parsed.port == 6543
+                          or "pooler" in (parsed.host or "").lower()
+                          or "pgbouncer" in (parsed.host or "").lower())
+                if pooled:
+                    # Supabase's pooler (and PgBouncer generally) runs in
+                    # transaction mode, where a server connection is handed to
+                    # a different client between statements. psycopg 3 prepares
+                    # statements automatically, so the second connection to
+                    # reuse a backend hits
+                    #     DuplicatePreparedStatement: "_pg3_0" already exists
+                    # and the request fails. It surfaces only after a
+                    # connection has been recycled, which is why a first run
+                    # can look perfectly healthy.
+                    kw["connect_args"] = {"prepare_threshold": None}
+                    # Transaction pooling also makes a large client-side pool
+                    # pointless: the pooler is the pool.
+                    kw["pool_size"] = 5
+                    kw["max_overflow"] = 5
+                    kw["pool_recycle"] = 300
+                    log.info("[DB] transaction pooler detected; prepared "
+                             "statements disabled")
+
             if url.startswith("sqlite"):
                 # SQLite needs WAL to tolerate concurrent readers alongside the
                 # writer, and check_same_thread off because Flask serves
