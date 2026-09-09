@@ -627,7 +627,10 @@ def upsert_flag(key: str):
     with session_scope() as s:
         f = s.get(FeatureFlag, key)
         if f is None:
-            f = FeatureFlag(key=key[:64])
+            # Set the defaults explicitly: column defaults are only applied at
+            # flush, and this function reads the values back before then.
+            f = FeatureFlag(key=key[:64], description="", enabled=False,
+                            rollout_percent=0)
             s.add(f)
         if "description" in body:
             f.description = str(body["description"])[:500]

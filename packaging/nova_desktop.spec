@@ -31,6 +31,15 @@ hidden = [
     "nova_tls", "truststore", "truststore._api", "truststore._windows",
     # one shared voice model + Core-owned proactive speech
     "nova_voice", "nova_core_voice", "nova_heartbeat",
+    # account identity, cross-platform secret storage and telemetry. keyring
+    # resolves its backend at runtime, so the platform backends have to be
+    # named explicitly or the packaged app silently falls back to the file
+    # store even where a real keystore exists.
+    "nova_account", "nova_secure_store",
+    "keyring", "keyring.backends", "keyring.backends.Windows",
+    "keyring.backends.macOS", "keyring.backends.SecretService",
+    "keyring.backends.chainer", "keyring.backends.fail",
+    "keyring.backends.null",
     "_ssl", "ssl",
     # websocket support (Live voice)
     "flask_sock", "simple_websocket",

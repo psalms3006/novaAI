@@ -239,10 +239,8 @@ def delete_account():
         for p in s.scalars(select(Preference).where(
                 Preference.user_id == u.id)).all():
             s.delete(p)
-        prof = s.get(Profile, u.id)
-        if prof is not None:
-            s.delete(prof)
-
+        # The profile is removed by the cascade on users; deleting it here as
+        # well makes SQLAlchemy warn that the row it expected was already gone.
         record_event(s, "ACCOUNT_DELETED")
         s.delete(u)
     return jsonify({"ok": True, "message": "Account deleted."})
