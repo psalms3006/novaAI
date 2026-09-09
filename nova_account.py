@@ -207,6 +207,11 @@ class NovaAccount:
             "last_verified": sess.get("last_verified"),
             "offline_grace_s": sess.get("offline_grace_s"),
             "grace_expired": self._grace_expired() if sess.get("user") else False,
+            # Verification is reported honestly: an unverified account says so
+            # rather than being displayed as if it were confirmed.
+            "email_verified": bool((sess.get("user") or {}).get("email_verified")),
+            "verification_required": bool(sess.get("verification_required")),
+            "email_delivery": sess.get("email_delivery") or {},
         }
 
     # -- HTTP --------------------------------------------------------------
@@ -263,6 +268,8 @@ class NovaAccount:
                 "refresh_token": payload.get("refresh_token") or "",
                 "offline_grace_s": float(payload.get("offline_grace_s") or 30 * 86400),
                 "last_verified": time.time(),
+                "verification_required": bool(payload.get("verification_required")),
+                "email_delivery": payload.get("email_delivery") or {},
             }
             store.set_json(_K_SESSION, self._session)
         self._last_online = time.time()
@@ -331,6 +338,31 @@ class NovaAccount:
             self._session["last_verified"] = time.time()
             store.set_json(_K_SESSION, self._session)
             return self._session["access_token"]
+
+    def resend_verification(self) -> dict:
+        """Ask the backend to send another verification email."""
+        tok = self.ensure_access_token()
+        if not tok:
+            raise Offline()
+        return self._request("POST", "/v1/auth/email/resend", token=tok)
+
+    def refresh_identity(self) -> dict:
+        """Re-read the account from the backend.
+
+        Used after the user follows a verification link in their browser: the
+        cached copy still says unverified until we ask.
+        """
+        tok = self.ensure_access_token()
+        if not tok:
+            raise Offline()
+        j = self._request("GET", "/v1/auth/me", token=tok)
+        with self._lock:
+            if j.get("user"):
+                self._session["user"] = j["user"]
+                self._session["last_verified"] = time.time()
+                store.set_json(_K_SESSION, self._session)
+        self._notify()
+        return self.status()
 
     # -- devices -----------------------------------------------------------
 

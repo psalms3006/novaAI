@@ -43,7 +43,9 @@ unreachable.
 
 | Path | Role |
 |---|---|
-| `nova_cloud/` | The backend: Flask + SQLAlchemy. SQLite by default, Postgres via `DATABASE_URL`. |
+| `nova_cloud/` | The backend: Flask + SQLAlchemy. SQLite for development, **Supabase Postgres** in production via `DATABASE_URL`. |
+| `nova_cloud/mailer.py` | Account email: Resend or SMTP. |
+| `nova_cloud/manage.py` | Operator CLI: admins, MFA, retention, `check`, `test-email`. |
 | `nova_cloud/static/admin.*` | The admin control plane, served at `/admin`. |
 | `nova_cloud/manage.py` | Operator CLI: create admins, enrol MFA, retention, serve. |
 | `nova_account.py` | The desktop's account client. Owns session state, sync and telemetry. |
@@ -54,6 +56,18 @@ unreachable.
 Flask and SQLAlchemy were chosen because the repository already runs on them.
 One service, one database. There is no queue, no cache tier and no second
 process, because nothing here needs one yet.
+
+**Why not Supabase Auth, Clerk or Auth0.** They give email verification,
+password reset and OAuth for free, which is real value. But NOVA's identity is
+*device-scoped*: a device secret, an epoch that revokes every token at once,
+and an admin plane on a separate signing key. None of those products models a
+device registry or admin RBAC, so adopting one would mean running two identity
+systems and implementing revocation correctly in both. Supabase is used for
+what it is genuinely best at — running and backing up Postgres — and identity
+stays in one place. Migrating later is a `pg_dump`, because it is only
+Postgres.
+
+Deployment steps, DNS records and costs: `docs/CLOUD_DEPLOYMENT.md`.
 
 ---
 
@@ -87,6 +101,17 @@ entry in `device_identities`, keyed by email. Consequences, all intended:
 ---
 
 ## 4. Authentication
+
+### Account states
+
+`active` · `suspended` · `disabled` · `deleted`
+
+Suspended and disabled both cut access immediately — sessions revoked, token
+epoch raised. They are distinct so an operator can tell a temporary hold
+(billing, review, an abuse investigation) from a deliberate shutdown, which
+matters when deciding whether to restore. Every access check compares against
+`active`, so a new blocking state cannot be added and then forgotten in one
+code path.
 
 ### Passwords
 
@@ -163,6 +188,35 @@ the conflict and the newer value so the client can adopt the winner instead of
 diverging silently. This is the right rule for scalar preferences — the newest
 thing the human chose is what they want — and anything needing stronger
 guarantees does not belong in that table.
+
+---
+
+## 5a. Email
+
+Verification, password reset and new-device security notices are sent through
+Resend or any SMTP server, selected by `EMAIL_PROVIDER`. Delivery happens on a
+background thread with bounded retries, so a provider outage cannot take
+sign-up down; permanent failures are recorded as `EMAIL_DELIVERY_FAILED` and
+appear in the admin Errors page rather than only in a log. Addresses are
+masked when logged.
+
+The rule the code enforces: **NOVA never claims to have sent an email it did
+not send.** With no provider configured there is no "check your inbox"
+anywhere — the sign-up response says delivery is unconfigured, the desktop
+says so on screen, and outside production the token is returned so a developer
+can still finish the flow. That fallback requires the provider to be absent
+*and* the environment not to be production.
+
+Password reset deliberately reports configuration only, never whether *this*
+message was sent: a per-message flag would be true for real addresses and
+false for unknown ones, which is exactly the account-existence oracle the
+generic response text exists to prevent. A test asserts the two responses are
+byte-identical.
+
+Verification is honest on the client too. When it is required and the account
+is unconfirmed, NOVA shows a confirmation step instead of proceeding as though
+the address were proven, with "send it again" and a re-check that asks the
+backend rather than trusting the cached copy.
 
 ---
 

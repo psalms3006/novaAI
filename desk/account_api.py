@@ -153,6 +153,28 @@ def register(app, require_token, meta: dict) -> None:
         meta["user_name"] = "User"
         return jsonify({"ok": True, **_status_payload()})
 
+    @app.post("/api/account/verify/resend")
+    @require_token
+    def api_account_resend_verification():
+        try:
+            return jsonify({"ok": True, **_acct().resend_verification()})
+        except nova_account.Offline:
+            return jsonify({"ok": False, "error": "offline",
+                            "message": "Sending a new link needs a connection."}), 503
+        except nova_account.AccountError as e:
+            return jsonify({"ok": False, "error": e.code, "message": e.message}), 400
+
+    @app.post("/api/account/refresh")
+    @require_token
+    def api_account_refresh_identity():
+        """Re-read the account after the user follows a verification link."""
+        try:
+            st = _acct().refresh_identity()
+            st["display_name"] = _acct().display_name
+            return jsonify({"ok": True, **st})
+        except nova_account.AccountError:
+            return jsonify({"ok": False, **_status_payload()}), 503
+
     @app.get("/api/account/devices")
     @require_token
     def api_account_devices():

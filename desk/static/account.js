@@ -99,6 +99,12 @@
         display_name: name.value.trim()
       } }).then(function (j) {
         state = j;
+        if (j.verification_required && !j.email_verified) {
+          // The account exists but is not confirmed. Say so rather than
+          // dropping the user into NOVA as though it were.
+          showVerifyStep(j);
+          return;
+        }
         dismiss();
       }).catch(function (e) { fail(e.message || "Could not sign in."); });
     });
@@ -135,6 +141,70 @@
     ]);
   }
 
+  /* -- verification step ------------------------------------------------- */
+
+  function showVerifyStep(st) {
+    if (!gate) return;
+    var card = gate.querySelector(".acct-card");
+    card.textContent = "";
+
+    var delivery = st.email_delivery || {};
+    var address = (st.user || {}).email || "your address";
+    var status = el("p", { class: "acct-note" });
+
+    card.appendChild(el("div", { class: "acct-brand", text: "NOVA" }));
+    card.appendChild(el("h3", { class: "acct-sub",
+                                text: "Confirm your email" }));
+
+    if (delivery.sent) {
+      card.appendChild(el("p", { class: "acct-note",
+        text: "We sent a link to " + address + ". Open it to finish setting "
+            + "up your account." }));
+    } else {
+      // Nothing was sent. Never tell the user to check an inbox.
+      card.appendChild(el("p", { class: "acct-note",
+        text: "This NOVA server has no email delivery configured, so no "
+            + "confirmation link could be sent. Ask your administrator to "
+            + "finish setting up email." }));
+    }
+
+    var check = el("button", { class: "acct-primary", text: "I have confirmed",
+      onclick: function () {
+        status.textContent = "Checking…";
+        api("/api/account/refresh", { method: "POST" }).then(function (j) {
+          state = j;
+          if (j.email_verified) { dismiss(); }
+          else { status.textContent = "Not confirmed yet. Open the link, then try again."; }
+        }).catch(function () {
+          status.textContent = "Could not reach NOVA Cloud. Try again shortly.";
+        });
+      } });
+    card.appendChild(check);
+
+    var links = el("div", { class: "acct-links" }, [
+      el("button", { class: "acct-link", text: "Send it again",
+        onclick: function () {
+          status.textContent = "Sending…";
+          api("/api/account/verify/resend", { method: "POST" })
+            .then(function (j) {
+              status.textContent = (j.email_delivery && j.email_delivery.sent)
+                ? "Sent. Check your inbox."
+                : "Could not send — email is not configured on this server.";
+            })
+            .catch(function (e) { status.textContent = e.message || "Could not send."; });
+        } }),
+      el("button", { class: "acct-link", text: "Sign out",
+        onclick: function () {
+          api("/api/account/signout", { method: "POST" }).then(function (j) {
+            state = j;
+            gate.remove(); gate = null; present();
+          });
+        } })
+    ]);
+    card.appendChild(links);
+    card.appendChild(status);
+  }
+
   function present() {
     if (gate) return;
     gate = buildGate();
@@ -168,6 +238,8 @@
     host.appendChild(el("dl", { class: "acct-kv" }, [
       el("dt", { text: "Signed in as" }), el("dd", { text: u.email || "—" }),
       el("dt", { text: "Name" }), el("dd", { text: state.display_name || "—" }),
+      el("dt", { text: "Email" }),
+      el("dd", { text: state.email_verified ? "Confirmed" : "Not confirmed" }),
       el("dt", { text: "Connection" }),
       el("dd", { text: state.online ? "Online" : "Offline (using cached session)" }),
       el("dt", { text: "Credentials stored in" }),
@@ -225,7 +297,12 @@
     return api("/api/account").then(function (j) {
       state = j;
       window.NOVA_ACCOUNT = j;
-      if (j.configured && !j.signed_in) present();
+      if (j.configured && !j.signed_in) {
+        present();
+      } else if (j.configured && j.verification_required && !j.email_verified) {
+        present();
+        showVerifyStep(j);
+      }
       return j;
     }).catch(function () {
       // The account surface being unavailable must never stop NOVA loading.

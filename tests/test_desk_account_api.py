@@ -123,3 +123,45 @@ def test_device_local_keys_are_never_offered_for_sync():
     from nova_cloud.api_sync import DEVICE_LOCAL_KEYS
     overlap = desk_keys & DEVICE_LOCAL_KEYS
     assert not overlap, f"machine-specific keys marked as synced: {overlap}"
+
+
+# -- email verification through the desktop ----------------------------------
+
+def test_status_reports_verification_state(client):
+    """A client must be able to tell 'confirmed' from 'not confirmed'."""
+    j = client.get("/api/account", headers=AUTH).get_json()
+    assert "email_verified" in j
+    assert "verification_required" in j
+
+
+def test_resend_without_a_backend_fails_cleanly(client):
+    r = client.post("/api/account/verify/resend", headers=AUTH)
+    assert r.status_code in (400, 503)
+    assert r.get_json()["ok"] is False
+
+
+def test_refresh_identity_without_a_backend_fails_cleanly(client):
+    r = client.post("/api/account/refresh", headers=AUTH)
+    assert r.status_code in (400, 503)
+
+
+def test_verify_endpoints_require_the_desk_token(client):
+    for path in ("/api/account/verify/resend", "/api/account/refresh"):
+        assert client.post(path).status_code == 401
+
+
+def test_the_spa_never_says_check_your_inbox_when_nothing_was_sent():
+    """Section 7: NOVA must not imply an email exists that does not.
+
+    The 'check your inbox' wording must sit behind delivery.sent; the
+    unconfigured branch must say email is not configured instead.
+    """
+    js = io.open("desk/static/account.js", encoding="utf-8").read()
+    step = js[js.index("function showVerifyStep"):js.index("function present()")]
+
+    assert "delivery.sent" in step, "the verify step does not check delivery"
+    sent_branch, _, unsent_branch = step.partition("} else {")
+    assert "We sent a link" in sent_branch
+    assert "no email delivery configured" in unsent_branch
+    assert "We sent a link" not in unsent_branch, \
+        "the unconfigured branch claims an email was sent"
