@@ -24,7 +24,7 @@
       method: opts.method || "GET",
       headers: {
         "Content-Type": "application/json",
-        "X-Desk-Token": token()
+        "X-NOVA-Desk": token()
       },
       body: opts.body ? JSON.stringify(opts.body) : undefined
     }).then(function (r) {
