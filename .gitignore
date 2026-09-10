@@ -149,3 +149,8 @@ build_tmp2/
 
 # Archived dead/duplicate modules (kept out of builds; see archive/README.md)
 archive/
+
+# Build output from versioned build attempts. Generated, never source.
+build_v*/
+dist_v*/
+build_voice/
