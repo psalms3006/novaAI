@@ -77,6 +77,10 @@ hidden = [
     "desk", "desk.bridge", "desk.chat", "desk.voice", "desk.store",
     "desk.settings", "desk.confirm", "desk.projects", "desk.live_session",
     "desk.win_overlay", "desk.creds",
+    # Ambient screen awareness. mss resolves its platform backend at import
+    # time, so naming it here is what stops the packaged build from reporting
+    # "screen sharing unavailable" on a machine where it works fine in source.
+    "desk.screen_share", "mss", "mss.windows", "mss.base",
     # mind map (ES modules served as static files, not imported by Python)
     # core modules
     "core", "core.event_bus", "core.boot", "core.verification_engine",

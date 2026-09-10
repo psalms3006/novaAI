@@ -78,10 +78,16 @@ REF_ACTIVE_RMS = 150.0
 #: device plays it out a few hundred milliseconds later. At the end of a turn
 #: that leaves a window where NOVA's last words are physically in the air with
 #: no reference left to cancel them against — the residual is then all of her
-#: voice, the ratio explodes, and she "hears someone talking". Observed
-#: exactly once in a clean run: a barge-in fired on the tail of the greeting
-#: and the model transcribed her own closing words, "the hand", as the user.
-REF_TAIL_S = 0.5
+#: voice, the ratio explodes, and she "hears someone talking". Observed first
+#: on a greeting, where the model transcribed her own closing words, "the
+#: hand", back as something the user had said.
+#:
+#: Measured rather than guessed: with the guard at 0.5 s, false barge-ins
+#: still landed 0.57 s after the last reference write, because the output
+#: buffer holds roughly 300 ms and the acoustic path adds more. 1.2 s clears
+#: that with margin. It costs nothing in practice — the gate is only consulted
+#: while NOVA is speaking, and once she stops it is not consulted at all.
+REF_TAIL_S = 1.2
 
 #: Leakage assumed at the start of a turn, before anything has been measured:
 #: all of it. NOVA starts each turn uninterruptible and becomes interruptible
@@ -162,9 +168,16 @@ class EchoCanceller:
     and requires a real interruption to stand well clear of it.
     """
 
-    #: Longest echo delay we look for: output buffer plus acoustic path. 300 ms
-    #: covers WASAPI's shared-mode latency with room to spare.
-    MAX_LAG_S = 0.30
+    #: Longest echo delay we look for: output buffer plus acoustic path.
+    #:
+    #: 600 ms, not 300. If the real delay exceeds this window the canceller
+    #: cannot align at all, the whole echo lands in the residual, and NOVA
+    #: interrupts herself mid-sentence — the original bug wearing a different
+    #: hat. WASAPI shared mode alone can hold 200-400 ms depending on the
+    #: device, so 300 ms had no margin. The cost of doubling it is one extra
+    #: millisecond of FFT per 64 ms frame, which is nothing next to being
+    #: wrong.
+    MAX_LAG_S = 0.60
 
     #: Correlation above which the locked lag is still considered good. Below
     #: it we re-search, because the device buffer has moved.
