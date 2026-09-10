@@ -258,7 +258,10 @@ async function liveStart() {
   try {
     const j = await api_json("/api/live/start", { method: "POST", body: "{}" });
     if (j.ok) return true;
-    liveDisconnect();
+    // Detach this surface; leave the session alone. There may be another
+    // window with a working conversation in progress, and stopping the
+    // session would end it for everyone.
+    liveDetach();
     return false;
   } catch (e) {
     return false;
@@ -427,11 +430,17 @@ async function setScreenWatching(on) {
 }
 window.novaSetScreenWatching = setScreenWatching;
 
-async function liveDisconnect() {
+/* Stop listening on this surface. The session keeps running for the others. */
+function liveDetach() {
   if (state.liveWs) {
     state.liveWs.close();
     state.liveWs = null;
   }
+}
+
+/* End the conversation, for every surface. Only ever a deliberate user act. */
+async function liveDisconnect() {
+  liveDetach();
   state.listening = false;
   try { await api_json("/api/live/stop", { method: "POST", body: "{}" }); } catch (e) { /* noop */ }
 }
