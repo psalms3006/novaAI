@@ -169,3 +169,105 @@ The device's own default rate is 44,100 Hz while the stream is opened at
 | Microphone never opening | **RULED OUT** | `[LIVE] mic opened` precedes the stall |
 | Packaged EXE missing an audio DLL | **RULED OUT** | `sounddevice` and PortAudio resolve in the EXE; playback starts |
 | CPU saturation | **UNLIKELY** | The stall is a single blocking import, not sustained load |
+
+---
+
+## Root cause of the 2026-09-10 failure: "listening" but deaf and mute
+
+**Confidence: certain.** Reproduced independently, from the application's own log
+and from a fresh diagnostic run.
+
+### What was actually happening
+
+`%APPDATA%/NOVA/nova.log` records the whole story:
+
+```
+10:24:49  [LIVE] connecting to models/gemini-3.1-flash-live-preview voice=Aoede ...
+10:24:51  [LIVE] connect/run error (failure 1/6): 1007 None. API key not valid.
+...
+10:25:59  [LIVE] connect/run error (failure 6/6): 1007 None. API key not valid.
+10:25:59  [LIVE] giving up after 6 consecutive failures
+```
+
+Gemini rejected the credential. The session therefore never opened — and because
+the microphone is opened *inside* the session, NOVA never touched the microphone
+at all. Nothing was ever going to be spoken. That is the reported symptom exactly:
+no microphone access, no speech, indefinitely.
+
+The same log shows a healthy session at 00:30 that connected in 1.5 s and opened
+the mic. The credential worked that morning and was rejected by 10:24.
+
+### Why the credential stopped working
+
+The stored key was 50 characters beginning `Ab8`. The key the user holds is 53
+characters beginning `AQ.`. The stored value was the same key **with its
+leading `AQ.` missing** — a partial paste.
+
+That is the entire failure. Gemini rejects the truncated value with
+
+```
+1007  API key not valid. Please pass a valid API key.
+```
+
+an error that names the key rather than the truncation, so it reads as an
+entirely wrong key. `byok.bin` was written at 00:35; the last healthy session
+was at 00:30, before it. Every session after it failed.
+
+**Correction.** An earlier revision of this document, and of
+`desk/creds.classify_credential()`, claimed `AQ.*` was a short-lived OAuth
+token that expires within the hour. That was wrong. Google AI Studio issues
+keys in two durable formats — `AIza…` (39 chars) and `AQ.Ab8…` (53 chars) —
+and the user's `AQ.` key was verified against the live API on 2026-09-10:
+
+```
+[ok]  credential            mode=byok, kind=api_key_aistudio, length=53
+[ok]  Gemini Live connect   connected in 1.75s
+```
+
+No evidence ever supported the expiry theory; truncation explained every
+observation on its own. The claim would have nagged every user holding a
+perfectly good key, and pointed future diagnosis at the wrong thing.
+
+`desk/creds.valid_key_format()` accepts any credential of 20 characters or
+more. That remains correct — the SDK genuinely accepts several formats — but it
+is why a truncated key was stored without comment. `classify_credential()` now
+catches exactly this case.
+
+### Why nobody could see it
+
+Three separate failures of honesty, all now fixed:
+
+| Layer | Defect | Fix |
+|---|---|---|
+| `desk/static/app.js` | Set the orb to `listening` because `/api/live/start` returned ok. That call returns as soon as a **thread spawns** — before any connection, and before the mic is opened. | The orb waits for the backend to report `connected`/`streaming`. A session that never reports ready times out visibly after 20 s. |
+| `desk/live_session.py` | A rejected key was retried 6 times with exponential backoff as though it were a network blip, then the loop gave up **silently**. | `_is_auth_failure()` classifies credential rejection as permanent; the loop stops on the first one and publishes an actionable message. |
+| `desk/live_session.py` | `_start_mic()` returned in silence when the audio backend was missing, and only logged when the device failed to open. | Both paths now publish `error` and `state` events naming the cause, including Windows microphone privacy settings. |
+| `desk/static/app.js` | A fatal voice error coloured the orb red and said nothing. | The message is written into the transcript. |
+
+### Ruled out
+
+- **PortAudio bundling** — `_sounddevice_data/portaudio-binaries/*.dll` is present
+  in every build, and `_cffi_backend` alongside it.
+- **Audio hardware** — the doctor opens the real speaker at 24 kHz and enumerates
+  11 input and 13 output devices on this machine.
+- **TLS** — `nova_tls.ensure_tls_trust()` verifies outbound HTTPS against the OS
+  trust store. (A bare shell without it fails with
+  `CERTIFICATE_VERIFY_FAILED`; the app calls it at startup, so it is unaffected.
+  The diagnostic now calls it too, or it would report an error the app never sees.)
+
+### The diagnostic
+
+`tools/voice_doctor.py` tests each stage rather than assuming it: audio backend,
+devices, real microphone capture with a measured signal level, real speaker
+output, credential kind, TLS trust, and an actual Gemini Live connection. It
+prints only a credential's length, prefix and kind — never the value — so its
+output is safe to share.
+
+It reproduces the production failure exactly:
+
+```
+[FAIL]  credential
+        mode=byok, kind=truncated_key, length=50, prefix='Ab8R'
+[FAIL]  Gemini Live connect
+        after 1.28s: APIError: 1007 None. API key not valid.
+```

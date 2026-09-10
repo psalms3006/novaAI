@@ -183,6 +183,52 @@ def valid_key_format(key: str) -> bool:
     return len(k) >= 20
 
 
+def classify_credential(key: str) -> dict:
+    """Describe what kind of credential this is, and whether it is intact.
+
+    Google AI Studio issues keys in two formats, and both are durable:
+
+        AIza…    the classic 39-character Gemini API key
+        AQ.Ab8…  the current 53-character AI Studio key
+
+    Verified on 2026-09-10: an `AQ.` key from aistudio.google.com/apikey
+    connected to Gemini Live in 3.6 s. An earlier revision of this function
+    called `AQ.` a short-lived OAuth token that expires within the hour. That
+    was wrong -- the observed failure was truncation, not expiry, and nothing
+    in the evidence supported an expiry claim.
+
+    What actually breaks is a partial paste. `AQ.Ab8…` that loses its leading
+    `AQ.` becomes a 50-character string beginning `Ab8`, which Gemini rejects
+    with
+
+        1007  API key not valid. Please pass a valid API key.
+
+    -- an error that names the key rather than the paste, so it reads as a
+    wrong key rather than a truncated one. That cost a day of diagnosis, so it
+    is detected explicitly.
+    """
+    k = (key or "").strip()
+    if not k:
+        return {"kind": "none", "durable": False, "warning": ""}
+    if k.startswith("AIza"):
+        return {"kind": "api_key", "durable": True, "warning": ""}
+    if k.startswith("AQ."):
+        return {"kind": "api_key_aistudio", "durable": True, "warning": ""}
+    if k.startswith("Ab8") or k.startswith("Ab"):
+        # An `AQ.Ab8…` key whose prefix was lost in the paste. It cannot
+        # authenticate, and the resulting error does not say so.
+        return {"kind": "truncated_key", "durable": False, "warning":
+                "This key looks like an AI Studio key that lost its leading "
+                "“AQ.” when it was pasted, so Gemini will reject it. "
+                "Copy the whole value from aistudio.google.com/apikey, "
+                "including the “AQ.” at the start."}
+    return {"kind": "unknown", "durable": False, "warning":
+            "NOVA does not recognise this credential’s format. Keys from "
+            "aistudio.google.com/apikey begin with either “AQ.” or "
+            "“AIza”. If voice fails to start, check the whole value was "
+            "pasted."}
+
+
 # ── device identity ──────────────────────────────────────────────────────────
 
 def _device_path() -> Path:
@@ -374,6 +420,17 @@ def resolve() -> dict:
         "byok_masked": mask(load_byok()) if mode == "byok" else "",
         "has_credential": mode in ("env", "cloud", "byok"),
     }
+    # Tell the interface what sort of credential is actually in play, so a
+    # key that will expire is flagged before it strands the user mid-sentence.
+    effective = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if mode == "cloud" or effective == _SENTINEL:
+        status["credential_kind"] = "cloud_session"
+        status["credential_warning"] = ""
+    else:
+        info = classify_credential(effective)
+        status["credential_kind"] = info["kind"]
+        status["credential_durable"] = info["durable"]
+        status["credential_warning"] = info["warning"]
     _last_status = status
     return status
 

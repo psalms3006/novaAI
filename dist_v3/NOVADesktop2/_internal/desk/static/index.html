@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NOVA</title>
+  <link rel="icon" type="image/png" href="/static/brand/logo/nova-icon.png">
+  <link rel="stylesheet" href="/static/brand.css">
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/hud.css">
+  <link rel="stylesheet" href="/static/vendor/atom-one-dark.min.css" id="hlcss">
+</head>
+<body>
+  <script>window.DESK_TOKEN = "__DESK_TOKEN__"; window.DESK_VERSION = "__DESK_VERSION__";</script>
+
+  <!-- ═══════════════════════════════════════════════════════
+       INITIALIZATION SCREEN
+       ═══════════════════════════════════════════════════════ -->
+  <div class="init-screen" id="init-screen">
+    <div class="init-logo-wrap">
+      <div class="nova-logo" style="width:80px;height:80px;" aria-label="NOVA"></div>
+    </div>
+    <div class="init-brand">NOVA</div>
+    <div class="init-sequence" id="init-sequence">
+      <div class="init-line" data-step="core">
+        <span class="init-label">intelligence</span>
+        <span class="init-status" id="init-core">initializing...</span>
+      </div>
+      <div class="init-line" data-step="voice">
+        <span class="init-label">voice system</span>
+        <span class="init-status" id="init-voice">initializing...</span>
+      </div>
+      <div class="init-line" data-step="memory">
+        <span class="init-label">memory</span>
+        <span class="init-status" id="init-memory">initializing...</span>
+      </div>
+      <div class="init-line" data-step="tools">
+        <span class="init-label">tools</span>
+        <span class="init-status" id="init-tools">initializing...</span>
+      </div>
+    </div>
+    <div class="init-ready" id="init-ready" style="display:none">
+      <div class="init-logo-wrap">
+        <div class="nova-logo" style="width:64px;height:64px;" aria-label="NOVA"></div>
+      </div>
+      <span class="init-status ready">ready</span>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════
+       MAIN APPLICATION — Three-column layout
+       ═══════════════════════════════════════════════════════ -->
+  <div class="app" id="app" style="display:none">
+
+    <!-- ── conversation drawer (secondary surface) ─────────────────── -->
+    <aside class="drawer" id="left-panel">
+      <div class="drawer-head">
+        <span class="drawer-ttl">CONVERSATIONS</span>
+        <button class="icon-btn" id="btn-close-panel" title="Close" aria-label="Close panel">&#10005;</button>
+      </div>
+      <button class="newchat-btn" id="btn-new">+ New</button>
+      <div class="drawer-search"><input id="search-convos" type="search" placeholder="Search..." autocomplete="off"></div>
+      <nav class="convo-list" id="convo-list"></nav>
+      <div class="panel-nav" id="panel-nav">
+        <button class="nav-item" data-view="projects"><span class="ico">&#9635;</span> Projects</button>
+        <button class="nav-item" data-view="files"><span class="ico">&#9783;</span> Files</button>
+        <button class="nav-item" data-view="skills"><span class="ico">&#9881;</span> Skills</button>
+        <button class="nav-item" data-view="mind-map"><span class="ico">&#9673;</span> Mind Map</button>
+        <button class="nav-item" data-view="memory"><span class="ico">&#9670;</span> Memory</button>
+        <button class="nav-item" data-view="settings"><span class="ico">&#9881;</span> Settings</button>
+      </div>
+      <div class="drawer-foot">
+        <span id="status-dot" class="status-dot connecting"></span>
+        <span id="status-text">Connecting...</span>
+        <span id="status-model" class="chip"></span>
+      </div>
+    </aside>
+
+    <!-- ── command centre ──────────────────────────────────────────── -->
+    <div class="hud" id="hud">
+
+      <!-- header -->
+      <header class="hud-head">
+        <div class="hud-head-l">
+          <button class="icon-btn ghost" id="btn-toggle-panel" title="Conversations" aria-label="Conversations">&#9776;</button>
+          <div>
+            <div class="sys-name">N.O.V.A. <span class="sys-exp">&middot; NEURAL OPERATIONS &amp; VOICE ASSISTANT</span></div>
+            <div class="sys-obj">OBJECTIVE &nbsp;:&nbsp; <span id="hud-objective">AWAITING INSTRUCTION</span><span id="chat-title" hidden></span></div>
+          </div>
+        </div>
+        <div class="hud-head-r">
+          <div class="hud-clock" id="hud-clock">--:--:--</div>
+          <div class="hud-date" id="hud-date">--</div>
+          <div class="hud-meta">
+            <div>SESSION &nbsp;: <span id="hud-session">----</span></div>
+            <div>ENGINE &nbsp;&nbsp;: <span id="hud-engine">----</span></div>
+            <div>LATENCY &nbsp;: <span id="hud-latency">--</span></div>
+          </div>
+        </div>
+      </header>
+
+      <div class="hud-pills" id="hud-pills">
+        <span class="pill" id="pill-link"><i></i>LINK</span>
+        <span class="pill" id="pill-tls"><i></i>TLS</span>
+        <span class="pill" id="pill-voice"><i></i>VOICE</span>
+        <span class="pill" id="pill-memory"><i></i>MEMORY</span>
+        <span class="pill" id="pill-brain"><i></i>BRAIN</span>
+      </div>
+
+      <!-- main grid -->
+      <div class="hud-grid">
+
+        <!-- left rail -->
+        <section class="rail rail-l">
+          <div class="panel">
+            <h4>SYSTEM VITALS</h4>
+            <div class="vitals" id="hud-vitals"></div>
+          </div>
+          <div class="panel grow">
+            <h4>TELEMETRY</h4>
+            <div class="logfeed" id="hud-telemetry"></div>
+          </div>
+        </section>
+
+        <!-- stage -->
+        <section class="stage">
+          <div class="orb-container" id="orb-container">
+            <canvas id="orb-canvas"></canvas>
+          </div>
+          <div class="stage-state"><span class="orb-label" id="orb-label">Ready</span></div>
+
+          <!-- Voice is not a mode you enter: the mic is hot once NOVA has
+               initialised. This is a status line plus a secondary mute, never
+               a "press to talk" control. -->
+          <div class="voice-cta">
+            <span id="voice-cta-label">Initialising&hellip;</span>
+            <button id="btn-mute" class="mute-btn" title="Mute microphone"
+                    aria-label="Mute microphone" aria-pressed="false">Mute</button>
+          </div>
+
+          <div class="live-transcript" id="live-transcript">
+            <div class="transcript-content" id="transcript-content">
+              <p class="transcript-placeholder" id="transcript-placeholder">Speak to NOVA &mdash; or type below</p>
+              <div class="transcript-messages" id="transcript-messages"></div>
+            </div>
+          </div>
+
+          <div class="command-bar" id="command-bar">
+            <button class="icon-btn" id="btn-voice" title="Voice input" aria-label="Voice input">&#127908;</button>
+            <input id="input" type="text" placeholder="ask naturally&hellip;" autocomplete="off" aria-label="Ask NOVA">
+            <button class="icon-btn primary" id="btn-send" title="Send" aria-label="Send">&#10148;</button>
+          </div>
+        </section>
+
+        <!-- right rail -->
+        <section class="rail rail-r">
+          <div class="panel">
+            <h4>LINK</h4>
+            <div class="radar" id="hud-radar"><canvas id="radar-canvas"></canvas></div>
+            <div class="kv"><span>UP</span><b id="hud-up">--</b></div>
+            <div class="kv"><span>DOWN</span><b id="hud-down">--</b></div>
+          </div>
+          <div class="panel">
+            <h4>AUDIO S/N</h4>
+            <canvas id="wave-canvas" class="wave"></canvas>
+          </div>
+          <div class="panel grow">
+            <h4>ACTIVITY</h4>
+            <div class="agent-field-container" id="agent-field"></div>
+          </div>
+        </section>
+      </div>
+
+      <!-- roll call -->
+      <footer class="rollcall">
+        <div class="rollcall-head">
+          <span class="rc-ttl">ROLL CALL &middot; ACTIVE AGENTS</span>
+          <span class="rc-sub">NOVA COMMAND CENTER / MANAGER AGENT</span>
+          <span class="rc-standby">STANDBY : <b id="hud-standby">--</b></span>
+        </div>
+        <div class="rollcall-grid" id="hud-agents"></div>
+      </footer>
+    </div>
+
+    <!-- inspector sheet: real data for the nav views, opened on demand -->
+    <aside class="inspector" id="inspector">
+      <div class="inspector-head">
+        <span class="inspector-ttl" id="inspector-title">DETAIL</span>
+        <button class="icon-btn" id="btn-inspector-close" title="Close" aria-label="Close">&#10005;</button>
+      </div>
+      <div class="inspector-body" id="inspector-body"></div>
+    </aside>
+
+    <!-- kept for app.js compatibility; the drawer owns this surface now -->
+    <aside class="right-field" id="right-field" hidden></aside>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════
+       MODALS
+       ═══════════════════════════════════════════════════════ -->
+
+  <!-- Settings modal -->
+  <div class="modal-backdrop" id="settings-modal">
+    <div class="modal modal-wide">
+      <h2>Settings</h2>
+      <div class="settings-tabs" id="settings-tabs">
+        <button data-tab="general" class="active">General</button>
+        <button data-tab="account">Account</button>
+        <button data-tab="appearance">Appearance</button>
+        <button data-tab="documents">Documents</button>
+        <button data-tab="voice">Voice</button>
+        <button data-tab="intelligence">Intelligence</button>
+        <button data-tab="permissions">Permissions</button>
+        <button data-tab="advanced">Advanced</button>
+      </div>
+      <div class="settings-body" id="settings-body"></div>
+      <div class="actions">
+        <button class="btn" id="btn-settings-close">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- First-run onboarding -->
+  <div class="modal-backdrop open" id="onboard-modal" style="display:none">
+    <div class="modal modal-wide">
+      <h2>Welcome to NOVA</h2>
+      <p style="color:var(--muted)">Your personal AI with real capabilities -- memory, files,
+        vision, voice, research and computer control. Choose how NOVA should connect:</p>
+      <div class="onboard-grid">
+        <div class="card onboard-card">
+          <h3>NOVA Cloud</h3>
+          <p class="desc">Sign in through your NOVA account. The AI credential stays on our
+            servers -- nothing for you to manage.</p>
+          <div class="field"><label>NOVA server URL</label>
+            <input type="text" id="ob-cloud-url" placeholder="https://nova.example.com"></div>
+          <button class="btn-sm primary" id="ob-cloud-btn">Connect</button>
+        </div>
+        <div class="card onboard-card">
+          <h3>Use my own API key</h3>
+          <p class="desc">Bring your own Gemini key. Sealed with Windows DPAPI.</p>
+          <div class="field"><label>Gemini API key</label>
+            <input type="password" id="ob-byok-key" placeholder="Paste your API key" autocomplete="off"></div>
+          <button class="btn-sm primary" id="ob-byok-btn">Save key</button>
+        </div>
+        <div class="card onboard-card">
+          <h3>Work offline</h3>
+          <p class="desc">Use NOVA's local brain only -- no network model.</p>
+          <button class="btn-sm" id="ob-offline-btn">Continue offline</button>
+        </div>
+      </div>
+      <p class="set-note" id="ob-note"></p>
+    </div>
+  </div>
+
+  <!-- Confirm modal -->
+  <div class="modal-backdrop" id="confirm-modal">
+    <div class="modal">
+      <h2>NOVA needs your approval</h2>
+      <p id="confirm-text" style="color:var(--muted)"></p>
+      <div class="actions">
+        <button class="btn" id="btn-confirm-no">No</button>
+        <button class="btn primary" id="btn-confirm-yes">Yes, proceed</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- About modal -->
+  <div class="modal-backdrop" id="about-modal">
+    <div class="modal">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
+        <div class="nova-logo" style="width:48px;height:48px;" aria-label="NOVA"></div>
+        <h2 style="margin:0;">NOVA</h2>
+      </div>
+      <p style="color:var(--muted)">
+        <strong style="color:var(--text)">NOVA</strong> is a personal AI assistant with
+        real computer capabilities -- built by <strong style="color:var(--text)">Omniel</strong>.
+      </p>
+      <p style="color:var(--muted)">Version <span id="about-version"></span></p>
+      <div class="actions"><button class="btn" id="btn-about-close">Close</button></div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <!-- Failsafe: if app.js fails to load, clear init screen after 4s -->
+  <script>
+    setTimeout(function() {
+      var s = document.getElementById('init-screen');
+      if (s && !s.dataset.dismissed) {
+        s.dataset.dismissed = '1';
+        s.classList.add('fade-out');
+        s.style.pointerEvents = 'none';
+        setTimeout(function() {
+          s.style.display = 'none';
+          try { s.remove(); } catch(e) {}
+        }, 400);
+      }
+      var a = document.getElementById('app');
+      if (a) a.style.display = 'flex';
+    }, 4000);
+  </script>
+
+  <script src="/static/vendor/marked.min.js" defer></script>
+  <script src="/static/vendor/purify.min.js" defer></script>
+  <script src="/static/vendor/highlight.min.js" defer></script>
+  <script src="/static/orb.js" defer></script>
+  <script src="/static/events.js" defer></script>
+  <script src="/static/agent-field.js" defer></script>
+  <script src="/static/app.js" defer></script>
+  <script src="/static/hud.js" defer></script>
+  <script src="/static/account.js" defer></script>
+  <script src="/static/documents.js" defer></script>
+
+  <!-- Three.js for 3D Mind Map (local vendor bundle) -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/static/vendor/three/three.module.js",
+      "three/addons/": "/static/vendor/three/"
+    }
+  }
+  </script>
+  <script type="module" src="/static/mind/main.js" defer></script>
+  <script type="module">
+    // Volumetric orb. Falls back silently to the 2D canvas orb if the machine
+    // has no usable WebGL context (app.js checks window.__novaOrb first).
+    import { NovaOrb3D } from "/static/orb3d.js";
+    const host = document.getElementById("orb-container");
+    if (host) {
+      const o = new NovaOrb3D(host);
+      if (o.available) {
+        window.__novaOrb = o;
+        if (window.__novaSetOrb) window.__novaSetOrb(o);
+      } else {
+        o.dispose();   // leaves the 2D canvas orb in place
+      }
+    }
+  </script>
+
+</body>
+</html>

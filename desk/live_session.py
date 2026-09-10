@@ -25,6 +25,7 @@ from typing import Any
 import numpy as np
 
 import nova_voice
+from desk.screen_share import ScreenShare
 
 try:
     import sounddevice as sd
@@ -100,6 +101,12 @@ MIC_WARMUP_WAIT_S = 4.0
 #: and speaking anyway. Long enough for the desktop window to finish loading
 #: on a cold start, short enough that a headless session is not left mute.
 SURFACE_WAIT_S = 8.0
+
+#: How long a tool may run before NOVA stops waiting for it. The model is
+#: blocked on the response for this whole time, and so is the conversation, so
+#: it has to be long enough for a web search and short enough that a wedged
+#: tool does not take the session with it.
+TOOL_TIMEOUT_S = 30.0
 
 #: Audio buffered before playback starts, per turn. Enough to ride out normal
 #: network jitter; small enough that NOVA still feels immediate.
@@ -365,6 +372,11 @@ class LiveManager:
     RECONNECT_BASE_DELAY = 2.0
     RECONNECT_MAX_DELAY = 60.0
 
+    #: How often to look for the network while offline. Cheap — a failed DNS
+    #: lookup costs nothing — and short enough that voice returns on its own
+    #: shortly after the connection does.
+    OFFLINE_RETRY_DELAY = 5.0
+
     def __init__(self, model: str | None = None, voice: str | None = None):
         self._model = model or os.getenv("LIVE_MODEL", LIVE_MODEL_DEFAULT)
         self._voice = voice or os.getenv("NOVA_VOICE", _resolve("NOVA_VOICE", "Aoede"))
@@ -426,6 +438,12 @@ class LiveManager:
         self._play_generation = 0
         self._trace: VoiceTrace | None = None
         self._auth_rejected = False
+        self._offline = False
+        # Screen awareness shares this session rather than opening its own.
+        # Ambient mode is a second view of one NOVA, so what she can see has
+        # to arrive in the same conversation she is already having.
+        self._screen = ScreenShare(sink=self._send_screen_frame, log=_log)
+        self._video_queue: asyncio.Queue | None = None
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -448,6 +466,7 @@ class LiveManager:
             self._audio_bytes_in = 0
             self._has_greeted = False
             self._auth_rejected = False
+            self._offline = False
         self._trace = VoiceTrace(uuid.uuid4().hex[:6])
         self._trace.mark("connect_start")
         self._thread = threading.Thread(target=self._run_loop, name="nova-live", daemon=True)
@@ -463,8 +482,10 @@ class LiveManager:
         self._publish(LiveEvent("state", state="disconnecting"))
         # Sentinels unblock the senders; both queues belong to the loop, so
         # they have to be posted from it.
+        self._screen.stop()
         self._post_to_loop(self._mic_queue, None)
         self._post_to_loop(self._input_text_queue, None)
+        self._post_to_loop(self._video_queue, None)
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread:
@@ -499,6 +520,47 @@ class LiveManager:
         except (RuntimeError, asyncio.QueueFull):
             return False
 
+    def set_screen_share(self, enabled: bool) -> dict:
+        """Turn screen awareness on or off for the running session."""
+        if enabled:
+            with self._state_lock:
+                if self._state not in (LiveState.CONNECTED, LiveState.STREAMING):
+                    return {"ok": False, "watching": False,
+                            "reason": "voice session not running"}
+            result = self._screen.start()
+        else:
+            result = self._screen.stop()
+        self._publish(LiveEvent("screen_share", watching=self._screen.enabled,
+                                **({"reason": result["reason"]}
+                                   if not result.get("ok") else {})))
+        return {**result, "watching": self._screen.enabled}
+
+    def screen_status(self) -> dict:
+        return self._screen.status()
+
+    def _send_screen_frame(self, jpeg: bytes, mime: str) -> None:
+        """Hand a captured frame to the session. Called from the sampler.
+
+        Dropped rather than queued if the session is busy: a stale screenshot
+        is worth less than the audio it would delay, and another frame is two
+        seconds away.
+        """
+        q = self._video_queue
+        loop = self._loop
+        if q is None or loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(self._offer_video, q, jpeg, mime)
+        except RuntimeError:
+            pass
+
+    @staticmethod
+    def _offer_video(q: "asyncio.Queue", jpeg: bytes, mime: str) -> None:
+        try:
+            q.put_nowait((jpeg, mime))
+        except asyncio.QueueFull:
+            pass
+
     def status(self) -> dict:
         with self._state_lock:
             state = self._state.value
@@ -520,6 +582,7 @@ class LiveManager:
             "turns": self._turn_count,
             "audio_out_kb": round(self._audio_bytes_out / 1024, 1),
             "audio_in_kb": round(self._audio_bytes_in / 1024, 1),
+            "screen": self._screen.status(),
             "error": self._last_error,
         }
 
@@ -897,6 +960,29 @@ class LiveManager:
             self._publish(LiveEvent("state", state="error", error=str(e)))
 
     @staticmethod
+    def _is_offline(err: str) -> bool:
+        """Is this "there is no network" rather than "the service refused us"?
+
+        The distinction decides whether giving up is reasonable. A laptop that
+        loses wifi, sleeps, or changes network produces name-resolution
+        failures for as long as it is disconnected — and counting those toward
+        a six-attempt budget means voice is dead until the application is
+        restarted, which is exactly what happened here: six getaddrinfo
+        failures in ninety seconds and then a permanent silent give-up.
+
+        Being offline is a state to wait out, not a failure to abandon.
+        """
+        e = (err or "").lower()
+        return ("getaddrinfo failed" in e
+                or "name or service not known" in e
+                or "temporary failure in name resolution" in e
+                or "nodename nor servname" in e
+                or "network is unreachable" in e
+                or "no route to host" in e
+                or "errno 11001" in e
+                or "errno 11002" in e)
+
+    @staticmethod
     def _is_auth_failure(err: str) -> bool:
         """Is this a credential problem rather than a network one?
 
@@ -971,6 +1057,9 @@ class LiveManager:
                     self._session = session
                     connected_ok = True
                     consecutive_failures = 0
+                    if self._offline:
+                        self._offline = False
+                        _log("[LIVE] network is back")
                     dt = time.time() - t0
                     self._t_connected = time.time()
                     _log("[LIVE] connected in %.1fs", dt)
@@ -981,6 +1070,10 @@ class LiveManager:
                     # microphone callback can post to them.
                     self._mic_queue = asyncio.Queue(maxsize=MIC_QUEUE_FRAMES)
                     self._input_text_queue = asyncio.Queue()
+                    # One frame deep on purpose: if a frame is still waiting
+                    # when the next is captured, the waiting one is already
+                    # out of date.
+                    self._video_queue = asyncio.Queue(maxsize=1)
                     self._gate.reset()
 
                     # Consumers before producers.
@@ -992,6 +1085,7 @@ class LiveManager:
                     tg.create_task(self._mic_sender(session))
                     tg.create_task(self._receiver(session))
                     tg.create_task(self._text_sender(session))
+                    tg.create_task(self._video_sender(session))
 
                     # Devices next, and only then do we call ourselves ready.
                     #
@@ -1045,8 +1139,24 @@ class LiveManager:
                 if self._is_auth_failure(str(e)):
                     # Permanent: report it in the user's language and stop.
                     self._auth_rejected = True
-                self._publish(LiveEvent("state", state="error", error=str(e)))
+                elif self._is_offline(str(e)):
+                    # Not a failure to count. Wait it out and say so plainly,
+                    # rather than exhausting the retry budget while the user
+                    # is on a train.
+                    consecutive_failures = 0
+                    if not self._offline:
+                        self._offline = True
+                        _log("[LIVE] no network; waiting for it to come back")
+                        self._publish(LiveEvent(
+                            "state", state="offline", error=str(e),
+                            message=("NOVA can't reach the network, so voice "
+                                     "is paused. She'll pick it up again as "
+                                     "soon as you're back online.")))
+                    self._publish(LiveEvent("state", state="offline"))
+                else:
+                    self._publish(LiveEvent("state", state="error", error=str(e)))
             finally:
+                self._screen.stop()
                 self._stop_mic()
                 self._stop_playback()
                 self._session = None
@@ -1080,11 +1190,14 @@ class LiveManager:
                 break
 
             # Exponential backoff with a ceiling, so a persistent outage costs
-            # a trickle of retries rather than 30 per minute.
-            delay = min(
+            # a trickle of retries rather than 30 per minute. While offline
+            # the backoff sits at a steady poll instead: there is no server to
+            # be gentle with, and the user wants voice back the moment their
+            # connection is.
+            delay = (self.OFFLINE_RETRY_DELAY if self._offline else min(
                 self.RECONNECT_BASE_DELAY * (2 ** max(0, consecutive_failures - 1)),
                 self.RECONNECT_MAX_DELAY,
-            )
+            ))
             with self._state_lock:
                 self._state = LiveState.CONNECTING
             self._publish(LiveEvent("state", state="connecting", retry_in_s=round(delay, 1)))
@@ -1252,6 +1365,21 @@ class LiveManager:
                 got_turn = False
                 async for msg in session.receive():
                     got_turn = True
+
+                    if msg.tool_call and msg.tool_call.function_calls:
+                        # Answer it, or the model simply stops.
+                        #
+                        # This session advertises sixteen tools and had no
+                        # handler for any of them. Gemini Live blocks on a
+                        # function call until the client returns a response,
+                        # so the moment NOVA decided to look something up she
+                        # went silent — no audio, no transcript, turn over.
+                        # Conversational replies still worked, which is why it
+                        # looked intermittent: "hello" was answered and "what
+                        # is the capital of Nigeria" was not.
+                        await self._handle_tool_calls(session, msg.tool_call)
+                        continue
+
                     sc = msg.server_content
                     if sc is None:
                         continue
@@ -1316,6 +1444,83 @@ class LiveManager:
             _log("[LIVE] receiver error: %s", e)
             self._publish(LiveEvent("error", error=str(e)))
             raise
+
+    async def _handle_tool_calls(self, session: Any, tool_call: Any) -> None:
+        """Run the tools the model asked for and send the results back."""
+        names = [fc.name for fc in tool_call.function_calls]
+        _log("[LIVE] tool call: %s", ", ".join(names))
+        self._publish(LiveEvent("tool_call", tools=names))
+
+        responses = []
+        for fc in tool_call.function_calls:
+            responses.append(await self._run_tool(fc))
+
+        try:
+            await session.send_tool_response(function_responses=responses)
+        except Exception as e:
+            # The tool ran; the model never heard about it and will stall.
+            # Say so rather than leaving a silent NOVA to explain.
+            _log("[LIVE] send_tool_response failed: %s", e)
+            self._publish(LiveEvent("error", error="tool_response_failed",
+                                    message=str(e)))
+
+    async def _run_tool(self, fc: Any) -> Any:
+        """Execute one tool call off the event loop.
+
+        Tools open applications, drive the browser and touch the filesystem —
+        all of it blocking, and none of it allowed to stall the audio stream
+        that is running on this loop.
+        """
+        name = fc.name
+        args = dict(fc.args or {})
+        t0 = time.time()
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(self._execute_tool, name, args),
+                timeout=TOOL_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            result = (f"'{name}' is taking longer than {TOOL_TIMEOUT_S:.0f} "
+                      "seconds; it may still be running.")
+            _log("[LIVE] tool %s timed out", name)
+        except Exception as e:
+            result = f"Tool '{name}' encountered an error: {str(e)[:200]}"
+            _log("[LIVE] tool %s failed: %s", name, e)
+        _log("[LIVE] tool %s finished in %.1fs", name, time.time() - t0)
+        self._publish(LiveEvent("tool_result", tool=name,
+                                summary=str(result)[:200]))
+        response = result if isinstance(result, dict) else {"output": str(result)}
+        return gtypes.FunctionResponse(id=fc.id, name=name, response=response)
+
+    @staticmethod
+    def _execute_tool(name: str, args: dict) -> Any:
+        """NOVA Core owns what tools are and what they do; this only calls it."""
+        import nova as _nova
+        meta = _load_meta()
+        result = _nova._execute_tool_sync(name, args, meta)
+        if name == "remember_fact" and args.get("fact"):
+            try:
+                _nova.add_memory_fact(args["fact"], meta)
+            except Exception:
+                pass
+        return result
+
+    async def _video_sender(self, session: Any) -> None:
+        """Forward sampled screen frames into the live conversation."""
+        while True:
+            try:
+                item = await self._video_queue.get()
+                if item is None:
+                    break
+                jpeg, mime = item
+                await session.send_realtime_input(
+                    video=gtypes.Blob(data=jpeg, mime_type=mime))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                _log("[LIVE] screen frame send failed: %s", e)
+                # Vision is an enhancement; losing it must never take the
+                # conversation down with it.
+                await asyncio.sleep(1.0)
 
     async def _text_sender(self, session: Any) -> None:
         while True:

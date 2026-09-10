@@ -137,3 +137,49 @@ class KeepaliveTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class OfflineTests(unittest.TestCase):
+    """Losing the network must pause voice, not end it.
+
+    Observed during testing when this machine's DNS went down: six
+    getaddrinfo failures inside ninety seconds exhausted the retry budget and
+    NOVA gave up permanently. A laptop that sleeps, changes wifi, or goes
+    through a tunnel does exactly that, and voice should come back on its own
+    rather than needing the app restarted.
+    """
+
+    from desk.live_session import LiveManager
+
+    def test_name_resolution_failures_are_recognised_as_offline(self):
+        for err in ("[Errno 11001] getaddrinfo failed",
+                    "[Errno 11002] getaddrinfo failed",
+                    "Name or service not known",
+                    "Temporary failure in name resolution",
+                    "Network is unreachable"):
+            with self.subTest(err=err):
+                self.assertTrue(self.LiveManager._is_offline(err))
+
+    def test_a_rejected_key_is_not_mistaken_for_being_offline(self):
+        """These must not be confused: one is waited out, the other is fatal."""
+        for err in ("API key not valid. Please pass a valid API key.",
+                    "PERMISSION_DENIED", "UNAUTHENTICATED"):
+            with self.subTest(err=err):
+                self.assertFalse(self.LiveManager._is_offline(err))
+                self.assertTrue(self.LiveManager._is_auth_failure(err))
+
+    def test_a_server_error_is_neither(self):
+        err = "sent 1011 (internal error) keepalive ping timeout"
+        self.assertFalse(self.LiveManager._is_offline(err))
+        self.assertFalse(self.LiveManager._is_auth_failure(err))
+
+    def test_offline_retries_stay_frequent_enough_to_notice_recovery(self):
+        self.assertLessEqual(self.LiveManager.OFFLINE_RETRY_DELAY, 15.0)
+        self.assertGreaterEqual(self.LiveManager.OFFLINE_RETRY_DELAY, 1.0)
+
+    def test_being_offline_does_not_consume_the_retry_budget(self):
+        import inspect
+        src = inspect.getsource(self.LiveManager._connect_and_run)
+        offline_branch = src[src.index("elif self._is_offline"):]
+        self.assertIn("consecutive_failures = 0", offline_branch.split("else:")[0],
+                      "offline attempts still count toward giving up")

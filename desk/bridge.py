@@ -968,6 +968,23 @@ def api_live_mute():
     return jsonify(mgr.set_muted(not mgr.muted))
 
 
+@app.post("/api/live/screen")
+@require_token
+def api_live_screen():
+    """Turn NOVA's screen awareness on or off.
+
+    Off unless explicitly switched on, and switched off again whenever the
+    voice session ends. Screen contents are the most sensitive thing NOVA can
+    be given, so this is never implicit: nothing here is enabled by opening
+    ambient mode, only by asking for it.
+    """
+    data = request.get_json(silent=True) or {}
+    mgr = desk_live.get_live_manager()
+    if "watching" in data:
+        return jsonify(mgr.set_screen_share(bool(data.get("watching"))))
+    return jsonify(mgr.set_screen_share(not mgr.screen_status()["watching"]))
+
+
 @app.get("/api/live/status")
 @require_token
 def api_live_status():

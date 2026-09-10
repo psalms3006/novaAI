@@ -315,6 +315,7 @@ function handleLiveEvent(ev) {
       // NOVA Core owns the voice state; this surface only reflects it.
       if (window.novaSetVoiceLabel) window.novaSetVoiceLabel(ev.state);
       if (ev.state === "ready") {
+        state.offlineNoticed = false;
         // The backend has the session, the speaker and the microphone all
         // genuinely open. Anything earlier is a promise, not a fact.
         setOrb("listening");
@@ -331,6 +332,17 @@ function handleLiveEvent(ev) {
         state.listening = true;      // mic stays hot while NOVA talks (barge-in)
       } else if (ev.state === "connecting") {
         setOrb("thinking");
+      } else if (ev.state === "offline") {
+        // Paused, not broken. NOVA reconnects on her own when the network
+        // returns, so this must not look like a dead session.
+        setOrb("idle");
+        state.listening = false;
+        state.voiceReadyConfirmed = true;
+        clearTimeout(state.voiceReadyTimer);
+        if (!state.offlineNoticed) {
+          state.offlineNoticed = true;
+          if (ev.message) addTranscript_nova(ev.message);
+        }
       } else if (ev.state === "error") {
         setOrb("error");
         state.listening = false;
@@ -355,6 +367,14 @@ function handleLiveEvent(ev) {
     case "error":
       if (ev.message) addTranscript_nova(ev.message);
       console.error("[nova] voice error:", ev.error, ev.message || "");
+      break;
+    case "screen_share":
+      // Screen awareness has to be visible while it is on. NOVA reading the
+      // screen is the most sensitive thing she does, and it must never be
+      // something the user has to remember they enabled.
+      state.screenWatching = !!ev.watching;
+      document.body.classList.toggle("screen-watching", state.screenWatching);
+      if (ev.reason) addTranscript_nova("NOVA can't watch the screen: " + ev.reason);
       break;
     case "audio_level":
       window.__novaAudioLevel = ev.level || 0;
@@ -392,6 +412,20 @@ function addTranscript(text, role) {
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
 }
+
+/* Screen awareness — off unless asked for, and shown while it is on. */
+async function setScreenWatching(on) {
+  try {
+    const r = await api_json("/api/live/screen", {
+      method: "POST", body: JSON.stringify({ watching: !!on }),
+    });
+    if (!r.ok && r.reason) addTranscript_nova("NOVA can't watch the screen: " + r.reason);
+    return !!r.watching;
+  } catch (e) {
+    return false;
+  }
+}
+window.novaSetScreenWatching = setScreenWatching;
 
 async function liveDisconnect() {
   if (state.liveWs) {
