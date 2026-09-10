@@ -101,11 +101,20 @@ class VoiceGate:
         with self._lock:
             return self._speaking
 
-    def set_speaking(self, value: bool) -> None:
+    def set_speaking(self, value: bool, *, interrupted: bool = False) -> None:
+        """Mark NOVA as speaking or not.
+
+        `interrupted=True` means the user cut in. That distinction matters: a
+        natural end needs the cooldown below, because the speaker's tail is
+        still decaying into the microphone. An interruption does not -- the
+        user is mid-sentence, and swallowing the next quarter second of it is
+        the difference between being heard and being ignored.
+        """
         with self._lock:
             self._speaking = bool(value)
             if not value:
-                self._last_speak_end = time.time()
+                # Only a natural finish arms the cooldown.
+                self._last_speak_end = 0.0 if interrupted else time.time()
                 self._speech_runs = 0
 
     @property
@@ -129,7 +138,8 @@ class VoiceGate:
                 self.frames_muted += 1
                 return self._silence
             speaking = self._speaking
-            too_soon = (time.time() - self._last_speak_end) < self._cooldown_s
+            too_soon = (self._last_speak_end > 0.0
+                        and (time.time() - self._last_speak_end) < self._cooldown_s)
 
         if not (speaking or too_soon):
             self.frames_sent += 1
@@ -145,7 +155,13 @@ class VoiceGate:
                     self._speech_runs = 0
             if triggered:
                 self.barge_ins += 1
-                self.set_speaking(False)
+                # Interrupted, not finished: no cooldown. Previously this used
+                # the plain call, which armed the 250 ms cooldown and silenced
+                # the next four frames -- so an interruption delivered exactly
+                # one 64 ms frame of the user's sentence and then nothing. The
+                # model received a fragment too short to act on, which is why
+                # the first utterance appeared to be ignored.
+                self.set_speaking(False, interrupted=True)
                 if self._on_barge_in is not None:
                     try:
                         self._on_barge_in()

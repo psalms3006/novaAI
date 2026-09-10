@@ -31,6 +31,8 @@ def session():
     m._interrupted_epoch = -1
     m._speaker_alive = True
     m._last_audio_at = 0.0
+    m._play_generation = 0
+    m._trace = None
     m._turn_done_flag = False
     m._turn_count = 0
     m._audio_bytes_out = 0

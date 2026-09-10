@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -25,6 +26,20 @@ def engine():
     with _lock:
         if _engine is None:
             url = config().database_url
+
+            # Refuse a remote database under pytest.
+            #
+            # Guarding the environment variable is not enough: several NOVA
+            # modules call load_dotenv() at import time, so a test that merely
+            # imports one can find the production URL back in os.environ. This
+            # is the boundary that matters -- nothing can connect to Supabase
+            # from a test run, whatever the environment says.
+            if ("PYTEST_CURRENT_TEST" in os.environ
+                    and not url.startswith("sqlite")):
+                raise RuntimeError(
+                    "refusing to open a non-SQLite database from a test run "
+                    f"({url.split('://')[0]}://...). Set DATABASE_URL to a "
+                    "sqlite:// path in the fixture.")
             kw: dict = {"future": True, "pool_pre_ping": True}
 
             if url.startswith("postgresql"):

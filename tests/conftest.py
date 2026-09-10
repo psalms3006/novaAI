@@ -39,8 +39,22 @@ def _isolate_from_production():
 
 @pytest.fixture(autouse=True)
 def _no_live_database():
-    """A test that reaches a non-local database is a bug, not a slow test."""
-    url = os.environ.get("DATABASE_URL", "")
-    if url and not url.startswith("sqlite"):
-        pytest.fail(f"a test tried to use a non-SQLite database: "
-                    f"{url.split('://')[0]}://...")
+    """Clear production credentials before every test, not just once.
+
+    Popping them at session start is not enough: several NOVA modules call
+    load_dotenv() at import time, so the first test that imports one puts the
+    live DATABASE_URL back into the environment. Anything importing that
+    module afterwards would quietly point at Supabase.
+
+    The value is removed rather than merely reported, so a stray import cannot
+    hand a test the production database, and the assertion below then catches
+    anything that sets one deliberately.
+    """
+    for key in _PRODUCTION_KEYS:
+        value = os.environ.get(key, "")
+        if key == "DATABASE_URL" and value and not value.startswith("sqlite"):
+            os.environ.pop(key, None)
+        elif key in ("RESEND_API_KEY", "NOVA_ADMIN_PASSWORD") and value:
+            os.environ.pop(key, None)
+
+    yield

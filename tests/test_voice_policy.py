@@ -261,3 +261,58 @@ def test_manager_uses_the_shared_policy():
     import nova_voice
     m = _manager()
     assert isinstance(m._gate, nova_voice.VoiceGate)
+
+
+# -- the interruption cooldown -----------------------------------------------
+
+def test_an_interruption_does_not_arm_the_speaker_cooldown():
+    """The bug this prevents, and why the first utterance was ignored:
+
+    Barge-in called set_speaking(False), which armed the 250 ms cooldown meant
+    for the speaker's decaying tail. The frame that triggered the interruption
+    was transmitted and the next four frames of the user's sentence were
+    replaced with silence -- so the model received one 64 ms fragment, far too
+    short to act on. Measured before the fix: 1 of 6 frames reached the model
+    even at shouting volume. After: 5 of 6.
+    """
+    import numpy as np
+    import nova_voice
+
+    def speech(amplitude=2000):
+        t = np.arange(1024)
+        return (np.sin(2 * np.pi * 180 * t / 16000) * amplitude
+                + np.random.randn(1024) * amplitude * 0.15).astype(np.int16)
+
+    g = nova_voice.VoiceGate(chunk_samples=1024, on_barge_in=lambda: None)
+    g.set_speaking(True)
+    transmitted = sum(1 for _ in range(6)
+                      if g.process(speech()) != bytes(2048))
+    assert transmitted >= 4, (
+        f"only {transmitted}/6 frames of the user's speech reached the model "
+        "after barge-in; the cooldown is swallowing the sentence")
+
+
+def test_a_natural_finish_still_suppresses_the_speaker_tail():
+    """The cooldown exists for a real reason: NOVA must not transcribe the
+    tail of her own voice decaying into the microphone."""
+    import numpy as np
+    import nova_voice
+
+    g = nova_voice.VoiceGate(chunk_samples=1024, on_barge_in=lambda: None)
+    g.set_speaking(True)
+    g.set_speaking(False)                      # finished on her own
+    loud = (np.random.randn(1024) * 2000).astype(np.int16)
+    assert all(g.process(loud) == bytes(2048) for _ in range(3)), \
+        "the speaker tail is reaching the model"
+
+
+def test_the_two_endings_are_distinguishable():
+    import nova_voice
+    g = nova_voice.VoiceGate(chunk_samples=1024)
+    g.set_speaking(True)
+    g.set_speaking(False, interrupted=True)
+    assert g._last_speak_end == 0.0, "an interruption armed the cooldown"
+
+    g.set_speaking(True)
+    g.set_speaking(False)
+    assert g._last_speak_end > 0.0, "a natural finish did not arm the cooldown"
