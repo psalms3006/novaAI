@@ -2333,24 +2333,16 @@ def run_desk_server(meta, port: int | None = None) -> None:
                 if cws in _event_clients:
                     _event_clients.remove(cws)
 
-    # Auto-start Gemini Live session (voice-first behavior)
-    try:
-        def _auto_start_live():
-            """Auto-start Live session after a short delay to let the server stabilize."""
-            import time as _time
-            _time.sleep(2.0)  # give the server a moment to be ready
-            try:
-                mgr = desk_live.get_live_manager()
-                result = mgr.start()
-                if result.get("ok"):
-                    print(f"[NOVA] 🔊 Voice auto-started: {result.get('message', 'ok')}")
-                else:
-                    print(f"[NOVA] ⚠️  Voice auto-start skipped: {result.get('reason', 'unknown')}")
-            except Exception as e:
-                print(f"[NOVA] ⚠️  Voice auto-start failed: {e}")
-        threading.Thread(target=_auto_start_live, daemon=True).start()
-    except Exception as e:
-        print(f"[NOVA] ⚠️  Voice auto-start thread failed: {e}")
-
+    # Voice is started by the interface, not by a timer here.
+    #
+    # This used to spawn a thread that slept two seconds and then opened the
+    # Live session regardless of what else was happening. Two seconds after
+    # the HTTP server binds is not "the application is ready" — it is usually
+    # before the window has painted. The user's report was NOVA speaking over
+    # her own startup, a fragment of a greeting delivered to an interface that
+    # did not exist yet, and this timer is where that came from.
+    #
+    # The SPA calls POST /api/live/start once it has loaded and attached to
+    # the event stream, which is the only moment that actually means ready.
     print(f"[NOVA] Press Ctrl+C to stop.")
     _serve(_server)

@@ -416,6 +416,7 @@ class VoiceGate:
         self.last_residual = 0.0
         self.last_smoothed = 0.0
         self.last_leak_ratio = 0.0
+        self.last_was_silence = False
 
     # ── state ────────────────────────────────────────────────────────────
 
@@ -479,12 +480,19 @@ class VoiceGate:
     # ── the policy ───────────────────────────────────────────────────────
 
     def process(self, frame: np.ndarray) -> bytes:
-        """Return the bytes to transmit for this mic frame."""
+        """Return the bytes to transmit for this mic frame.
+
+        Also records whether the frame was muted, readable from
+        :attr:`last_was_silence`. Callers that batch frames before sending use
+        it to avoid spending bandwidth on long runs of digital zeroes; it is
+        written from the microphone callback and meant to be read there.
+        """
         with self._lock:
             if self._muted:
                 # Explicit user mute: still send silence so the session stays
                 # alive and NOVA can resume instantly when unmuted.
                 self.frames_muted += 1
+                self.last_was_silence = True
                 return self._silence
             speaking = self._speaking
             too_soon = (self._last_speak_end > 0.0
@@ -492,6 +500,7 @@ class VoiceGate:
 
         if not (speaking or too_soon):
             self.frames_sent += 1
+            self.last_was_silence = False
             return frame.tobytes()
 
         # NOVA is talking (or just stopped). Mute by default, but listen for a
@@ -508,9 +517,11 @@ class VoiceGate:
                 except Exception:
                     pass
             self.frames_sent += 1
+            self.last_was_silence = False
             return frame.tobytes()
 
         self.frames_muted += 1
+        self.last_was_silence = True
         return self._silence
 
     def _is_double_talk(self, frame: np.ndarray) -> bool:

@@ -44,6 +44,41 @@ except Exception:
 
 LIVE_MODEL_DEFAULT = "models/gemini-3.1-flash-live-preview"
 MIC_RATE = 16000
+
+#: Mic block size. 1024 frames at 16 kHz is 64 ms — the same granularity the
+#: reference implementation uses, and small enough that a barge-in is noticed
+#: promptly without waking the callback so often that it costs measurable CPU.
+MIC_BLOCK = 1024
+
+#: Mic frames buffered before the oldest is dropped. Two seconds. Anything
+#: longer is not a buffer, it is a delay: audio that stale has already lost
+#: the conversation it belonged to.
+MIC_QUEUE_FRAMES = 32
+
+#: Audio gathered into one outbound message.
+#:
+#: Frames are captured at 64 ms because that is the granularity barge-in
+#: detection needs, but transmitting at 64 ms means 15.6 WebSocket messages a
+#: second, and the socket is where this pipeline actually falls over. Measured
+#: against Gemini Live from this machine over 100 s at a constant bit rate:
+#:
+#:     64 ms messages (15.6/s):  6 sends stalled past 250 ms, worst 2.9 s
+#:    200 ms messages ( 5.0/s):  2 sends stalled past 250 ms, worst 3.0 s
+#:    500 ms messages ( 2.0/s):  5 sends stalled past 250 ms, worst 14.9 s
+#:
+#: The cost is per message, not per byte, so batching helps — but only up to a
+#: point, past which each message is large enough to stall on its own. 200 ms
+#: is the measured floor, and it is well inside what turn detection needs.
+#:
+#: Expressed as exactly three 64 ms frames so a batch is never a frame and a
+#: bit, which would round up to 256 ms and quietly cost latency nobody chose.
+SEND_BATCH_MS = 192
+
+#: While NOVA is speaking the microphone is muted, so every batch is digital
+#: silence. Sending 5 messages a second of zeroes buys nothing and competes
+#: with the audio coming back for the same congested uplink. One every 800 ms
+#: is enough to keep the stream from looking abandoned.
+SILENCE_KEEPALIVE_MS = 800
 # If 'speaking' is set the mic is muted, so a stuck flag means NOVA is deaf.
 # Longest plausible gap between audio chunks inside one model turn.
 SPEAKING_WATCHDOG_S = 3.0
@@ -51,6 +86,11 @@ SPEAKING_WATCHDOG_S = 3.0
 #: How long NOVA will wait for Core to produce something worth saying before
 #: falling back to a plain greeting. The user is already waiting to talk.
 GREETING_BUDGET_S = 6.0
+
+#: How long the greeting waits for an interface to attach before giving up
+#: and speaking anyway. Long enough for the desktop window to finish loading
+#: on a cold start, short enough that a headless session is not left mute.
+SURFACE_WAIT_S = 8.0
 
 #: Audio buffered before playback starts, per turn. Enough to ride out normal
 #: network jitter; small enough that NOVA still feels immediate.
@@ -139,6 +179,97 @@ def _telemetry(event: str, **attrs) -> None:
         nova_account.emit(event, **{k: v for k, v in attrs.items() if v is not None})
     except Exception:
         pass
+
+
+#: WebSocket keepalive, widened from the library default of 20 s.
+#:
+#: The client sends a ping every interval and closes the connection with 1011
+#: if no pong comes back within the timeout. On a congested uplink a single
+#: outbound send was measured stalling for up to 15 s, and the pong sits
+#: behind that stall in the same socket — so the default closed a session
+#: that was about to recover perfectly well. Every failure in the reported
+#: logs was this: "sent 1011 (internal error) keepalive ping timeout", roughly
+#: 70 seconds in, mid-conversation, over and over.
+#:
+#: Pinging is kept, at the same rate: a genuinely dead socket must still be
+#: noticed. Only the patience for an answer changes.
+WS_PING_INTERVAL_S = 20
+WS_PING_TIMEOUT_S = 75
+
+
+def _relax_websocket_keepalive(client: Any) -> bool:
+    """Widen the Live socket's keepalive timeout, if the SDK still allows it.
+
+    google-genai splats `_api_client._websocket_ssl_ctx` straight into
+    `websockets.connect()`, so extra keyword arguments placed there reach the
+    library. That is a private attribute and it may not survive an SDK
+    upgrade, which is why this reports failure rather than raising: a session
+    with the default keepalive is worse, not broken.
+    """
+    try:
+        kwargs = client._api_client._websocket_ssl_ctx
+        if not isinstance(kwargs, dict):
+            raise TypeError(type(kwargs).__name__)
+        kwargs["ping_interval"] = WS_PING_INTERVAL_S
+        kwargs["ping_timeout"] = WS_PING_TIMEOUT_S
+        return True
+    except Exception as e:
+        _log("[LIVE] could not widen WebSocket keepalive (%s); using the "
+             "library default, so a long network stall may drop the session", e)
+        return False
+
+
+class MicBatcher:
+    """Gathers 64 ms mic frames into messages worth sending.
+
+    Two jobs. It batches frames up to :data:`SEND_BATCH_MS`, because the
+    per-message cost on the socket is what limits this pipeline rather than
+    the bitrate. And it throttles runs of pure silence — while NOVA is talking
+    the gate mutes the microphone, and transmitting that at full rate spends
+    upstream bandwidth on zeroes at exactly the moment her audio needs it.
+    """
+
+    def __init__(self, rate: int = MIC_RATE,
+                 batch_ms: int = SEND_BATCH_MS,
+                 silence_ms: int = SILENCE_KEEPALIVE_MS):
+        self._target = int(rate * batch_ms / 1000) * 2      # bytes, int16
+        self._silence_gap = silence_ms / 1000.0
+        self._buf: list[bytes] = []
+        self._bytes = 0
+        self._all_silence = True
+        self._last_silence_sent = 0.0
+
+    def add(self, payload: bytes, silent: bool) -> bytes | None:
+        """Returns a message to send, or None while still gathering."""
+        self._buf.append(payload)
+        self._bytes += len(payload)
+        if not silent:
+            self._all_silence = False
+        if self._bytes < self._target:
+            return None
+
+        batch = b"".join(self._buf)
+        silence = self._all_silence
+        self._buf.clear()
+        self._bytes = 0
+        self._all_silence = True
+
+        now = time.monotonic()
+        if silence:
+            if now - self._last_silence_sent < self._silence_gap:
+                return None
+            self._last_silence_sent = now
+        else:
+            # Real audio resets the clock: the next quiet stretch gets its full
+            # keepalive interval rather than one measured from ancient history.
+            self._last_silence_sent = now
+        return batch
+
+    def reset(self) -> None:
+        self._buf.clear()
+        self._bytes = 0
+        self._all_silence = True
+        self._last_silence_sent = 0.0
 
 
 class LiveState(str, Enum):
@@ -237,8 +368,19 @@ class LiveManager:
         self._session: Any = None
         self._mic_active = False
         self._mic_stream: Any = None
-        self._mic_queue: queue.Queue = queue.Queue(maxsize=50)
-        self._input_text_queue: queue.Queue = queue.Queue()
+        # Mic frames go straight from the PortAudio callback onto the event
+        # loop, the way the reference implementation does it.
+        #
+        # The previous pump was a threading.Queue drained by
+        # loop.run_in_executor(queue.get, timeout=0.1). That polls a worker
+        # thread 15 times a second forever, and when a send ran long the queue
+        # backed up and was then flushed as a burst — 106 frames dropped in a
+        # 100 second session, and the outbound burst delayed the WebSocket
+        # keepalive behind it until the socket was closed with 1011. An
+        # asyncio.Queue posted from the callback has no polling, no worker
+        # thread and no burst: one frame in, one frame out.
+        self._mic_queue: asyncio.Queue | None = None
+        self._input_text_queue: asyncio.Queue | None = None
         self._t_first_audio: float = 0.0
         self._t_connected: float = 0.0
         self._start_time: float = 0.0
@@ -250,7 +392,7 @@ class LiveManager:
 
         # One shared voice policy — identical rules to the terminal path.
         self._gate = nova_voice.VoiceGate(
-            chunk_samples=1024, on_barge_in=self._barge_in,
+            chunk_samples=MIC_BLOCK, on_barge_in=self._barge_in,
         )
         # NOVA Core owns playback. The UI surfaces receive amplitude/state and
         # only visualise it, so the fullscreen window and the ambient orb can
@@ -259,30 +401,22 @@ class LiveManager:
         self._play_thread: threading.Thread | None = None
         self._play_stop = threading.Event()
         self._turn_done_flag = False
-        # Barge-in suppression, scoped to the turn it belongs to.
-        #
-        # This was a plain boolean latch and that made NOVA go deaf: it was
-        # cleared only by `interrupted`/`turn_complete` from the model, but a
-        # barge-in on the *tail* of playback happens after the model already
-        # finished the turn, so neither message ever arrives again. The latch
-        # stayed set and every later chunk was discarded -- mic streaming,
-        # model replying, NOVA silent.
-        #
-        # An epoch fixes it: suppression only applies to the turn that was
-        # actually interrupted, and any new turn -- including one detected
-        # purely from the user starting to speak -- moves past it.
-        self._turn_epoch = 0
-        self._interrupted_epoch = -1
         self._speaker_alive = False
         self._last_audio_at = 0.0
         self._t_mic_ready = 0.0
         self._mic_dropped = 0
+        self._send_total = 0.0
+        self._send_count = 0
+        self._send_worst = 0.0
+        self._last_drop_log = 0.0
+        self._batcher = MicBatcher()
         # Bumped whenever playback is cut. The pre-roll lives inside the
         # speaker thread, so draining _play_q alone would leave held audio to
         # play after an interruption -- exactly the "speaks a fragment of the
         # old response" behaviour barge-in exists to prevent.
         self._play_generation = 0
         self._trace: VoiceTrace | None = None
+        self._auth_rejected = False
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -304,6 +438,7 @@ class LiveManager:
             self._audio_bytes_out = 0
             self._audio_bytes_in = 0
             self._has_greeted = False
+            self._auth_rejected = False
         self._trace = VoiceTrace(uuid.uuid4().hex[:6])
         self._trace.mark("connect_start")
         self._thread = threading.Thread(target=self._run_loop, name="nova-live", daemon=True)
@@ -317,9 +452,10 @@ class LiveManager:
                 return {"ok": True, "message": "not running"}
             self._state = LiveState.DISCONNECTING
         self._publish(LiveEvent("state", state="disconnecting"))
-        # Send sentinel to unblock mic sender, then stop loop
-        self._mic_queue.put(None)
-        self._input_text_queue.put(None)
+        # Sentinels unblock the senders; both queues belong to the loop, so
+        # they have to be posted from it.
+        self._post_to_loop(self._mic_queue, None)
+        self._post_to_loop(self._input_text_queue, None)
         if self._loop and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread:
@@ -339,8 +475,20 @@ class LiveManager:
         with self._state_lock:
             if self._state not in (LiveState.CONNECTED, LiveState.STREAMING):
                 return {"ok": False, "reason": "not connected"}
-        self._input_text_queue.put(text)
+        if not self._post_to_loop(self._input_text_queue, text):
+            return {"ok": False, "reason": "session loop not running"}
         return {"ok": True}
+
+    def _post_to_loop(self, q: "asyncio.Queue | None", item: Any) -> bool:
+        """Put an item on a loop-owned queue from any thread."""
+        loop = self._loop
+        if q is None or loop is None or loop.is_closed():
+            return False
+        try:
+            loop.call_soon_threadsafe(q.put_nowait, item)
+            return True
+        except (RuntimeError, asyncio.QueueFull):
+            return False
 
     def status(self) -> dict:
         with self._state_lock:
@@ -384,38 +532,52 @@ class LiveManager:
     # ── playback (Core-owned) ─────────────────────────────────────────────
 
     def _start_playback(self) -> None:
+        """Open the speaker, then start draining the queue into it.
+
+        The device is opened *synchronously*, before this returns. It used to
+        be opened inside the worker thread, which meant the session declared
+        itself ready and sent the greeting while the speaker was still
+        opening; the first chunks of NOVA's first sentence arrived to find
+        `_speaker_alive` still false and were dropped on the floor as
+        "speaker_unavailable". A greeting that starts mid-word is not a
+        greeting.
+        """
         if self._play_thread is not None or not HAS_SD:
-            return
+            return False
         self._play_stop.clear()
+        try:
+            # blocksize=0 lets the device choose, and the default latency is
+            # used deliberately.
+            #
+            # The previous setting was blocksize=4096 with latency="low",
+            # which asks for the smallest buffer the device will give while
+            # writing in large lumps. Measured on this machine that blocked 6
+            # of 12 writes past 150 ms against 0 of 12 for the defaults: the
+            # device drained between writes, and an empty output buffer is the
+            # click that was heard. Model audio arrives in bursts over a
+            # network, so playback needs slack, not the tightest buffer.
+            stream = sd.RawOutputStream(
+                samplerate=nova_voice.RECEIVE_RATE,
+                channels=nova_voice.CHANNELS,
+                dtype="int16",
+                blocksize=0,
+            )
+            stream.start()
+        except Exception as e:
+            _log("[LIVE] speaker open failed: %s", e)
+            # Make sure a dead speaker never leaves the mic muted.
+            self._speaker_alive = False
+            self._gate.set_speaking(False)
+            self._publish(LiveEvent(
+                "error", error="speaker_unavailable",
+                message=("NOVA could not open your speakers (%s), so you will "
+                         "not hear her replies." % type(e).__name__)))
+            return False
+
+        self._speaker_alive = True
+        _log("[LIVE] speaker ready (%d Hz)", nova_voice.RECEIVE_RATE)
 
         def _worker():
-            try:
-                # blocksize=0 lets the device choose, and the default
-                # latency is used deliberately.
-                #
-                # The previous setting was blocksize=4096 with latency="low",
-                # which asks for the smallest buffer the device will give
-                # while writing in large lumps. Measured on this machine that
-                # blocked 6 of 12 writes past 150 ms against 0 of 12 for the
-                # defaults: the device drained between writes, and an empty
-                # output buffer is the click that was heard. Model audio
-                # arrives in bursts over a network, so playback needs slack,
-                # not the tightest possible buffer.
-                stream = sd.RawOutputStream(
-                    samplerate=nova_voice.RECEIVE_RATE,
-                    channels=nova_voice.CHANNELS,
-                    dtype="int16",
-                    blocksize=0,
-                )
-                stream.start()
-            except Exception as e:
-                _log("[LIVE] speaker open failed: %s", e)
-                # Make sure a dead speaker never leaves the mic muted.
-                self._speaker_alive = False
-                self._gate.set_speaking(False)
-                return
-            self._speaker_alive = True
-            _log("[LIVE] speaker ready (%d Hz)", nova_voice.RECEIVE_RATE)
             # Pre-roll: hold a little audio back before the first write.
             #
             # Starting playback on the very first chunk means the device is
@@ -429,32 +591,39 @@ class LiveManager:
             primed = False
             generation = self._play_generation
 
+            def emit(chunk: bytes) -> None:
+                # Tell the gate what the room is about to hear, at the moment
+                # it hears it. The echo canceller aligns against this, so
+                # handing it audio at enqueue time instead — seconds before
+                # the device plays it — would put the reference outside the
+                # search window and cancel nothing.
+                self._gate.reference(chunk, nova_voice.RECEIVE_RATE)
+                stream.write(chunk)
+
             try:
                 while not self._play_stop.is_set():
                     try:
                         chunk = self._play_q.get(timeout=0.2)
                     except queue.Empty:
-                        # A pause with audio still held back means the turn is
-                        # short: play what there is rather than waiting for a
-                        # cushion that will never fill.
                         if self._play_generation != generation:
                             generation = self._play_generation
                             preroll.clear(); preroll_bytes = 0; primed = False
                             continue
+                        # A pause with audio still held back means the turn is
+                        # short: play what there is rather than waiting for a
+                        # cushion that will never fill.
                         if preroll and not primed:
                             for held in preroll:
                                 try:
-                                    stream.write(held)
+                                    emit(held)
                                 except Exception:
                                     break
                             preroll.clear(); preroll_bytes = 0; primed = True
                         # Queue drained and the model finished its turn: NOVA
                         # has stopped talking, so reopen the mic.
                         if self._gate.speaking and self._turn_done_flag:
-                            self._gate.set_speaking(False)
-                            self._turn_done_flag = False
+                            self._finish_speaking()
                             primed = False          # next turn re-buffers
-                            self._publish(LiveEvent("state", state="listening"))
                         elif self._gate.speaking and self._last_audio_at:
                             # Watchdog. 'speaking' mutes the mic, so anything
                             # that leaves it set is deafness. If the queue has
@@ -462,9 +631,8 @@ class LiveManager:
                             # model's audio, stop believing NOVA is talking.
                             if time.time() - self._last_audio_at > SPEAKING_WATCHDOG_S:
                                 _log("[LIVE] watchdog: clearing stuck speaking state")
-                                self._gate.set_speaking(False)
-                                self._turn_done_flag = False
-                                self._publish(LiveEvent("state", state="listening"))
+                                self._finish_speaking()
+                                primed = False
                         continue
                     if chunk is None:
                         break
@@ -479,11 +647,14 @@ class LiveManager:
                             preroll_bytes += len(chunk)
                             if preroll_bytes >= need:
                                 for held in preroll:
-                                    stream.write(held)
+                                    emit(held)
                                 preroll.clear(); preroll_bytes = 0
                                 primed = True
+                                if self._trace:
+                                    self._trace.mark("playback_started")
+                                    self._trace.turn_timing("playback started")
                         else:
-                            stream.write(chunk)
+                            emit(chunk)
                     except Exception as e:
                         _log("[LIVE] speaker write failed: %s", e)
             finally:
@@ -494,8 +665,16 @@ class LiveManager:
                 except Exception:
                     pass
 
-        self._play_thread = threading.Thread(target=_worker, name="nova-speaker", daemon=True)
+        self._play_thread = threading.Thread(target=_worker, name="nova-speaker",
+                                             daemon=True)
         self._play_thread.start()
+        return True
+
+    def _finish_speaking(self) -> None:
+        """NOVA has stopped talking: reopen the mic and say so."""
+        self._gate.set_speaking(False)
+        self._turn_done_flag = False
+        self._publish(LiveEvent("state", state="listening"))
 
     def _stop_playback(self) -> None:
         self._play_stop.set()
@@ -506,12 +685,17 @@ class LiveManager:
         self._play_thread = None
 
     def _enqueue_audio(self, audio: bytes) -> None:
-        """Play a chunk and tell the surfaces how loud it is."""
-        if self._interrupted_epoch == self._turn_epoch:
-            # The user cut into *this* turn. Discard the rest of it instead of
-            # resuming playback and immediately re-triggering the detector.
-            # Scoped to the epoch, so it cannot leak into the next turn.
-            return
+        """Play a chunk and tell the surfaces how loud it is.
+
+        There is deliberately no post-interruption suppression here. There
+        used to be: an epoch latch that discarded every chunk of a turn once
+        it had been interrupted. It existed because the barge-in detector was
+        firing on NOVA's own echo, so playback had to be kept from resuming
+        and re-triggering it — and when the latch failed to clear, NOVA went
+        silent for the rest of the session while the model went on replying.
+        With echo cancellation the premise is gone: an interruption now means
+        the user really spoke, the model is told, and it stops on its own.
+        """
         if not self._speaker_alive:
             # No playback thread: never mute the mic on its behalf, or NOVA
             # would be permanently deaf on a machine with no working speaker.
@@ -533,17 +717,7 @@ class LiveManager:
         self._publish(LiveEvent("audio_level", level=round(level, 4)))
 
     def _barge_in(self) -> None:
-        """User spoke over NOVA — stop immediately and stay stopped."""
-        # Only suppress a turn that is genuinely still in flight. A cough on
-        # the *tail* of playback -- after the model already finished the turn
-        # -- has nothing to cut off, and latching there is what made NOVA
-        # silent for every turn afterwards.
-        turn_in_flight = (not self._turn_done_flag) and (
-            self._play_q.qsize() > 0
-            or (self._last_audio_at and time.time() - self._last_audio_at < 1.0)
-        )
-        if turn_in_flight:
-            self._interrupted_epoch = self._turn_epoch
+        """User spoke over NOVA — stop playing and let them finish."""
         # Clear speaking here too, not just in VoiceGate.process. "Stop
         # talking" has to be self-sufficient: any caller of _barge_in should
         # leave NOVA genuinely stopped, not rely on the detector having
@@ -551,6 +725,7 @@ class LiveManager:
         # interrupted=True: the user is mid-sentence, so the speaker-tail
         # cooldown must not swallow the next quarter second of it.
         self._gate.set_speaking(False, interrupted=True)
+        self._turn_done_flag = False
         self._play_generation += 1        # discard anything held in the pre-roll
         dropped = nova_voice.drain(self._play_q)
         _log("[LIVE] barge-in — dropped %d queued chunks", dropped)
@@ -567,17 +742,47 @@ class LiveManager:
         return self._gate.muted
 
     def _start_mic(self) -> None:
-        if not HAS_SD or self._mic_active:
+        if self._mic_active:
             return
+        if not HAS_SD:
+            # Previously this returned in silence. The session went on to
+            # connect, the orb went on saying "listening", and NOVA simply
+            # could not hear -- with nothing anywhere to say why. An audio
+            # stack that failed to load is a hard failure of a voice
+            # assistant, so it is reported as one.
+            _log("[LIVE] no audio backend: sounddevice failed to import; "
+                 "microphone cannot be opened")
+            self._publish(LiveEvent(
+                "error", error="mic_unavailable",
+                message=("NOVA has no audio input backend, so she cannot "
+                         "hear you. The sound library failed to load.")))
+            self._publish(LiveEvent("state", state="error",
+                                    error="mic_unavailable", fatal="audio"))
+            return
+
+        loop = self._loop
+        q = self._mic_queue
+
+        batcher = self._batcher
+        batcher.reset()
 
         def _cb(indata, frames, time_info, status):
             # Every rule about what reaches the model lives in nova_voice:
-            # mute-while-speaking, silence keepalive, barge-in detection.
+            # mute-while-speaking, echo cancellation, barge-in detection.
             try:
-                payload = self._gate.process(np.asarray(indata).reshape(-1))
+                frame = self._gate.process(np.asarray(indata).reshape(-1))
+                payload = batcher.add(frame, self._gate.last_was_silence)
+            except Exception:
+                return
+            if payload is None:
+                return                      # still gathering, or throttled
+            if loop is None or q is None or loop.is_closed():
+                return
+
+            def _post():
                 try:
-                    self._mic_queue.put_nowait(payload)
-                except queue.Full:
+                    q.put_nowait(payload)
+                except asyncio.QueueFull:
                     # Drop the OLDEST frame, never the newest.
                     #
                     # This queue is a live conversation, not a recording. When
@@ -586,31 +791,58 @@ class LiveManager:
                     # seconds-old audio is how "Hello NOVA" reached the model
                     # detached from its context.
                     try:
-                        self._mic_queue.get_nowait()
+                        q.get_nowait()
                         self._mic_dropped += 1
-                    except queue.Empty:
+                        # Say so when it starts, not only in the closing
+                        # tally. A burst of drops is the user's words going
+                        # missing, and knowing *when* it began is the whole
+                        # difference between diagnosing it and guessing.
+                        now = time.monotonic()
+                        if now - self._last_drop_log > 5.0:
+                            self._last_drop_log = now
+                            _log("[LIVE] mic queue full — dropping frames "
+                                 "(%d so far); the sender is not keeping up",
+                                 self._mic_dropped)
+                        q.put_nowait(payload)
+                    except Exception:
                         pass
-                    try:
-                        self._mic_queue.put_nowait(payload)
-                    except queue.Full:
-                        pass
-            except Exception:
-                pass
+
+            try:
+                loop.call_soon_threadsafe(_post)
+            except RuntimeError:
+                pass            # loop shutting down
 
         try:
             self._mic_stream = sd.InputStream(
                 samplerate=MIC_RATE, channels=1, dtype="int16",
-                blocksize=1024, callback=_cb,
+                blocksize=MIC_BLOCK, callback=_cb,
             )
             self._mic_stream.start()
             self._mic_active = True
             self._mic_dropped = 0
             _log("[LIVE] mic opened (16 kHz mono, %d-frame blocks, "
-                 "%.1fs queue)", 1024, self._mic_queue.maxsize * 1024 / MIC_RATE)
+                 "%.1fs queue)", MIC_BLOCK,
+                 MIC_QUEUE_FRAMES * MIC_BLOCK / MIC_RATE)
         except Exception as e:
+            # Same reasoning as above: a device that is missing, busy or
+            # blocked by Windows privacy settings must surface, not vanish
+            # into a log line nobody reads.
             _log("[LIVE] mic open failed: %s", e)
+            self._publish(LiveEvent(
+                "error", error="mic_open_failed",
+                message=("NOVA could not open your microphone (%s). Check it "
+                         "is plugged in and that microphone access is allowed "
+                         "for desktop apps in Windows privacy settings."
+                         % type(e).__name__)))
+            self._publish(LiveEvent("state", state="error",
+                                    error="mic_open_failed", fatal="audio"))
 
     def _stop_mic(self) -> None:
+        if self._send_count:
+            _log("[LIVE] mic sends: %d, mean %.1f ms, worst %.0f ms",
+                 self._send_count,
+                 self._send_total / self._send_count * 1000,
+                 self._send_worst * 1000)
         if self._mic_dropped:
             # Silence here would hide the pipeline falling behind.
             _log("[LIVE] mic: %d frame(s) dropped this session (consumer "
@@ -623,11 +855,8 @@ class LiveManager:
             except Exception:
                 pass
             self._mic_stream = None
-        while not self._mic_queue.empty():
-            try:
-                self._mic_queue.get_nowait()
-            except queue.Empty:
-                break
+        if self._mic_queue is not None:
+            nova_voice.drain(self._mic_queue)
 
     # ── subscriber fan-out ────────────────────────────────────────────────
 
@@ -658,6 +887,32 @@ class LiveManager:
                 self._state = LiveState.ERROR
             self._publish(LiveEvent("state", state="error", error=str(e)))
 
+    @staticmethod
+    def _is_auth_failure(err: str) -> bool:
+        """Is this a credential problem rather than a network one?
+
+        Gemini Live closes with application code 1007 and "API key not valid"
+        when the credential is rejected. Retrying that is pointless: the key
+        will still be invalid in two seconds, and in four, and in eight. The
+        session log for 2026-09-10 shows exactly that -- six identical
+        rejections over 90 seconds, then a silent give-up, while the interface
+        went on claiming NOVA was listening.
+
+        Failing fast turns an inscrutable dead microphone into one clear
+        sentence the user can act on.
+        """
+        # Normalise separators: Google returns both "PERMISSION_DENIED" (the
+        # status enum) and "permission denied" (prose) for the same condition,
+        # and matching only one of them lets the other retry forever.
+        e = (err or "").lower().replace("_", " ")
+        return ("api key not valid" in e
+                or "api key invalid" in e
+                or "invalid api key" in e
+                or "invalid authentication" in e
+                or "unauthenticated" in e
+                or "permission denied" in e
+                or ("expired" in e and ("token" in e or "credential" in e)))
+
     async def _connect_and_run(self) -> None:
         meta = _load_meta()
         mem_ctx = _build_memory_context(meta)
@@ -668,6 +923,7 @@ class LiveManager:
 
         try:
             client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+            _relax_websocket_keepalive(client)
         except Exception as e:
             _log("[LIVE] client init failed: %s", e)
             self._last_error = f"client init failed: {e}"
@@ -708,38 +964,57 @@ class LiveManager:
                     consecutive_failures = 0
                     dt = time.time() - t0
                     self._t_connected = time.time()
-                    with self._state_lock:
-                        self._state = LiveState.STREAMING
                     _log("[LIVE] connected in %.1fs", dt)
                     if self._trace:
                         self._trace.mark("connected", seconds=round(dt, 2))
-                    self._publish(LiveEvent("state", state="connected", connect_time_s=round(dt, 2)))
+
+                    # Queues belong to this loop and must exist before the
+                    # microphone callback can post to them.
+                    self._mic_queue = asyncio.Queue(maxsize=MIC_QUEUE_FRAMES)
+                    self._input_text_queue = asyncio.Queue()
+                    self._gate.reset()
 
                     # Consumers before producers.
                     #
                     # Previously the mic was opened and the greeting awaited
                     # before these tasks existed, so nothing drained the mic
-                    # queue. The queue holds 3.2 seconds; everything the user
-                    # said after that was dropped, and what survived was
-                    # transmitted seconds stale. Starting the readers first
-                    # means every frame the microphone captures has somewhere
-                    # to go from the moment it exists.
+                    # queue; everything the user said in the meantime was
+                    # dropped, and what survived was transmitted stale.
                     tg.create_task(self._mic_sender(session))
                     tg.create_task(self._receiver(session))
                     tg.create_task(self._text_sender(session))
 
-                    self._start_playback()
+                    # Devices next, and only then do we call ourselves ready.
+                    #
+                    # This ordering is the whole fix for NOVA speaking over her
+                    # own startup. The greeting used to be sent as soon as the
+                    # socket opened, while the speaker was still being opened
+                    # on another thread and the interface had not finished
+                    # loading; the first words went nowhere and what the user
+                    # heard was a fragment. Nothing may be said until the
+                    # session, the speaker and the microphone are all genuinely
+                    # up.
+                    speaker_ok = self._start_playback()
                     self._start_mic()
                     self._t_mic_ready = time.time()
                     if self._trace:
                         self._trace.mark("mic_ready")
-                    _log("[LIVE] voice ready in %.2fs (connect %.2fs)",
-                         self._t_mic_ready - self._start_time, dt)
+                    with self._state_lock:
+                        self._state = LiveState.STREAMING
+                    self._publish(LiveEvent(
+                        "state", state="connected", connect_time_s=round(dt, 2)))
+                    _log("[LIVE] voice ready in %.2fs (connect %.2fs, speaker %s,"
+                         " mic %s)", self._t_mic_ready - self._start_time, dt,
+                         "ok" if speaker_ok else "unavailable",
+                         "ok" if self._mic_active else "unavailable")
+                    self._publish(LiveEvent("state", state="ready",
+                                            speaker=speaker_ok,
+                                            mic=self._mic_active))
 
                     # Greet once per session, not on every reconnect. The Live
-                    # socket drops on keepalive timeout roughly every minute of
-                    # silence, so greeting on reconnect made an idle NOVA speak
-                    # an unprompted greeting over and over.
+                    # socket drops on keepalive timeout or the ten-minute
+                    # session cap, so greeting on reconnect made NOVA introduce
+                    # herself over and over to someone mid-conversation.
                     #
                     # Fired as a task, never awaited: composing the greeting can
                     # touch NOVA Core, and anything slow in the greeting path
@@ -747,7 +1022,7 @@ class LiveManager:
                     # trying to have.
                     if not self._has_greeted:
                         self._has_greeted = True
-                        tg.create_task(self._send_greeting(session))
+                        tg.create_task(self._send_greeting(session, speaker_ok))
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -758,6 +1033,9 @@ class LiveManager:
                     consecutive_failures, self.MAX_RECONNECT_ATTEMPTS, e,
                 )
                 self._last_error = str(e)
+                if self._is_auth_failure(str(e)):
+                    # Permanent: report it in the user's language and stop.
+                    self._auth_rejected = True
                 self._publish(LiveEvent("state", state="error", error=str(e)))
             finally:
                 self._stop_mic()
@@ -766,6 +1044,18 @@ class LiveManager:
 
             # Reconnect on transient drops (keepalive timeout, network blip, 5xx)
             if not self._should_reconnect():
+                break
+
+            if self._auth_rejected:
+                _log("[LIVE] credential rejected by Gemini; not retrying")
+                with self._state_lock:
+                    self._state = LiveState.ERROR
+                self._publish(LiveEvent(
+                    "state", state="error", gave_up=True, fatal="auth",
+                    error=self._last_error,
+                    message=("Gemini rejected NOVA's API key, so voice cannot "
+                             "start. Open Settings and enter a valid key."),
+                ))
                 break
 
             if consecutive_failures >= self.MAX_RECONNECT_ATTEMPTS:
@@ -791,14 +1081,27 @@ class LiveManager:
             self._publish(LiveEvent("state", state="connecting", retry_in_s=round(delay, 1)))
             await asyncio.sleep(delay)
 
-    async def _send_greeting(self, session: Any) -> None:
+    async def _send_greeting(self, session: Any, speaker_ok: bool = True) -> None:
         """Say something worth saying — or just say hello.
 
         The greeting is NOVA Core's, not the session's. Core is asked whether it
         has anything genuinely worth surfacing (missed notices, system events);
         if it does, that becomes the opening line, otherwise NOVA gives a short
         natural greeting. Either way she then goes straight back to listening.
+
+        Nothing is said until there is somewhere for it to go. That means a
+        working speaker, and a surface actually attached to the event stream —
+        the user reported NOVA talking before the window had even appeared, and
+        the fragment they heard was the first half of a sentence played into a
+        pipeline that was not finished being built.
         """
+        if not speaker_ok:
+            _log("[LIVE] no speaker; skipping the greeting")
+            return
+        if not await self._await_surface():
+            _log("[LIVE] no interface attached after %.0fs; greeting anyway",
+                 SURFACE_WAIT_S)
+
         surfaced = ""
         try:
             # In a worker thread, with a deadline.
@@ -832,6 +1135,8 @@ class LiveManager:
             )
 
         try:
+            if self._trace:
+                self._trace.mark("greeting_sent")
             await session.send_client_content(
                 turns={"role": "user", "parts": [{"text": prompt}]}, turn_complete=True
             )
@@ -839,21 +1144,46 @@ class LiveManager:
         except Exception as e:
             _log("[LIVE] greeting failed: %s", e)
 
+    async def _await_surface(self) -> bool:
+        """Wait until an interface is listening, or give up and speak anyway.
+
+        Giving up matters as much as waiting. A headless run, or a window that
+        failed to load, must not leave NOVA permanently mute — but nor should
+        she deliver the greeting to nobody a full second before the window
+        exists.
+        """
+        deadline = time.time() + SURFACE_WAIT_S
+        while time.time() < deadline:
+            with self._subs_lock:
+                if self._subscribers:
+                    return True
+            await asyncio.sleep(0.1)
+        return False
+
     async def _mic_sender(self, session: Any) -> None:
-        loop = asyncio.get_running_loop()
         while True:
             try:
-                data = await loop.run_in_executor(None, self._mic_queue.get, True, 0.1)
+                data = await self._mic_queue.get()
                 if data is None:
                     break
+                t0 = time.monotonic()
                 await session.send_realtime_input(
                     audio=gtypes.Blob(data=data, mime_type="audio/pcm;rate=16000")
                 )
+                # A frame is 64 ms of audio. If handing it to the socket takes
+                # longer than that we are falling behind in real time, and the
+                # queue behind us starts discarding the user's words. Silence
+                # here is how that went unnoticed for so long.
+                dt = time.monotonic() - t0
+                self._send_total += dt
+                self._send_count += 1
+                if dt > self._send_worst:
+                    self._send_worst = dt
+                if dt > 0.25:
+                    _log("[LIVE] slow mic send: %.0f ms", dt * 1000)
                 if not self._audio_bytes_in and self._trace:
                     self._trace.mark("first_user_audio")
                 self._audio_bytes_in += len(data)
-            except queue.Empty:
-                continue
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -889,12 +1219,6 @@ class LiveManager:
                 if sc.input_transcription and sc.input_transcription.text:
                     text = sc.input_transcription.text.strip()
                     if text:
-                        # The user is speaking, so whatever turn was
-                        # interrupted is over. This is the backstop that makes
-                        # deafness impossible even if the model never sends
-                        # `interrupted` or `turn_complete` again.
-                        if self._interrupted_epoch == self._turn_epoch:
-                            self._turn_epoch += 1
                         if self._trace:
                             self._trace.turn_started()
                         self._publish(LiveEvent("user_transcript", text=text))
@@ -905,13 +1229,17 @@ class LiveManager:
                         self._publish(LiveEvent("nova_transcript", text=text))
 
                 if sc.interrupted:
-                    self._turn_epoch += 1            # model acknowledged the cut
+                    # The model has acknowledged the cut and stopped
+                    # generating. Anything of the old turn still queued is now
+                    # stale, so drop it rather than playing a fragment of an
+                    # answer the user has already moved on from.
+                    self._play_generation += 1
+                    nova_voice.drain(self._play_q)
                     self._publish(LiveEvent("interrupted"))
                     self._turn_count += 1
 
                 if sc.turn_complete:
                     self._turn_done_flag = True
-                    self._turn_epoch += 1            # next turn may speak again
                     self._turn_count += 1
                     self._publish(LiveEvent("turn_complete", turn_count=self._turn_count))
 
@@ -926,17 +1254,14 @@ class LiveManager:
             raise
 
     async def _text_sender(self, session: Any) -> None:
-        loop = asyncio.get_running_loop()
         while True:
             try:
-                text = await loop.run_in_executor(None, self._input_text_queue.get, True, 0.1)
+                text = await self._input_text_queue.get()
                 if text is None:
                     break
                 await session.send_client_content(
                     turns={"role": "user", "parts": [{"text": text}]}, turn_complete=True
                 )
-            except queue.Empty:
-                continue
             except asyncio.CancelledError:
                 break
             except Exception as e:

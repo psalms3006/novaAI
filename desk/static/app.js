@@ -247,12 +247,18 @@ async function refreshConversations(query = "") {
 
 /* ── Voice (Live WebSocket) ────────────────────────── */
 async function liveStart() {
+  // Attach to the event stream *before* asking for a session.
+  //
+  // The greeting waits for a surface to be listening before NOVA says
+  // anything, so connecting afterwards means racing her: on a fast machine
+  // the session is up and greeting before this socket exists, and the first
+  // words of the transcript are lost. Subscribing first costs nothing — the
+  // socket is a subscriber, not a session.
+  liveConnect();
   try {
     const j = await api_json("/api/live/start", { method: "POST", body: "{}" });
-    if (j.ok) {
-      liveConnect();
-      return true;
-    }
+    if (j.ok) return true;
+    liveDisconnect();
     return false;
   } catch (e) {
     return false;
@@ -278,12 +284,46 @@ function liveConnect() {
   state.liveWs.onerror = () => { state.liveWs = null; };
 }
 
+/* If the backend never reports a working session, say so rather than sitting
+   on a hopeful label. Cleared by the first real state event. */
+function watchForVoiceReady(timeoutMs) {
+  clearTimeout(state.voiceReadyTimer);
+  state.voiceReadyConfirmed = false;
+  state.voiceReadyTimer = setTimeout(() => {
+    if (!state.voiceReadyConfirmed) {
+      setOrb("error");
+      state.listening = false;
+      if (window.novaSetVoiceLabel) {
+        window.novaSetVoiceLabel("voice unavailable");
+      }
+      console.warn("[nova] voice session never reported ready");
+    }
+  }, timeoutMs || 20000);
+}
+
+function addTranscript_nova(text) { addTranscript(text, "nova"); }
+
 function handleLiveEvent(ev) {
   switch (ev.type) {
     case "state":
+      if (ev.state === "connected" || ev.state === "streaming"
+          || ev.state === "ready"
+          || ev.state === "listening" || ev.state === "speaking") {
+        state.voiceReadyConfirmed = true;
+        clearTimeout(state.voiceReadyTimer);
+      }
       // NOVA Core owns the voice state; this surface only reflects it.
       if (window.novaSetVoiceLabel) window.novaSetVoiceLabel(ev.state);
-      if (ev.state === "connected" || ev.state === "streaming" || ev.state === "listening") {
+      if (ev.state === "ready") {
+        // The backend has the session, the speaker and the microphone all
+        // genuinely open. Anything earlier is a promise, not a fact.
+        setOrb("listening");
+        state.listening = true;
+        if (ev.mic === false) {
+          addTranscript_nova("NOVA cannot reach your microphone, so she will "
+            + "not hear you. Check Windows microphone privacy settings.");
+        }
+      } else if (ev.state === "connected" || ev.state === "streaming" || ev.state === "listening") {
         setOrb("listening");
         state.listening = true;
       } else if (ev.state === "speaking") {
@@ -294,12 +334,27 @@ function handleLiveEvent(ev) {
       } else if (ev.state === "error") {
         setOrb("error");
         state.listening = false;
+        state.voiceMode = false;
+        clearTimeout(state.voiceReadyTimer);
+        // A dead voice session must say why. Sitting on a red orb is how the
+        // "listening but deaf" bug stayed invisible for so long: the backend
+        // knew the key was rejected and the interface never passed it on.
+        if (ev.message) {
+          addTranscript_nova(ev.message);
+        } else if (ev.gave_up) {
+          addTranscript_nova("Voice could not start: " +
+            (ev.error || "the session failed repeatedly") + ".");
+        }
       } else if (ev.state === "muted") {
         setOrb("idle");
       } else {
         setOrb("idle");
         state.listening = false;
       }
+      break;
+    case "error":
+      if (ev.message) addTranscript_nova(ev.message);
+      console.error("[nova] voice error:", ev.error, ev.message || "");
       break;
     case "audio_level":
       window.__novaAudioLevel = ev.level || 0;
@@ -916,7 +971,16 @@ async function runInitSequence() {
       if (liveOk) {
         state.voiceMode = true;
         state.liveEngine = "live";
-        setOrb("listening");
+        // Deliberately NOT "listening".
+        //
+        // /api/live/start returns as soon as the session thread is spawned,
+        // long before anything connects or the microphone opens. Showing
+        // "listening" here meant the orb claimed to be listening even when
+        // the session had failed outright -- the user saw a listening NOVA
+        // that could not hear them. The backend owns this state; the orb
+        // waits for it.
+        setOrb("thinking");
+        watchForVoiceReady();
       } else {
         setOrb("idle");
       }

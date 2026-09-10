@@ -104,6 +104,7 @@ class NOVALive:
         self._has_greeted    = False
         self._last_speak_end = 0.0
         self._play_q         = None
+        self._gate           = None
         self._barge_in_pending = False
         # Diagnostic counters — stage 0: did __init__ even reach here?
         self._diag_mic_chunks_sent   = 0
@@ -503,6 +504,16 @@ class NOVALive:
                     if chunk is None:
                         break
                     try:
+                        # Tell the shared voice policy what the room is about
+                        # to hear. Without this the echo canceller in
+                        # nova_voice has no reference to cancel against, and
+                        # the terminal falls back to a plain loudness test —
+                        # the exact behaviour that made the desktop interrupt
+                        # itself. Both surfaces run one policy; both have to
+                        # feed it.
+                        gate = self._gate
+                        if gate is not None:
+                            gate.reference(chunk, RECEIVE_SAMPLE_RATE)
                         stream.write(chunk)
                         self._diag_play_chunks += 1
                         if self._diag_play_chunks == 1:
