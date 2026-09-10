@@ -34,6 +34,15 @@ bp = Blueprint("admin", __name__, url_prefix="/admin/api")
 
 DAY = 86400.0
 
+#: TOTP steps accepted either side of now.
+#:
+#: Sign-in stays at one step (30s each way): a code should prove present
+#: possession. Enrolment allows ten (five minutes), because it only proves the
+#: authenticator was seeded correctly and the password was already verified on
+#: the same request.
+LOGIN_WINDOW = 1
+ENROL_WINDOW = 10
+
 
 def _ip() -> str:
     fwd = request.headers.get("X-Forwarded-For", "")
@@ -106,7 +115,8 @@ def admin_login():
                 return jsonify({"ok": False, "error": "mfa_required",
                                 "message": "Enter your authenticator code."}), 401
             secret = sec.decrypt_totp_secret(admin.totp_secret_enc or "")
-            if not pyotp.TOTP(secret).verify(totp_code, valid_window=1):
+            if not pyotp.TOTP(secret).verify(totp_code,
+                                             valid_window=LOGIN_WINDOW):
                 admin.failed_logins = int(admin.failed_logins) + 1
                 if admin.failed_logins >= 5:
                     admin.locked_until = now() + 900
@@ -201,8 +211,22 @@ def admin_mfa_enrol():
         if not admin.totp_secret_enc:
             return jsonify({"ok": False, "error": "no_pending_enrolment"}), 400
         secret = sec.decrypt_totp_secret(admin.totp_secret_enc)
-        if not pyotp.TOTP(secret).verify(confirm, valid_window=1):
-            return jsonify({"ok": False, "error": "invalid_code"}), 400
+        # Enrolment tolerates a wider window than sign-in.
+        #
+        # These checks answer different questions. At sign-in, a code proves
+        # the person holds the device *right now*, so the window stays tight.
+        # At enrolment it proves only that the authenticator was seeded with
+        # the right secret -- the password has already been checked on this
+        # same request -- and the person is typically copying a code between
+        # two devices, which is slow. A tight window here rejects correct
+        # setups and teaches people to distrust the step.
+        if not pyotp.TOTP(secret).verify(confirm, valid_window=ENROL_WINDOW):
+            return jsonify({
+                "ok": False, "error": "invalid_code",
+                "message": "That code did not match. Check the authenticator "
+                           "entry is the one just added, and that the device "
+                           "clock is correct.",
+            }), 400
         admin.mfa_enabled = True
         g.admin_id, g.admin_email = admin.id, admin.email
         audit(s, "admin.mfa_enrolled", target_type="admin", target_id=admin.id)

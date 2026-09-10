@@ -263,3 +263,74 @@ def test_no_env_file_with_real_values_is_tracked():
         if base == ".env" or (base.startswith(".env") and "example" not in base
                               and "template" not in base):
             pytest.fail(f"a real .env file is tracked in git: {path}")
+
+
+# -- deployment configuration ------------------------------------------------
+
+def test_the_render_blueprint_contains_no_secrets():
+    """A blueprint lives in Git, so every secret in it is a committed secret."""
+    import yaml
+    blueprint = yaml.safe_load(src(pathlib.Path("render.yaml")))
+    service = blueprint["services"][0]
+    for entry in service["envVars"]:
+        if "value" not in entry:
+            continue
+        value = str(entry["value"])
+        assert not re.search(r"re_[A-Za-z0-9]{20,}", value), entry["key"]
+        assert "postgresql://" not in value, entry["key"]
+        assert not re.fullmatch(r"[A-Za-z0-9_\-]{40,}", value), entry["key"]
+
+
+def test_every_secret_is_prompted_rather_than_stored():
+    import yaml
+    blueprint = yaml.safe_load(src(pathlib.Path("render.yaml")))
+    service = blueprint["services"][0]
+    prompted = {e["key"] for e in service["envVars"] if e.get("sync") is False}
+    for required in ("DATABASE_URL", "NOVA_SECRET_KEY",
+                     "NOVA_ADMIN_SECRET_KEY", "RESEND_API_KEY"):
+        assert required in prompted, f"{required} is not prompted for"
+
+
+def test_the_blueprint_uses_the_real_health_check():
+    import yaml
+    blueprint = yaml.safe_load(src(pathlib.Path("render.yaml")))
+    assert blueprint["services"][0]["healthCheckPath"] == "/health"
+
+
+def test_the_container_does_not_run_as_root():
+    docker = src(pathlib.Path("nova_cloud/Dockerfile"))
+    assert "USER nova" in docker
+    assert docker.index("USER nova") < docker.index("CMD ")
+
+
+def test_the_container_health_check_queries_the_app():
+    docker = src(pathlib.Path("nova_cloud/Dockerfile"))
+    assert "HEALTHCHECK" in docker and "/health" in docker
+
+
+def test_the_image_does_not_pull_in_the_desktop_stack():
+    """This service does identity and sync. Bundling torch or audio would add
+    gigabytes for nothing."""
+    reqs = src(pathlib.Path("nova_cloud/requirements.txt")).lower()
+    for heavy in ("torch", "sentence-transformers", "sounddevice",
+                  "faster-whisper", "pywebview", "onnxruntime"):
+        assert heavy not in reqs, f"{heavy} does not belong in the cloud image"
+
+
+# -- MFA windows -------------------------------------------------------------
+
+def test_sign_in_uses_a_tight_totp_window_and_enrolment_a_wider_one():
+    """They answer different questions: sign-in proves present possession,
+    enrolment only proves the authenticator was seeded correctly -- and the
+    password was already checked on that same request."""
+    from nova_cloud.api_admin import ENROL_WINDOW, LOGIN_WINDOW
+    assert LOGIN_WINDOW == 1, "sign-in must not accept stale codes"
+    assert ENROL_WINDOW > LOGIN_WINDOW
+    assert ENROL_WINDOW <= 10, "an enrolment window beyond five minutes is too loose"
+
+
+def test_the_login_path_uses_the_login_window():
+    body = src(pathlib.Path("nova_cloud/api_admin.py"))
+    login = body[body.index("def admin_login("):body.index("def admin_logout(")]
+    assert "LOGIN_WINDOW" in login
+    assert "ENROL_WINDOW" not in login, "enrolment tolerance leaked into sign-in"
