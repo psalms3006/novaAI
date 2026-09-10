@@ -130,14 +130,15 @@ def check_mic_capture(seconds: float = 2.0) -> bool:
     audio = np.concatenate(frames).astype("float32").reshape(-1)
     peak = float(np.abs(audio).max())
     rms = float(np.sqrt((audio ** 2).mean()))
+    import nova_voice
     detail = (f"{len(frames)} blocks, peak {peak:.0f}, RMS {rms:.0f} "
-              f"(NOVA's speech threshold is 350)")
+              f"(NOVA's barge-in floor is {nova_voice.BARGE_IN_FLOOR_RMS:.0f})")
     if peak < 20:
         record("microphone capture", FAIL, detail +
                "\nThe device is delivering silence. It is muted at the OS or "
                "hardware level, or blocked by privacy settings.")
         return False
-    if rms < 350:
+    if rms < 200:
         record("microphone capture", WARN, detail +
                "\nAudio is arriving but is quieter than NOVA's speech "
                "threshold. Raise the input level, or move closer.")
@@ -161,6 +162,97 @@ def check_speaker() -> bool:
     except Exception as e:
         record("speaker output", FAIL, f"{type(e).__name__}: {e}")
         return False
+
+
+def check_echo_coupling(seconds: float = 3.0) -> bool:
+    """Play a sound and measure how much of it comes back into the microphone.
+
+    This is the number NOVA's listening policy is built on. She mutes the
+    microphone while speaking and only interrupts herself for sound the echo
+    canceller cannot explain, so how loudly the speakers reach the microphone
+    on *this* machine decides how well that works.
+
+    Measured through nova_voice.EchoCanceller itself, not by comparing
+    loudness. Comparing loudness fails in a room with any ambient noise at all
+    -- on this machine the room tone alone read 1877, which swamped the
+    playback entirely and reported 0% coupling for speakers that were working
+    perfectly. Correlating against the known probe is both robust to that and
+    a genuine test of the component NOVA actually relies on.
+    """
+    try:
+        import numpy as np
+        import sounddevice as sd
+
+        import nova_voice
+    except Exception as e:
+        record("echo coupling", SKIP, f"needs numpy + sounddevice ({e})")
+        return True
+
+    rate = nova_voice.SEND_RATE
+    frame = 1024
+    try:
+        # Speech-shaped noise, not a tone: a pure tone measures one frequency
+        # and says nothing about how a voice couples through.
+        rng = np.random.default_rng(0)
+        probe = rng.normal(0, 6000, int(rate * seconds))
+        probe = np.convolve(probe, np.ones(60) / 60, mode="same")
+        probe = (probe / max(1.0, np.abs(probe).max()) * 9000).astype(np.int16)
+
+        ec = nova_voice.EchoCanceller(rate=rate, frame=frame)
+        captured: list = []
+        fed = {"n": 0}
+
+        def _cb(indata, frames, t, status):
+            captured.append(indata.copy().reshape(-1))
+
+        with sd.InputStream(samplerate=rate, channels=1, dtype="int16",
+                            blocksize=frame, callback=_cb):
+            sd.play(probe, rate)
+            t0 = time.time()
+            # Feed the canceller the probe as it plays, exactly as the
+            # playback thread feeds it in the real pipeline.
+            while time.time() - t0 < seconds:
+                played = int((time.time() - t0) * rate)
+                if played > fed["n"]:
+                    ec.reference(probe[fed["n"]:played].tobytes(), rate)
+                    fed["n"] = played
+                time.sleep(0.02)
+            sd.stop()
+            time.sleep(0.2)
+
+        if len(captured) < 8:
+            record("echo coupling", WARN, "captured too little audio to judge")
+            return True
+
+        mic = np.concatenate(captured)
+        gains, corrs = [], []
+        for i in range(0, len(mic) - frame, frame):
+            ec.residual_rms(mic[i:i + frame])
+            if abs(ec.last_corr) > 0.25:
+                gains.append(ec.gain)
+                corrs.append(abs(ec.last_corr))
+        if not gains:
+            record("echo coupling", WARN,
+                   "could not hear the test sound at all -- speakers may be "
+                   "muted, or output is going somewhere the microphone cannot "
+                   "hear (headphones, HDMI, another device)")
+            return True
+
+        coupling = float(np.median(gains))
+        lag = ec.snapshot().get("echo_lag_ms")
+        detail = (f"coupling {coupling:.0%}, echo delay {lag} ms, "
+                  f"correlation {np.median(corrs):.2f}")
+        if coupling <= 0.45:
+            record("echo coupling", PASS, detail + " -- comfortable")
+        else:
+            record("echo coupling", WARN,
+                   detail + " -- loud. NOVA will still never interrupt "
+                   "herself, but barge-in may be slow; headphones or less "
+                   "volume fixes it")
+        return True
+    except Exception as e:
+        record("echo coupling", WARN, f"could not measure ({type(e).__name__}: {e})")
+        return True
 
 
 def check_tls() -> bool:
@@ -299,6 +391,10 @@ def main() -> int:
         else:
             check_mic_capture(args.seconds)
         check_speaker()
+        if args.no_mic:
+            record("echo coupling", SKIP, "--no-mic")
+        else:
+            check_echo_coupling()
     else:
         record("audio devices", SKIP, "no audio backend")
 
