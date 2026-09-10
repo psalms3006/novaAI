@@ -87,6 +87,15 @@ SPEAKING_WATCHDOG_S = 3.0
 #: falling back to a plain greeting. The user is already waiting to talk.
 GREETING_BUDGET_S = 6.0
 
+#: Microphone audio that must have reached the model before NOVA is allowed
+#: to send anything else. One second at 16 kHz mono 16-bit. See
+#: LiveManager._await_mic_stream for why this is not optional.
+MIC_WARMUP_BYTES = MIC_RATE * 2
+
+#: ...and how long to wait for it before giving up. A microphone that never
+#: produces anything is a broken microphone, not a reason to stay silent.
+MIC_WARMUP_WAIT_S = 4.0
+
 #: How long the greeting waits for an interface to attach before giving up
 #: and speaking anyway. Long enough for the desktop window to finish loading
 #: on a cold start, short enough that a headless session is not left mute.
@@ -1101,6 +1110,7 @@ class LiveManager:
         if not await self._await_surface():
             _log("[LIVE] no interface attached after %.0fs; greeting anyway",
                  SURFACE_WAIT_S)
+        await self._await_mic_stream()
 
         surfaced = ""
         try:
@@ -1143,6 +1153,29 @@ class LiveManager:
             _log("[LIVE] opening sent (%s)", "proactive" if surfaced else "greeting")
         except Exception as e:
             _log("[LIVE] greeting failed: %s", e)
+
+    async def _await_mic_stream(self) -> bool:
+        """Wait until real microphone audio has reached the model.
+
+        This ordering is load-bearing, not politeness. If client content is
+        sent before the realtime audio stream is established, Gemini Live
+        never activates audio input for that session: the model answers the
+        text, and then every word the user says afterwards is ignored, for as
+        long as the connection lasts. Measured directly — greeting first, the
+        utterance that follows is not even transcribed; two seconds of
+        microphone first, the same utterance is heard and answered.
+
+        That is the whole of the "NOVA greeted me and then went deaf"
+        report, and it is why the greeting waits here.
+        """
+        deadline = time.time() + MIC_WARMUP_WAIT_S
+        while time.time() < deadline:
+            if self._audio_bytes_in >= MIC_WARMUP_BYTES:
+                return True
+            await asyncio.sleep(0.05)
+        _log("[LIVE] mic stream still quiet after %.1fs (%d bytes sent); "
+             "greeting anyway", MIC_WARMUP_WAIT_S, self._audio_bytes_in)
+        return False
 
     async def _await_surface(self) -> bool:
         """Wait until an interface is listening, or give up and speak anyway.
@@ -1191,61 +1224,92 @@ class LiveManager:
                 raise
 
     async def _receiver(self, session: Any) -> None:
+        """Read the model's turns, forever — not just the first one.
+
+        `session.receive()` is one *turn*, not the session. Look at the SDK:
+
+            while result := await self._receive():
+              if result.server_content and result.server_content.turn_complete:
+                yield result
+                break
+
+        It breaks on turn_complete, so a bare `async for msg in
+        session.receive()` reads exactly one reply and then falls off the end.
+        That was NOVA's second failure, and it was every symptom at once:
+        after her first answer she never read another message, so she never
+        spoke again, never showed another transcript, and never noticed
+        anything the user said. Worse, an unread socket is a stalled socket —
+        the incoming queue fills, the library stops reading the transport,
+        pongs stop being processed, and about seventy seconds later the
+        connection dies with "keepalive ping timeout". Every one of those
+        1011s in the logs traces back to this loop ending.
+
+        The outer loop is what the reference implementation has and what this
+        was missing.
+        """
         try:
-            async for msg in session.receive():
-                sc = msg.server_content
-                if sc is None:
-                    continue
+            while True:
+                got_turn = False
+                async for msg in session.receive():
+                    got_turn = True
+                    sc = msg.server_content
+                    if sc is None:
+                        continue
 
-                if sc.model_turn and sc.model_turn.parts:
-                    for part in sc.model_turn.parts:
-                        inline = getattr(part, "inline_data", None)
-                        if inline is not None and getattr(inline, "data", None):
-                            audio = inline.data
-                            self._audio_bytes_out += len(audio)
-                            if self._t_first_audio == 0.0:
-                                self._t_first_audio = time.time()
+                    if sc.model_turn and sc.model_turn.parts:
+                        for part in sc.model_turn.parts:
+                            inline = getattr(part, "inline_data", None)
+                            if inline is not None and getattr(inline, "data", None):
+                                audio = inline.data
+                                self._audio_bytes_out += len(audio)
+                                if self._t_first_audio == 0.0:
+                                    self._t_first_audio = time.time()
+                                    if self._trace:
+                                        self._trace.mark("first_model_audio")
                                 if self._trace:
-                                    self._trace.mark("first_model_audio")
+                                    self._trace.turn_timing("model audio")
+                                # NOVA Core owns playback. Previously the raw PCM
+                                # was shipped to the browser, which meant any
+                                # surface with the page open played it — with the
+                                # fullscreen window and the ambient orb both open
+                                # that is the same audio twice.
+                                self._enqueue_audio(audio)
+
+                    if sc.input_transcription and sc.input_transcription.text:
+                        text = sc.input_transcription.text.strip()
+                        if text:
                             if self._trace:
-                                self._trace.turn_timing("model audio")
-                            # NOVA Core owns playback. Previously the raw PCM
-                            # was shipped to the browser, which meant any
-                            # surface with the page open played it — with the
-                            # fullscreen window and the ambient orb both open
-                            # that is the same audio twice.
-                            self._enqueue_audio(audio)
+                                self._trace.turn_started()
+                            self._publish(LiveEvent("user_transcript", text=text))
 
-                if sc.input_transcription and sc.input_transcription.text:
-                    text = sc.input_transcription.text.strip()
-                    if text:
-                        if self._trace:
-                            self._trace.turn_started()
-                        self._publish(LiveEvent("user_transcript", text=text))
+                    if sc.output_transcription and sc.output_transcription.text:
+                        text = sc.output_transcription.text.strip()
+                        if text:
+                            self._publish(LiveEvent("nova_transcript", text=text))
 
-                if sc.output_transcription and sc.output_transcription.text:
-                    text = sc.output_transcription.text.strip()
-                    if text:
-                        self._publish(LiveEvent("nova_transcript", text=text))
+                    if sc.interrupted:
+                        # The model has acknowledged the cut and stopped
+                        # generating. Anything of the old turn still queued is now
+                        # stale, so drop it rather than playing a fragment of an
+                        # answer the user has already moved on from.
+                        self._play_generation += 1
+                        nova_voice.drain(self._play_q)
+                        self._publish(LiveEvent("interrupted"))
+                        self._turn_count += 1
 
-                if sc.interrupted:
-                    # The model has acknowledged the cut and stopped
-                    # generating. Anything of the old turn still queued is now
-                    # stale, so drop it rather than playing a fragment of an
-                    # answer the user has already moved on from.
-                    self._play_generation += 1
-                    nova_voice.drain(self._play_q)
-                    self._publish(LiveEvent("interrupted"))
-                    self._turn_count += 1
+                    if sc.turn_complete:
+                        self._turn_done_flag = True
+                        self._turn_count += 1
+                        self._publish(LiveEvent("turn_complete", turn_count=self._turn_count))
 
-                if sc.turn_complete:
-                    self._turn_done_flag = True
-                    self._turn_count += 1
-                    self._publish(LiveEvent("turn_complete", turn_count=self._turn_count))
+                    if msg.go_away:
+                        self._publish(LiveEvent("go_away"))
+                        raise ConnectionError("gemini live go_away")
 
-                if msg.go_away:
-                    self._publish(LiveEvent("go_away"))
-                    raise ConnectionError("gemini live go_away")
+                if not got_turn:
+                    # receive() ended without yielding anything: the socket
+                    # is gone. Spinning here would burn a core for nothing.
+                    raise ConnectionError("gemini live stream ended")
         except asyncio.CancelledError:
             pass
         except Exception as e:

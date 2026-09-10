@@ -64,6 +64,25 @@ BARGE_IN_ECHO_MARGIN = 2.0
 #: a second afterwards.
 RESIDUAL_FLOOR_DECAY = 0.90
 
+#: How long a reference stays usable after the last audio was handed to the
+#: sound device. Past this, playback has stopped and there is nothing left to
+#: cancel — see EchoCanceller.armed.
+REF_STALE_S = 0.5
+
+#: Aligned playback level below which the speaker counts as quiet.
+REF_ACTIVE_RMS = 150.0
+
+#: How long after the reference goes quiet the room is still ringing with it.
+#:
+#: The reference is recorded when audio is handed to the sound device, but the
+#: device plays it out a few hundred milliseconds later. At the end of a turn
+#: that leaves a window where NOVA's last words are physically in the air with
+#: no reference left to cancel them against — the residual is then all of her
+#: voice, the ratio explodes, and she "hears someone talking". Observed
+#: exactly once in a clean run: a barge-in fired on the tail of the greeting
+#: and the model transcribed her own closing words, "the hand", as the user.
+REF_TAIL_S = 0.5
+
 #: Leakage assumed at the start of a turn, before anything has been measured:
 #: all of it. NOVA starts each turn uninterruptible and becomes interruptible
 #: within a second as the estimate decays onto what the room actually leaks.
@@ -182,6 +201,7 @@ class EchoCanceller:
         self._locked_lag: int | None = None
         self._gain: float | None = None
         self._pending: tuple | None = None
+        self._last_ref_at = 0.0
         self.last_ref_rms = 0.0
         self._nfft = 1
         while self._nfft < self._max_lag + frame:
@@ -204,6 +224,7 @@ class EchoCanceller:
             keep = self._max_lag + self._frame * 4
             self._ref = (np.concatenate([self._ref, a])[-keep:]
                          if self._ref.size else a[-keep:])
+            self._last_ref_at = time.time()
 
     def reset(self) -> None:
         with self._lock:
@@ -211,12 +232,22 @@ class EchoCanceller:
             self._locked_lag = None
             self._gain = None
             self._pending = None
+            self._last_ref_at = 0.0
         self.last_corr = 0.0
 
     @property
     def armed(self) -> bool:
-        """Is there enough recent playback for cancellation to mean anything?"""
+        """Is there enough *recent* playback for cancellation to mean anything?
+
+        Recency is the point. The buffer holds the last fraction of a second
+        of audio, but it has no idea time has passed — once NOVA stops
+        talking it would go on matching microphone frames against her last
+        words indefinitely, reporting a healthy reference level and
+        suppressing everything the user said next.
+        """
         with self._lock:
+            if not self._last_ref_at or time.time() - self._last_ref_at > REF_STALE_S:
+                return False
             return self._ref.size >= self._frame * 2
 
     @property
@@ -241,7 +272,10 @@ class EchoCanceller:
         """
         mic = frame.astype(np.float32)
         with self._lock:
-            ref = self._ref.copy() if self._ref.size else self._ref
+            stale = (not self._last_ref_at
+                     or time.time() - self._last_ref_at > REF_STALE_S)
+            ref = np.zeros(0, dtype=np.float32) if stale else (
+                self._ref.copy() if self._ref.size else self._ref)
             locked = self._locked_lag
             gain = self._gain
         self._pending = None
@@ -396,6 +430,7 @@ class VoiceGate:
         self._speaking_frames = 0
         self._residual_history: list[float] = []
         self._ref_history: list[float] = []
+        self._last_loud_ref_at = 0.0
         #: Frames of NOVA's own speech to observe before a barge-in is
         #: believable. The echo path is unknown at the start of every turn,
         #: and 4 frames is ~256 ms — long enough for the filter to lock on,
@@ -443,6 +478,7 @@ class VoiceGate:
                 self._speaking_frames = 0
                 self._residual_history.clear()
                 self._ref_history.clear()
+                self._last_loud_ref_at = 0.0
             else:
                 self._speech_runs = 0
                 # Begin every turn deaf to interruption and earn hearing back
@@ -452,6 +488,7 @@ class VoiceGate:
                 self._residual_floor = INITIAL_LEAK_RATIO
                 self._residual_history.clear()
                 self._ref_history.clear()
+                self._last_loud_ref_at = 0.0
 
     @property
     def muted(self) -> bool:
@@ -554,7 +591,27 @@ class VoiceGate:
         # given room, so that is what gets learned.
         ratio = smoothed / ref_rms if ref_rms > 1.0 else 0.0
         self.last_leak_ratio = ratio
-        loud_enough = smoothed > self._floor
+        now = time.time()
+        # Keyed to the instantaneous reference, not the smoothed one. The
+        # smoothed value still carries several frames of history after
+        # playback has actually stopped, and refreshing the guard from that
+        # keeps refreshing it from its own tail — NOVA stays deaf indefinitely
+        # instead of for the half second the guard is meant to cover.
+        if self.echo.last_ref_rms > REF_ACTIVE_RMS:
+            self._last_loud_ref_at = now
+        elif self._last_loud_ref_at and now - self._last_loud_ref_at < REF_TAIL_S:
+            # The speaker has gone quiet on our side but the room has not.
+            # Nothing heard in this window can be attributed to the user.
+            self.echo_warmup_suppressions += 1
+            with self._lock:
+                self._speech_runs = 0
+            return False
+
+        # Both the window and this frame have to be loud. Smoothing alone is
+        # not enough: one spike keeps a five-frame mean above the floor for
+        # several frames afterwards, which reads as sustained speech when it
+        # was a door closing.
+        loud_enough = smoothed > self._floor and residual > self._floor * 0.5
         unexplained = ref_rms <= 1.0 or ratio > floor * self._margin
 
         if not (loud_enough and unexplained):
@@ -577,12 +634,17 @@ class VoiceGate:
                 self.suppressed_echo_frames += 1
             return False
 
-        if warming or not self.echo.converged:
+        if self.echo.armed and (warming or not self.echo.converged):
             # The filter has not learned this turn's echo path yet, so a loud
             # frame is not evidence of anything: it is just uncancelled NOVA.
             # Interrupting here is the original bug — she cut herself off in
             # the first half second, every time. Waiting costs us only the
             # opening moments of a turn, which is not when people interrupt.
+            #
+            # Conditional on `armed`, though. With no playback reference at
+            # all there is no echo to be confused by, and a loud frame really
+            # is the user — refusing to hear them because a filter that has
+            # nothing to do has not converged would be its own deafness bug.
             self.echo_warmup_suppressions += 1
             with self._lock:
                 self._speech_runs = 0
