@@ -89,10 +89,35 @@ REF_ACTIVE_RMS = 150.0
 #: while NOVA is speaking, and once she stops it is not consulted at all.
 REF_TAIL_S = 1.2
 
-#: Leakage assumed at the start of a turn, before anything has been measured:
-#: all of it. NOVA starts each turn uninterruptible and becomes interruptible
-#: within a second as the estimate decays onto what the room actually leaks.
-INITIAL_LEAK_RATIO = 1.0
+#: Frames of NOVA's speech to allow the canceller to lock onto the echo
+#: before concluding there is no echo to lock onto.
+#:
+#: Requiring convergence indefinitely was a bug with teeth: on a machine whose
+#: speakers do not reach its microphone at all — headphones, a distant
+#: speaker, a quiet room — the canceller can *never* converge, because there
+#: is nothing to converge on. NOVA was then uninterruptible for the entire
+#: session. Reproduced directly: room tone at RMS 700 with no echo path, user
+#: talking over her for four seconds, forty-three frames suppressed, barge-in
+#: never fired.
+ECHO_LOCK_GRACE_FRAMES = 12
+
+#: How far above the room's own noise a voice must stand when there is no
+#: echo path to cancel. The ratio test is meaningless there — it compares the
+#: microphone against a playback level that never reaches the microphone — so
+#: the fallback is the classic one: louder than the room has been.
+NOISE_MARGIN = 2.0
+
+#: Leakage assumed at the start of a turn, before anything has been measured.
+#:
+#: Not 1.0. Assuming the room leaks *all* of NOVA's voice back is so
+#: pessimistic that the threshold is still above a real interruption several
+#: frames later — measured, it cost the whole first word: the user says
+#: "NOVA," at RMS 6349 and the gate declined it, catching only the phrase
+#: after the pause, 1.2 s in. Measured echo leakage sits between 0.10 and
+#: 0.35 across the coupling sweep, so starting at the top of the learnable
+#: range is still conservative and converges in a third of the time. The
+#: warm-up frames, not this value, are what protect the start of a turn.
+INITIAL_LEAK_RATIO = 0.5
 
 #: The learned leakage floor only moves up on frames comfortably *below* the
 #: decision threshold, not merely under it. Without that gap the floor chases
@@ -444,6 +469,9 @@ class VoiceGate:
         self._residual_history: list[float] = []
         self._ref_history: list[float] = []
         self._last_loud_ref_at = 0.0
+        #: Loudest the room itself has been recently, in absolute RMS. Used
+        #: only when there is no echo path, where it is the honest baseline.
+        self._noise_floor = 0.0
         #: Frames of NOVA's own speech to observe before a barge-in is
         #: believable. The echo path is unknown at the start of every turn,
         #: and 4 frames is ~256 ms — long enough for the filter to lock on,
@@ -464,6 +492,7 @@ class VoiceGate:
         self.last_residual = 0.0
         self.last_smoothed = 0.0
         self.last_leak_ratio = 0.0
+        self.last_echo_path = False
         self.last_was_silence = False
 
     # ── state ────────────────────────────────────────────────────────────
@@ -575,7 +604,17 @@ class VoiceGate:
         return self._silence
 
     def _is_double_talk(self, frame: np.ndarray) -> bool:
-        """Is there sound here that NOVA's own playback cannot account for?"""
+        """Is there sound here that NOVA's own playback cannot account for?
+
+        Every path that decides "not the user" falls through to the same
+        learning step at the bottom. That is deliberate: earlier versions
+        returned early from the warm-up guards, which meant the learned floor
+        never decayed while they were active. It was still sitting near its
+        pessimistic starting value when the user began talking, so the first
+        second of a genuine interruption was measured against a threshold
+        that had never been allowed to come down, and barge-in took 1.2 s
+        instead of 0.3 s.
+        """
         residual = self.echo.residual_rms(frame)
         self.last_residual = residual
 
@@ -593,74 +632,83 @@ class VoiceGate:
             ref_rms = sum(self._ref_history) / len(self._ref_history)
             floor = self._residual_floor
             self._speaking_frames += 1
-            warming = self._speaking_frames <= self._warmup_frames
+            frames = self._speaking_frames
+            noise = self._noise_floor
         self.last_smoothed = smoothed
 
-        # Compare against *leakage*, not loudness. Residual echo scales with
-        # how loud NOVA currently is, so an absolute floor learned during a
-        # quiet passage is far too low for the next loud one — which is
-        # exactly how she still cut herself off on loud speakers. The ratio of
-        # residual to the aligned playback level is roughly constant for a
-        # given room, so that is what gets learned.
-        ratio = smoothed / ref_rms if ref_rms > 1.0 else 0.0
-        self.last_leak_ratio = ratio
         now = time.time()
         # Keyed to the instantaneous reference, not the smoothed one. The
         # smoothed value still carries several frames of history after
-        # playback has actually stopped, and refreshing the guard from that
-        # keeps refreshing it from its own tail — NOVA stays deaf indefinitely
-        # instead of for the half second the guard is meant to cover.
+        # playback has stopped, and refreshing the guard from that keeps
+        # refreshing it from its own tail.
         if self.echo.last_ref_rms > REF_ACTIVE_RMS:
             self._last_loud_ref_at = now
-        elif self._last_loud_ref_at and now - self._last_loud_ref_at < REF_TAIL_S:
+
+        # Is there an echo path at all?
+        #
+        # If the speakers do not reach the microphone — headphones, a distant
+        # speaker, a quiet room — the canceller never locks on, because there
+        # is nothing to lock onto. Waiting for it forever left NOVA
+        # permanently uninterruptible on exactly those machines.
+        has_echo = self.echo.converged
+        self.last_echo_path = has_echo
+        ratio = smoothed / ref_rms if ref_rms > 1.0 else 0.0
+        self.last_leak_ratio = ratio if has_echo else 0.0
+
+        # Loud in its own right, in both the window and this frame. Smoothing
+        # alone is not enough: one spike keeps a five-frame mean above the
+        # floor afterwards, which reads as sustained speech when it was a door.
+        loud = smoothed > self._floor and residual > self._floor * 0.5
+
+        suppressed = False
+        if has_echo and frames <= self._warmup_frames:
+            # The filter has not learned this turn's echo path yet, so a loud
+            # frame is not evidence of anything: it is just uncancelled NOVA.
+            suppressed = True
+        elif has_echo and (self._last_loud_ref_at
+                           and self.echo.last_ref_rms <= REF_ACTIVE_RMS
+                           and now - self._last_loud_ref_at < REF_TAIL_S):
             # The speaker has gone quiet on our side but the room has not.
-            # Nothing heard in this window can be attributed to the user.
+            suppressed = True
+        elif not has_echo and self.echo.armed and frames <= ECHO_LOCK_GRACE_FRAMES:
+            # Still giving the canceller a chance to find an echo path.
+            suppressed = True
+
+        if suppressed:
             self.echo_warmup_suppressions += 1
-            with self._lock:
-                self._speech_runs = 0
-            return False
+            speech = False
+        elif has_echo:
+            speech = loud and (ref_rms <= 1.0 or ratio > floor * self._margin)
+        else:
+            # No echo path. The leak ratio is meaningless — it compares the
+            # microphone against a playback level that never reaches it — so
+            # judge the honest way: louder than this room has been.
+            speech = loud and smoothed > noise * NOISE_MARGIN
 
-        # Both the window and this frame have to be loud. Smoothing alone is
-        # not enough: one spike keeps a five-frame mean above the floor for
-        # several frames afterwards, which reads as sustained speech when it
-        # was a door closing.
-        loud_enough = smoothed > self._floor and residual > self._floor * 0.5
-        unexplained = ref_rms <= 1.0 or ratio > floor * self._margin
-
-        if not (loud_enough and unexplained):
-            # The speaker explains this frame. Teach the echo model, and let
-            # it raise the bar for what counts as an interruption — decaying,
-            # so a loud passage does not leave NOVA deaf for the rest of the
-            # turn.
+        if not speech:
             self.echo.accept()
             with self._lock:
+                # Decayed whenever the speaker is actually producing sound,
+                # not only once the canceller has converged. Gating it on
+                # convergence left the floor pinned at its starting value for
+                # the whole lock-on period, and it was still there when the
+                # user spoke.
                 if ref_rms > 1.0 and ratio <= self._residual_floor * LEAK_LEARN_MARGIN:
-                    # Decay only while actually learning. Decaying on the
-                    # frames we decline to learn from collapses the floor to
-                    # zero during exactly the loud passage it is needed for.
+                    # Decay only while actually learning. Decaying on frames we
+                    # decline to learn from collapses the floor to zero during
+                    # exactly the loud passage it is needed for.
                     self._residual_floor = max(
                         self._residual_floor * RESIDUAL_FLOOR_DECAY,
                         min(ratio, MAX_LEARNED_LEAK),
                         MIN_LEARNED_LEAK)
+                # The room's own level, learned the same cautious way: only
+                # from frames we are confident are not the user.
+                if smoothed <= max(self._floor, self._noise_floor * LEAK_LEARN_MARGIN):
+                    self._noise_floor = max(
+                        self._noise_floor * RESIDUAL_FLOOR_DECAY, smoothed)
                 self._speech_runs = 0
             if self.echo.armed:
                 self.suppressed_echo_frames += 1
-            return False
-
-        if self.echo.armed and (warming or not self.echo.converged):
-            # The filter has not learned this turn's echo path yet, so a loud
-            # frame is not evidence of anything: it is just uncancelled NOVA.
-            # Interrupting here is the original bug — she cut herself off in
-            # the first half second, every time. Waiting costs us only the
-            # opening moments of a turn, which is not when people interrupt.
-            #
-            # Conditional on `armed`, though. With no playback reference at
-            # all there is no echo to be confused by, and a loud frame really
-            # is the user — refusing to hear them because a filter that has
-            # nothing to do has not converged would be its own deafness bug.
-            self.echo_warmup_suppressions += 1
-            with self._lock:
-                self._speech_runs = 0
             return False
 
         with self._lock:
@@ -681,9 +729,11 @@ class VoiceGate:
                 "suppressed_echo_frames": self.suppressed_echo_frames,
                 "echo_warmup_suppressions": self.echo_warmup_suppressions,
                 "residual_floor": round(self._residual_floor, 1),
+                "noise_floor": round(self._noise_floor, 1),
                 "last_residual": round(self.last_residual, 1),
                 "last_smoothed": round(self.last_smoothed, 1),
                 "leak_ratio": round(self.last_leak_ratio, 3),
+                "echo_path": self.last_echo_path,
             }
         base.update(self.echo.snapshot())
         return base

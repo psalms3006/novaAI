@@ -431,6 +431,13 @@ class LiveManager:
         self._send_worst = 0.0
         self._last_drop_log = 0.0
         self._batcher = MicBatcher()
+        #: The output stream, and when the audio already handed to it will
+        #: have finished playing (time.monotonic clock). Guarded because
+        #: barge-in aborts the device from the microphone callback thread
+        #: while the playback thread may be writing to it.
+        self._stream: Any = None
+        self._stream_lock = threading.Lock()
+        self._playing_until = 0.0
         # Bumped whenever playback is cut. The pre-roll lives inside the
         # speaker thread, so draining _play_q alone would leave held audio to
         # play after an interruption -- exactly the "speaks a fragment of the
@@ -635,6 +642,7 @@ class LiveManager:
                 blocksize=0,
             )
             stream.start()
+            self._stream = stream
         except Exception as e:
             _log("[LIVE] speaker open failed: %s", e)
             # Make sure a dead speaker never leaves the mic muted.
@@ -670,7 +678,19 @@ class LiveManager:
                 # the device plays it — would put the reference outside the
                 # search window and cancel nothing.
                 self._gate.reference(chunk, nova_voice.RECEIVE_RATE)
-                stream.write(chunk)
+                # Account for what the device now owes the room.
+                #
+                # write() returns as soon as the buffer accepts the audio, not
+                # when it is heard. Tracking the difference is the only way to
+                # know when NOVA has actually stopped talking — everything
+                # else here treats "the queue is empty" as "she finished",
+                # which unmutes the microphone into the middle of her own
+                # sentence.
+                duration = len(chunk) / 2 / nova_voice.RECEIVE_RATE
+                now = time.monotonic()
+                self._playing_until = max(self._playing_until, now) + duration
+                with self._stream_lock:
+                    stream.write(chunk)
 
             try:
                 while not self._play_stop.is_set():
@@ -691,9 +711,11 @@ class LiveManager:
                                 except Exception:
                                     break
                             preroll.clear(); preroll_bytes = 0; primed = True
-                        # Queue drained and the model finished its turn: NOVA
-                        # has stopped talking, so reopen the mic.
-                        if self._gate.speaking and self._turn_done_flag:
+                        # Queue drained, the model finished its turn, and the
+                        # sound device has actually played it all out. Only
+                        # then has NOVA stopped talking.
+                        if (self._gate.speaking and self._turn_done_flag
+                                and self._playback_drained()):
                             self._finish_speaking()
                             primed = False          # next turn re-buffers
                         elif self._gate.speaking and self._last_audio_at:
@@ -701,7 +723,8 @@ class LiveManager:
                             # that leaves it set is deafness. If the queue has
                             # been empty well past any plausible gap in the
                             # model's audio, stop believing NOVA is talking.
-                            if time.time() - self._last_audio_at > SPEAKING_WATCHDOG_S:
+                            if (time.time() - self._last_audio_at > SPEAKING_WATCHDOG_S
+                                    and self._playback_drained()):
                                 _log("[LIVE] watchdog: clearing stuck speaking state")
                                 self._finish_speaking()
                                 primed = False
@@ -732,7 +755,11 @@ class LiveManager:
             finally:
                 self._speaker_alive = False
                 self._gate.set_speaking(False)
+                self._stream = None
                 try:
+                    # stop(), not abort(): on the way out, let whatever is
+                    # already in the device finish rather than clipping the
+                    # last word of a goodbye.
                     stream.stop(); stream.close()
                 except Exception:
                     pass
@@ -742,10 +769,26 @@ class LiveManager:
         self._play_thread.start()
         return True
 
+    def _playback_drained(self) -> bool:
+        """Has the sound device finished playing everything it was given?
+
+        The model running out of chunks is not NOVA finishing her sentence.
+        There is up to a second of audio sitting in the device after the last
+        write, and treating the two as the same event unmuted the microphone
+        while she was still audibly talking — so she heard her own voice, the
+        model received it as the user speaking, and the turn fell apart.
+
+        MODEL_RESPONSE_COMPLETE and AUDIO_PLAYBACK_COMPLETE are separate
+        things. This is the second one.
+        """
+        return time.monotonic() >= self._playing_until
+
     def _finish_speaking(self) -> None:
         """NOVA has stopped talking: reopen the mic and say so."""
         self._gate.set_speaking(False)
         self._turn_done_flag = False
+        self._playing_until = 0.0
+        self._publish(LiveEvent("playback_complete"))
         self._publish(LiveEvent("state", state="listening"))
 
     def _stop_playback(self) -> None:
@@ -800,9 +843,41 @@ class LiveManager:
         self._turn_done_flag = False
         self._play_generation += 1        # discard anything held in the pre-roll
         dropped = nova_voice.drain(self._play_q)
-        _log("[LIVE] barge-in — dropped %d queued chunks", dropped)
+        discarded_ms = self._abort_playback()
+        _log("[LIVE] barge-in — dropped %d queued chunks, %d ms already in "
+             "the sound device", dropped, discarded_ms)
+        self._publish(LiveEvent("playback_cancelled", queued_chunks=dropped,
+                                device_ms=discarded_ms))
         self._publish(LiveEvent("interrupted", reason="barge_in"))
         self._publish(LiveEvent("state", state="listening"))
+
+    def _abort_playback(self) -> int:
+        """Throw away audio the sound device has already accepted.
+
+        Draining our own queue is not stopping. Everything handed to
+        `stream.write()` lives in the device buffer, which on WASAPI is
+        several hundred milliseconds deep and on some devices far more — so
+        NOVA calmly finished her sentence out of it while the interface said
+        "listening". That is the reported barge-in failure: the user talks
+        over her, and she talks on regardless.
+
+        PortAudio's `abort()` discards those buffers immediately, where
+        `stop()` politely waits for them to finish playing. Returns roughly
+        how much audio was thrown away, for the log.
+        """
+        stream = self._stream
+        if stream is None:
+            return 0
+        pending_ms = max(0, int((self._playing_until - time.monotonic()) * 1000))
+        with self._stream_lock:
+            try:
+                stream.abort()
+                stream.start()          # abort leaves it stopped
+            except Exception as e:
+                _log("[LIVE] could not abort playback: %s", e)
+                return 0
+        self._playing_until = 0.0
+        return pending_ms
 
     def set_muted(self, value: bool) -> dict:
         self._gate.set_muted(bool(value))

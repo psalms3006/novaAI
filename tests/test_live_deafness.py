@@ -43,6 +43,9 @@ def session():
     m._turn_count = 0
     m._audio_bytes_out = 0
     m._gate = nova_voice.VoiceGate(chunk_samples=1024, on_barge_in=m._barge_in)
+    m._stream = None                # no real output device in a unit test
+    m._stream_lock = threading.Lock()
+    m._playing_until = 0.0
     m._published = []
     m._publish = lambda ev: m._published.append(ev)
     return m

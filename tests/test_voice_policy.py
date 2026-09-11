@@ -368,3 +368,92 @@ def test_a_natural_finish_arms_the_cooldown():
     g.set_speaking(True)
     g.set_speaking(False)
     assert g._last_speak_end > 0.0, "a natural finish did not arm the cooldown"
+
+
+# ── barge-in without an echo path ────────────────────────────────────────────
+
+def _talk_over(coupling, room_rms, with_user, seed=3):
+    """Play NOVA's recorded voice, optionally with a person talking over it.
+
+    Returns milliseconds from the user starting to speak until barge-in, or
+    None if it never fired.
+    """
+    import pathlib
+    import wave
+
+    fixtures = pathlib.Path(__file__).resolve().parent / "fixtures" / "voice"
+    nova_wav, user_wav = fixtures / "nova_speech_24k.wav", fixtures / "user_speech_16k.wav"
+    if not (nova_wav.exists() and user_wav.exists()):
+        return "skip"
+
+    def read(p):
+        with wave.open(str(p), "rb") as w:
+            return (np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16),
+                    w.getframerate())
+
+    nova24, rate = read(nova_wav)
+    user, _ = read(user_wav)
+    idx = (np.arange(int(len(nova24) * 16000 / rate)) * rate / 16000).astype(np.int64)
+    nova16 = nova24[idx[idx < len(nova24)]]
+
+    g = VoiceGate(chunk_samples=CHUNK)
+    g.set_speaking(True)
+    fired = []
+    g._on_barge_in = lambda: fired.append(1)
+    rng = np.random.default_rng(seed)
+    user_at = 15
+
+    for i in range(len(nova16) // CHUNK):
+        seg = nova24[i * CHUNK * rate // 16000:(i + 1) * CHUNK * rate // 16000]
+        if seg.size:
+            g.reference(seg.tobytes(), rate)
+        mic = rng.normal(0, room_rms, CHUNK)
+        if coupling > 0 and i >= 3:
+            echo = nova16[(i - 3) * CHUNK:(i - 2) * CHUNK]
+            if echo.size == CHUNK:
+                mic = mic + echo.astype(np.float64) * coupling
+        if with_user and i >= user_at:
+            k = (i - user_at) * CHUNK
+            s = user[k:k + CHUNK]
+            if s.size == CHUNK:
+                mic = mic + s.astype(np.float64)
+        g.process(np.clip(mic, -32768, 32767).astype(np.int16))
+        if fired:
+            return (i - user_at) * 64
+    return None
+
+
+def test_barge_in_works_with_no_echo_path_at_all():
+    """Headphones, a distant speaker, or a quiet room.
+
+    The canceller can never converge when NOVA's voice does not reach the
+    microphone, because there is nothing to converge on. Requiring
+    convergence therefore left her permanently uninterruptible on exactly
+    those machines — reproduced at room tone RMS 700 with the user talking
+    over her for four seconds and barge-in never firing once.
+    """
+    for room in (40, 300, 700):
+        got = _talk_over(0.0, room, with_user=True)
+        if got == "skip":
+            return
+        assert got is not None, f"uninterruptible with no echo path, room {room}"
+
+
+def test_barge_in_is_quick_enough_to_feel_like_conversation():
+    got = _talk_over(0.15, 40, with_user=True)
+    if got == "skip":
+        return
+    assert got is not None
+    assert got <= 400, f"took {got} ms to notice the user talking over her"
+
+
+def test_no_self_interruption_across_rooms_and_couplings():
+    """The invariant that must survive every change to the above."""
+    for coupling, room in ((0.0, 700), (0.05, 700), (0.15, 40), (0.25, 300),
+                           (0.40, 200), (0.60, 40), (0.10, 150)):
+        got = _talk_over(coupling, room, with_user=False)
+        if got == "skip":
+            return
+        assert got is None, (
+            f"NOVA interrupted herself at {got} ms with {coupling:.0%} "
+            f"coupling in a room at RMS {room}")
