@@ -629,25 +629,86 @@ body[data-mode="ambient"] .hud-grid {
   gap: 0;
   height: 100vh;
 }
-body[data-mode="ambient"] .stage { padding: 0; gap: 0; height: 100vh; }
-body[data-mode="ambient"] .orb-container {
-  min-height: 0;
+body[data-mode="ambient"] .stage {
+  padding: 0;
+  gap: 0;
+  height: 100vh;
+  display: block;
+}
+
+/* ── the ambient bar ──────────────────────────────────────────────────────
+   Presence on the left, what NOVA is saying on the right. The window itself
+   is clipped to a rounded rectangle by the shell (SetWindowRgn), so this only
+   has to paint inside it — but it must paint an opaque ground, because the
+   region clip removes the corners rather than making the middle transparent.
+   ───────────────────────────────────────────────────────────────────────── */
+body[data-mode="ambient"] .ambient-bar {
+  display: grid;
+  grid-template-columns: 92px 1fr;
+  align-items: center;
+  gap: 10px;
   height: 100vh;
   width: 100vw;
+  padding: 0 18px 0 4px;
+  box-sizing: border-box;
+  background: linear-gradient(100deg, #05080f 0%, #070d18 55%, #05080f 100%);
+  border: 1px solid rgba(120, 190, 255, .16);
+  border-radius: 52px;
 }
-/* The canvas already screen-blends; over pure black that leaves the orb's own
-   colour untouched and the surround exactly #000 for the key to remove. */
-body[data-mode="ambient"] #orb-canvas-3d { mix-blend-mode: normal; }
 
-/* Colour-key transparency only removes *exactly* black pixels. Bloom leaves a
-   very dim halo (RGB 1-10) that survives the key and reads as a faint square
-   around the orb, so mask the canvas to a circle: everything past the orb's
-   radius becomes fully transparent, composites to pure #000, and is keyed out. */
-/* No CSS mask here any more: the shell clips the whole window to an ellipse
-   with SetWindowRgn, which is what actually removes the corners (WebView2
-   ignores layered-window colour keying). A second CSS mask only shrank the orb
-   inside that circle and left a dark ring. */
-body[data-mode="ambient"] #orb-canvas-3d { mix-blend-mode: normal; }
+body[data-mode="ambient"] .ambient-orb {
+  position: relative;
+  width: 92px;
+  height: 92px;
+}
+body[data-mode="ambient"] .ambient-orb .orb-container {
+  position: absolute;
+  inset: 0;
+  height: 92px;
+  width: 92px;
+  min-height: 0;
+}
+
+body[data-mode="ambient"] .ambient-side {
+  min-width: 0;                 /* or the grid column refuses to shrink */
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  height: 100%;
+  padding: 14px 0;
+  box-sizing: border-box;
+}
+
+body[data-mode="ambient"] .ambient-state {
+  font-family: var(--hud-mono);
+  font-size: 9px;
+  letter-spacing: .2em;
+  text-transform: uppercase;
+  color: rgba(150, 200, 255, .62);
+  flex: 0 0 auto;
+}
+
+body[data-mode="ambient"] .ambient-text {
+  font-size: 12.5px;
+  line-height: 1.38;
+  color: rgba(226, 240, 255, .94);
+  overflow: hidden;
+  /* Three lines, then it scrolls itself. A bar that grows with the sentence
+     would resize the window mid-speech. */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  word-break: break-word;
+}
+body[data-mode="ambient"] .ambient-text:empty::before {
+  content: "";
+}
+
+/* The orb canvas fills its slot in the bar, not the whole window. */
+body[data-mode="ambient"] .orb-container {
+  min-height: 0;
+}
 
 /* Mute is a secondary control: present, unobtrusive, never the way in. */
 .mute-btn {
@@ -787,3 +848,53 @@ body[data-mode="ambient"].screen-watching::after {
   0%, 100% { opacity: 0.45; }
   50%      { opacity: 1; }
 }
+
+/* ── conversation feed ────────────────────────────────────────────────────
+   What was actually said, in the left rail beside telemetry. Deliberately a
+   short tail rather than a chat log: it exists to answer "did NOVA hear that
+   correctly", not to be scrolled through. Long sessions must not turn this
+   panel into a wall.
+   ───────────────────────────────────────────────────────────────────────── */
+.convo-feed {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  max-height: 210px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.convo-empty {
+  margin: 0;
+  font-family: var(--hud-mono);
+  font-size: 9.5px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--hud-muted);
+}
+.convo-turn { display: flex; flex-direction: column; gap: 2px; }
+.convo-who {
+  font-family: var(--hud-mono);
+  font-size: 8.5px;
+  letter-spacing: .2em;
+  text-transform: uppercase;
+  color: var(--hud-muted);
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.convo-turn.user .convo-who { color: rgba(150, 200, 255, .78); }
+.convo-turn.nova .convo-who { color: rgba(120, 235, 200, .78); }
+.convo-what {
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--hud-text);
+  word-break: break-word;
+}
+/* The turn still being spoken, so it is visibly live rather than final. */
+.convo-turn.live .convo-what { color: rgba(226, 240, 255, .72); }
+.convo-turn.live .convo-who::after {
+  content: "●";
+  color: rgba(120, 235, 200, .9);
+  animation: convo-live 1.2s ease-in-out infinite;
+}
+@keyframes convo-live { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }

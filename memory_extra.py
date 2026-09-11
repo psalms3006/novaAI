@@ -336,17 +336,66 @@ def _reset_rate_limit() -> None:
     nova_state._rest_backoff_secs = 0.0
 
 
+#: Standing instructions and preferences: things meant to hold beyond this
+#: sentence, whoever they are about.
+_MEMORY_STANDING = (
+    "always", "never", "from now on", "going forward", "in future",
+    "in the future", "stop ", "don't ", "do not ", "remember", "forget",
+    "prefer", "preference", "instead of", "rather than", "make sure",
+    "my goal", "note that", "keep in mind", "by default", "each time",
+    "every time", "whenever",
+)
+
+#: First-person markers: something about the user, their work or their people.
+_MEMORY_PERSONAL = (
+    "i ", "i'm", "im ", "i've", "i'll", "i am", "my ", "mine", "me ",
+    "we ", "we're", "our ", "call me",
+)
+
+#: Asking is not telling. A question with no standing instruction in it has
+#: nothing to carry forward.
+_MEMORY_QUESTION_OPENERS = (
+    "what", "who", "where", "when", "why", "how", "which", "is ", "are ",
+    "can you", "could you", "do you", "did you", "will you", "would you",
+    "tell me", "show me", "open", "close", "play", "search", "find ",
+)
+
+
 def _should_extract_memory(user_msg: str, ai_reply: str) -> bool:
-    """Heuristic gate — skips REST call if conversation has nothing worth storing."""
-    combined = (user_msg + " " + ai_reply).lower()
-    triggers = [
-        "my name", "i am", "i'm", "call me", "i study", "i work", "i live",
-        "i like", "i love", "i hate", "i prefer", "my favorite", "i'm from",
-        "i was born", "my project", "i'm building", "i want to", "i plan to",
-        "remember", "don't forget", "note that", "my age", "years old",
-        "i use", "my goal", "i'm working on", "my team", "i go to",
-    ]
-    return any(k in combined for k in triggers)
+    """Is this exchange worth spending an extraction call on?
+
+    A cheap gate in front of a model call, not the decision itself — the
+    extractor still returns nothing for most of what reaches it. The point is
+    only to avoid paying for "yes", "thanks" and "what time is it".
+
+    It used to be a list of twenty-odd literal phrases, and it was far too
+    narrow to be useful. Measured against realistic statements it kept one in
+    six: "call me Psalms" passed, while "I always want my reports as PDF",
+    "stop using bullet points", "always ask before deleting anything", "the
+    OMNIEL launch is in March" and "my sister Ada is visiting next week" were
+    all discarded before anything could look at them. That is the whole reason
+    nothing seemed to be remembered.
+    """
+    text = (user_msg or "").strip().lower()
+    if len(text.split()) < 4:
+        return False                      # "yes", "stop", "thanks"
+
+    padded = f" {text} "
+    standing = any(k in padded for k in _MEMORY_STANDING)
+    personal = any(k in padded for k in _MEMORY_PERSONAL)
+    if standing:
+        return True                       # holds regardless of who it is about
+
+    if text.endswith("?") or text.startswith(_MEMORY_QUESTION_OPENERS):
+        return False                      # asking, not telling
+
+    # Anything left is a statement. First-person ones are obviously about the
+    # user; the rest are only worth a look if they are substantial, which
+    # catches durable project facts with no "I" in them — "the OMNIEL launch
+    # is in March" would otherwise be dropped for lack of a pronoun. The
+    # extractor still returns nothing for most of these; this gate exists to
+    # bound the cost, not to make the decision.
+    return personal or len(text.split()) >= 6
 
 
 def extract_memory_updates(user_msg: str, ai_reply: str, meta: dict) -> dict:

@@ -257,17 +257,27 @@ def main() -> int:
     # desk.win_overlay.AmbientOverlay is NOT used: it creates a layered Win32
     # window with no WM_PAINT handler and never draws anything.
 
-    # The loading ring is 64px. pywebview does not honour small sizes exactly
-    # (it reported 200x100 for a 96px request), so the real bounds are forced
-    # with SetWindowPos once the HWND exists.
-    AMBIENT_PX = 72
+    # Ambient is a bar, not a bead.
+    #
+    # It was a 72px circle showing only the orb, which meant NOVA could be
+    # heard in ambient mode but never read — and when she is the only thing on
+    # screen, what she just said is the most useful thing to show. The shape
+    # is now a short rectangle: presence on the left, words on the right.
+    #
+    # pywebview does not honour small sizes exactly (it reported 200x100 for a
+    # 96px request), so the real bounds are forced with SetWindowPos once the
+    # HWND exists.
+    AMBIENT_W, AMBIENT_H = 460, 104
+    #: Corner radius for the rounded-rectangle window region. Half the height
+    #: gives fully round ends, which reads as a pill rather than a dialog.
+    AMBIENT_PX = AMBIENT_H // 2
 
     ambient_window = None
     try:
         ambient_window = webview.create_window(
             "NOVA_AMBIENT",                      # distinct title so we can find the HWND
             url=f"{DESK_URL}/?mode=ambient",
-            width=AMBIENT_PX, height=AMBIENT_PX,
+            width=AMBIENT_W, height=AMBIENT_H,
             # pywebview defaults min_size to (200,100), which silently floors
             # the window and clipped the orb — the requested 72px was ignored
             # and SetWindowPos could move it but never shrink it.
@@ -279,7 +289,7 @@ def main() -> int:
             hidden=True,
             background_color="#000000",          # the colour-key
         )
-        _log(f"Ambient window created ({AMBIENT_PX}px, hidden)")
+        _log(f"Ambient window created ({AMBIENT_W}x{AMBIENT_H}, hidden)")
     except Exception as e:
         _log(f"Ambient window unavailable: {e}")
 
@@ -329,10 +339,10 @@ def main() -> int:
             saved = _load_amb_pos()
             if saved is None:
                 sw = u.GetSystemMetrics(0)
-                x, y = sw - AMBIENT_PX - 48, 64
+                x, y = sw - AMBIENT_W - 48, 64
             else:
                 x, y = saved
-            return _clamp_to_desktop(x, y, AMBIENT_PX, AMBIENT_PX)
+            return _clamp_to_desktop(x, y, AMBIENT_W, AMBIENT_H)
         except Exception:
             return 64, 64
 
@@ -345,13 +355,13 @@ def main() -> int:
             if saved is None:
                 # Default: top-right, inset from the edge, on the primary display.
                 sw = u.GetSystemMetrics(0)
-                x, y = sw - AMBIENT_PX - 48, 64
+                x, y = sw - AMBIENT_W - 48, 64
             else:
                 x, y = saved
-            x, y = _clamp_to_desktop(x, y, AMBIENT_PX, AMBIENT_PX)
+            x, y = _clamp_to_desktop(x, y, AMBIENT_W, AMBIENT_H)
             HWND_TOPMOST, SWP_NOACTIVATE = -1, 0x0010
-            u.SetWindowPos(hwnd, HWND_TOPMOST, x, y, AMBIENT_PX, AMBIENT_PX, SWP_NOACTIVATE)
-            _log(f"Ambient placed at ({x},{y}) {AMBIENT_PX}x{AMBIENT_PX}")
+            u.SetWindowPos(hwnd, HWND_TOPMOST, x, y, AMBIENT_W, AMBIENT_H, SWP_NOACTIVATE)
+            _log(f"Ambient placed at ({x},{y}) {AMBIENT_W}x{AMBIENT_H}")
         except Exception as e:
             _log(f"Ambient placement failed: {e}")
 
@@ -370,7 +380,7 @@ def main() -> int:
             pass
 
     def _round_window(hwnd, px) -> bool:
-        """Clip the ambient window to a circle.
+        """Clip the ambient window to a rounded rectangle.
 
         WebView2 renders through DirectComposition, which bypasses layered-
         window colour keying — SetLayeredWindowAttributes(LWA_COLORKEY) reports
@@ -386,12 +396,15 @@ def main() -> int:
         try:
             import ctypes
             u, g = ctypes.windll.user32, ctypes.windll.gdi32
-            rgn = g.CreateEllipticRgn(0, 0, px + 1, px + 1)
+            radius = min(px, AMBIENT_H)
+            rgn = g.CreateRoundRectRgn(0, 0, AMBIENT_W + 1, AMBIENT_H + 1,
+                                       radius, radius)
             ok = u.SetWindowRgn(hwnd, rgn, True)
-            _log(f"Ambient clipped to circle ({px}px): {bool(ok)}")
+            _log(f"Ambient clipped to rounded rect "
+                 f"({AMBIENT_W}x{AMBIENT_H}, r={radius}): {bool(ok)}")
             return bool(ok)
         except Exception as e:
-            _log(f"Ambient circle clip failed: {e}")
+            _log(f"Ambient clip failed: {e}")
             return False
 
     def _make_transparent(hwnd) -> bool:
@@ -500,9 +513,9 @@ def main() -> int:
                         try:
                             x, y = _ambient_target_xy()
                             time.sleep(0.12)
-                            ambient_window.resize(AMBIENT_PX, AMBIENT_PX)
+                            ambient_window.resize(AMBIENT_W, AMBIENT_H)
                             ambient_window.move(x, y)
-                            _log(f"Ambient sized {AMBIENT_PX}x{AMBIENT_PX} at ({x},{y})")
+                            _log(f"Ambient sized {AMBIENT_W}x{AMBIENT_H} at ({x},{y})")
                         except Exception as e:
                             _log(f"Ambient sizing failed: {e}")
                         if amb_hwnd:

@@ -190,6 +190,43 @@ def _compose_opening_line() -> str:
         return ""
 
 
+#: Words below which a turn is not worth considering for memory. "yes",
+#: "thanks", "stop" carry nothing forward.
+MEMORY_MIN_WORDS = 4
+
+#: Never hand these to the extractor, whatever else is true of the turn.
+#: Credentials do not become less sensitive for having been said out loud, and
+#: an assistant that files them away under "useful context" is a liability.
+MEMORY_FORBIDDEN = (
+    "password", "passphrase", "api key", "api-key", "secret key", "token is",
+    "credit card", "card number", "cvv", "social security", "ssn",
+    "bank account", "routing number", "pin is", "private key", "seed phrase",
+)
+
+
+def _remember_turn(user_text: str, nova_text: str) -> None:
+    """Consider one finished turn for long-term memory. Runs in a thread.
+
+    NOVA Core already knows how to decide what is worth keeping and how to
+    store it — this only feeds it, which the desktop session never did. That
+    is why nothing said to the desktop app survived a restart while the
+    terminal remembered perfectly well.
+    """
+    user_text = (user_text or "").strip()
+    nova_text = (nova_text or "").strip()
+    if len(user_text.split()) < MEMORY_MIN_WORDS:
+        return
+    haystack = f"{user_text} {nova_text}".lower()
+    if any(bad in haystack for bad in MEMORY_FORBIDDEN):
+        _log("[LIVE] turn withheld from memory: looks like a credential")
+        return
+    try:
+        from memory_extra import extract_memory_updates, load_memory
+        extract_memory_updates(user_text, nova_text, load_memory())
+    except Exception as e:
+        _log("[LIVE] memory extraction unavailable: %s", e)
+
+
 def _telemetry(event: str, **attrs) -> None:
     """Operational telemetry. Metadata only -- no transcripts, no audio, ever.
 
@@ -1440,6 +1477,11 @@ class LiveManager:
         The outer loop is what the reference implementation has and what this
         was missing.
         """
+        # Transcript of the turn in progress, accumulated so a finished
+        # exchange can be offered to memory as a whole rather than word by
+        # word.
+        heard: list[str] = []
+        said: list[str] = []
         try:
             while True:
                 got_turn = False
@@ -1488,11 +1530,13 @@ class LiveManager:
                         if text:
                             if self._trace:
                                 self._trace.turn_started()
+                            heard.append(text)
                             self._publish(LiveEvent("user_transcript", text=text))
 
                     if sc.output_transcription and sc.output_transcription.text:
                         text = sc.output_transcription.text.strip()
                         if text:
+                            said.append(text)
                             self._publish(LiveEvent("nova_transcript", text=text))
 
                     if sc.interrupted:
@@ -1509,6 +1553,15 @@ class LiveManager:
                         self._turn_done_flag = True
                         self._turn_count += 1
                         self._publish(LiveEvent("turn_complete", turn_count=self._turn_count))
+                        # Offer the finished exchange to long-term memory, off
+                        # the event loop — deciding what is worth keeping can
+                        # involve a model call and must never delay audio.
+                        turn_user, turn_nova = " ".join(heard), " ".join(said)
+                        heard, said = [], []
+                        if turn_user:
+                            threading.Thread(
+                                target=_remember_turn, args=(turn_user, turn_nova),
+                                name="nova-memory", daemon=True).start()
 
                     if msg.go_away:
                         self._publish(LiveEvent("go_away"))

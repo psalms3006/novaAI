@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import io
 import json
+import queue
 import os
 import secrets
 import tempfile
@@ -1010,7 +1011,21 @@ def api_live_ws(ws):
     try:
         while True:
             try:
-                ev = q.get(timeout=0.5)
+                try:
+                    ev = q.get(timeout=0.5)
+                except queue.Empty:
+                    # A quiet half-second is the normal state of a voice
+                    # session, not a reason to hang up.
+                    #
+                    # This used to fall through to the bare `except
+                    # Exception: break` below, so the socket closed after the
+                    # first 500 ms in which NOVA happened to say nothing —
+                    # which is immediately. The conversation panel therefore
+                    # never received a transcript, and the greeting sat
+                    # waiting eight seconds for an interface that had already
+                    # been and gone. Observed live: connected at 00:02:11,
+                    # "no interface attached after 8s" at 00:02:23.
+                    continue
                 ev_dict = ev.to_dict()
                 ws.send(json.dumps(ev_dict))
                 # Forward voice state events to unified event bus
@@ -1031,6 +1046,14 @@ def api_live_ws(ws):
                     publish_event({"type": "transcript", "text": ev_dict.get("text", ""), "role": "user", "ts": time.time()})
                 elif ev_dict.get("type") == "nova_transcript":
                     publish_event({"type": "transcript", "text": ev_dict.get("text", ""), "role": "nova", "ts": time.time()})
+                elif ev_dict.get("type") in ("turn_complete", "interrupted",
+                                             "tool_call", "tool_result",
+                                             "screen_share", "screen_frame",
+                                             "playback_complete"):
+                    # Forwarded so the ambient bar and the telemetry panel can
+                    # follow the conversation without opening their own voice
+                    # socket. One runtime, one event stream.
+                    publish_event({**ev_dict, "ts": time.time()})
             except Exception:
                 break
     finally:

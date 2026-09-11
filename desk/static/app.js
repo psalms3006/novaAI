@@ -385,9 +385,14 @@ function handleLiveEvent(ev) {
       break;
     case "user_transcript":
       addTranscript(ev.text, "user");
+      convoAppend("user", ev.text);
       break;
     case "nova_transcript":
       addTranscript(ev.text, "nova");
+      convoAppend("nova", ev.text);
+      break;
+    case "turn_complete":
+      convoSettle();
       break;
     case "audio":
       // NOVA Core owns playback (server-side sounddevice). If this ever fires
@@ -1278,3 +1283,48 @@ if (obOfflineBtn) {
 // Modal backdrop close
 document.querySelectorAll(".modal-backdrop").forEach(bk =>
   bk.addEventListener("click", (e) => { if (e.target === bk) bk.classList.remove("open"); }));
+
+/* ── conversation feed (left rail) ──────────────────────────────────────────
+   What was actually said, so "did NOVA hear that right?" is answerable at a
+   glance. Fragments arrive a few words at a time and are appended to the turn
+   in progress rather than pushed as separate entries — one word per line is
+   not a transcript, it is confetti. Only the last few turns are kept; this is
+   a status panel, not a chat history. */
+const CONVO_MAX_TURNS = 6;
+const convoState = { role: null, node: null };
+
+function convoTime() {
+  const d = new Date();
+  return String(d.getHours()).padStart(2, "0") + ":" +
+         String(d.getMinutes()).padStart(2, "0");
+}
+
+function convoAppend(role, text) {
+  const feed = $("hud-convo");
+  if (!feed || !text) return;
+  const empty = $("convo-empty");
+  if (empty) empty.remove();
+
+  if (convoState.role !== role || !convoState.node) {
+    const turn = document.createElement("div");
+    turn.className = `convo-turn ${role} live`;
+    turn.innerHTML = `<div class="convo-who"><span>${role === "user" ? "You" : "NOVA"}</span>` +
+                     `<span>${convoTime()}</span></div><div class="convo-what"></div>`;
+    feed.appendChild(turn);
+    convoState.role = role;
+    convoState.node = turn.querySelector(".convo-what");
+    while (feed.children.length > CONVO_MAX_TURNS) feed.removeChild(feed.firstChild);
+  }
+  convoState.node.textContent = (convoState.node.textContent + " " + text).trim();
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function convoSettle() {
+  const feed = $("hud-convo");
+  if (feed) [...feed.querySelectorAll(".convo-turn.live")].forEach(
+    (n) => n.classList.remove("live"));
+  convoState.role = null;
+  convoState.node = null;
+}
+window.novaConvoAppend = convoAppend;
+window.novaConvoSettle = convoSettle;
