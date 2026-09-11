@@ -108,6 +108,11 @@ SURFACE_WAIT_S = 8.0
 #: tool does not take the session with it.
 TOOL_TIMEOUT_S = 30.0
 
+#: Longest a screen frame may go unrefreshed inside one conversational turn.
+#: Within a turn the screen rarely matters more than once; across turns a
+#: fresh frame is sent as soon as one is captured.
+SCREEN_REFRESH_S = 10.0
+
 #: Audio buffered before playback starts, per turn. Enough to ride out normal
 #: network jitter; small enough that NOVA still feels immediate.
 PREROLL_MS = 220
@@ -1580,15 +1585,49 @@ class LiveManager:
         return result
 
     async def _video_sender(self, session: Any) -> None:
-        """Forward sampled screen frames into the live conversation."""
+        """Put the screen in front of the model, as conversation context.
+
+        Not `send_realtime_input(video=...)`. That is the obvious call and it
+        silently does nothing useful — measured directly: capture a frame of
+        this desktop, send it that way, ask "what application is on my
+        screen", and the model answers "I can't see your screen". The same
+        frame sent as `inline_data` inside client content comes back with
+        "a terminal application, likely Windows PowerShell, displaying
+        command-line operations and errors related to a Python project",
+        which is exactly what was on it.
+
+        `turn_complete=False` matters as much. The frame is *context*, not a
+        question — NOVA should not announce what she can see every two
+        seconds. Left pending, it is folded into whatever the user says next,
+        so "what am I looking at?" is answered from the screen as it was a
+        moment ago.
+        """
+        last_sent_turn = -1
+        last_sent_at = 0.0
         while True:
             try:
                 item = await self._video_queue.get()
                 if item is None:
                     break
                 jpeg, mime = item
-                await session.send_realtime_input(
-                    video=gtypes.Blob(data=jpeg, mime_type=mime))
+
+                # One frame per conversational turn is the right granularity:
+                # enough that a question about the screen sees the screen,
+                # few enough that the context does not fill up with pictures
+                # of an unchanged desktop.
+                now = time.monotonic()
+                same_turn = self._turn_count == last_sent_turn
+                if same_turn and (now - last_sent_at) < SCREEN_REFRESH_S:
+                    continue
+
+                await session.send_client_content(
+                    turns={"role": "user",
+                           "parts": [{"inline_data": {"mime_type": mime,
+                                                      "data": jpeg}}]},
+                    turn_complete=False)
+                last_sent_turn = self._turn_count
+                last_sent_at = now
+                self._publish(LiveEvent("screen_frame", kb=round(len(jpeg) / 1024, 1)))
             except asyncio.CancelledError:
                 break
             except Exception as e:
