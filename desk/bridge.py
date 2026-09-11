@@ -1008,9 +1008,11 @@ def api_live_ws(ws):
         return
     mgr = desk_live.get_live_manager()
     q = mgr.subscribe()
+    idle = 0
     try:
         while True:
             try:
+                idle = 0
                 try:
                     ev = q.get(timeout=0.5)
                 except queue.Empty:
@@ -1023,8 +1025,19 @@ def api_live_ws(ws):
                     # which is immediately. The conversation panel therefore
                     # never received a transcript, and the greeting sat
                     # waiting eight seconds for an interface that had already
-                    # been and gone. Observed live: connected at 00:02:11,
-                    # "no interface attached after 8s" at 00:02:23.
+                    # been and gone.
+                    #
+                    # The ping is not decoration: without traffic there is no
+                    # way to notice a peer that has gone away, and a
+                    # subscriber queue nobody drains fills up and starts
+                    # dropping the events other surfaces still want.
+                    idle += 1
+                    if idle >= 20:              # ~10 s
+                        idle = 0
+                        try:
+                            ws.send('{"type":"ping"}')
+                        except Exception:
+                            break
                     continue
                 ev_dict = ev.to_dict()
                 ws.send(json.dumps(ev_dict))

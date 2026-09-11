@@ -898,3 +898,9 @@ body[data-mode="ambient"].screen-watching::after {
   animation: convo-live 1.2s ease-in-out infinite;
 }
 @keyframes convo-live { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+
+/* An active control must look active. */
+.mute-btn.active {
+  border-color: rgba(87, 217, 163, .6);
+  color: rgba(120, 235, 200, .95);
+}

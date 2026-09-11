@@ -97,10 +97,16 @@ MIC_WARMUP_BYTES = MIC_RATE * 2
 #: produces anything is a broken microphone, not a reason to stay silent.
 MIC_WARMUP_WAIT_S = 4.0
 
-#: How long the greeting waits for an interface to attach before giving up
-#: and speaking anyway. Long enough for the desktop window to finish loading
-#: on a cold start, short enough that a headless session is not left mute.
-SURFACE_WAIT_S = 8.0
+#: How long the greeting waits for an interface to attach before going ahead.
+#:
+#: Short, because it is a courtesy rather than the readiness check. What
+#: actually has to be true before NOVA speaks is that the session is
+#: connected, the speaker is open, the microphone is open and real audio has
+#: reached the model — all of which are checked separately. Waiting eight
+#: seconds on a surface that may never attach (a headless run, a window that
+#: reloaded during boot) just delays the greeting for no benefit; it was
+#: observed doing exactly that.
+SURFACE_WAIT_S = 2.5
 
 #: How long a tool may run before NOVA stops waiting for it. The model is
 #: blocked on the response for this whole time, and so is the conversation, so

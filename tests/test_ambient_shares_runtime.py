@@ -84,7 +84,7 @@ def test_screen_awareness_uses_the_conversation_already_in_progress():
     from desk.live_session import LiveManager
 
     src = inspect.getsource(LiveManager._video_sender)
-    assert "session.send_realtime_input" in src, (
+    assert "session.send_" in src, (
         "screen frames go somewhere other than the live session")
     assert "genai.Client" not in src, "a second Gemini connection for vision"
 

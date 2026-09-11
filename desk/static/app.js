@@ -377,6 +377,11 @@ function handleLiveEvent(ev) {
       // something the user has to remember they enabled.
       state.screenWatching = !!ev.watching;
       document.body.classList.toggle("screen-watching", state.screenWatching);
+      if (screenBtn) {
+        screenBtn.setAttribute("aria-pressed", state.screenWatching ? "true" : "false");
+        screenBtn.classList.toggle("active", state.screenWatching);
+        screenBtn.textContent = state.screenWatching ? "Seeing screen" : "See screen";
+      }
       if (ev.reason) addTranscript_nova("NOVA can't watch the screen: " + ev.reason);
       break;
     case "audio_level":
@@ -1131,6 +1136,21 @@ async function toggleMute() {
   }
 }
 if (muteBtn) muteBtn.addEventListener("click", toggleMute);
+
+/* Screen awareness is off until asked for, and visibly on once it is. Nothing
+   about opening ambient mode enables it: the screen is the most sensitive
+   thing NOVA can be given, so it is always a deliberate act. */
+const screenBtn = $("btn-screen");
+if (screenBtn) {
+  screenBtn.addEventListener("click", async () => {
+    const on = await setScreenWatching(!state.screenWatching);
+    state.screenWatching = on;
+    screenBtn.setAttribute("aria-pressed", on ? "true" : "false");
+    screenBtn.classList.toggle("active", on);
+    screenBtn.textContent = on ? "Seeing screen" : "See screen";
+    document.body.classList.toggle("screen-watching", on);
+  });
+}
 
 // Voice button (legacy control, hidden in the HUD layout)
 const voiceBtn = $("btn-voice");
