@@ -1,3 +1,4 @@
+import os
 import platform
 import subprocess
 import time
@@ -22,6 +23,64 @@ def execute(args: dict) -> str:
                 return f"Screenshot saved as {filename}"
             except ImportError:
                 return "Screenshot requires PIL: pip install pillow"
+
+        elif action in ("battery", "get_battery"):
+            # Reading the machine, which NOVA could not do at all: the tool
+            # answered "Unknown action: battery".
+            try:
+                import psutil
+                b = psutil.sensors_battery()
+                if b is None:
+                    return "No battery detected — this looks like a desktop."
+                state = "charging" if b.power_plugged else "on battery"
+                left = ""
+                if not b.power_plugged and b.secsleft and b.secsleft > 0:
+                    left = f", about {b.secsleft // 3600}h {(b.secsleft % 3600) // 60}m left"
+                return f"Battery is at {b.percent:.0f}%, {state}{left}."
+            except Exception as e:
+                return f"Could not read the battery: {e}"
+
+        elif action in ("get_volume", "volume"):
+            if system == "Windows":
+                try:
+                    from actions._audio_win import get_volume
+                    return f"Volume is at {get_volume() * 100:.0f}%."
+                except Exception as e:
+                    return f"Could not read the volume: {e}"
+            return "Reading the volume is not supported on this OS."
+
+        elif action == "set_volume":
+            if system == "Windows":
+                try:
+                    from actions._audio_win import set_volume
+                    raw = args.get("value", args.get("level"))
+                    level = float(raw)
+                    if level > 1:
+                        level /= 100.0
+                    got = set_volume(level)
+                    return f"Volume set to {got * 100:.0f}%."
+                except (TypeError, ValueError):
+                    return "Tell me a level, for example 'set volume to 40%'."
+                except Exception as e:
+                    return f"Could not set the volume: {e}"
+            return "Setting the volume is not supported on this OS."
+
+        elif action in ("system_info", "info"):
+            try:
+                # platform is imported at module scope; importing it again
+                # here would make it a local and shadow the earlier use.
+                import psutil
+                mem = psutil.virtual_memory()
+                disk = psutil.disk_usage(os.path.expanduser("~"))
+                return (
+                    f"{platform.system()} {platform.release()}. "
+                    f"CPU {psutil.cpu_percent(interval=0.3):.0f}%. "
+                    f"Memory {mem.percent:.0f}% of "
+                    f"{mem.total / 1024**3:.1f} GB. "
+                    f"Disk {disk.percent:.0f}% of {disk.total / 1024**3:.0f} GB."
+                )
+            except Exception as e:
+                return f"Could not read system info: {e}"
 
         elif action == "volume_up":
             if system == "Windows":

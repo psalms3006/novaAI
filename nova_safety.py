@@ -87,6 +87,9 @@ CONSEQUENTIAL_TOOLS: Dict[str, str] = {
 }
 
 # Actions within tools that are safe without confirmation
+#: Fallback allowlist, used only when the permission engine cannot be
+#: imported. nova_core.permissions is the source of truth; anything added
+#: here must be added there too, or the two will disagree again.
 SAFE_ACTIONS: Dict[str, set] = {
     "file_controller":  {"list", "read", "find", "info"},
     "computer_settings":{"screenshot"},
@@ -141,8 +144,26 @@ def safety_gate(
     if tool_name not in CONSEQUENTIAL_TOOLS:
         return None  # unrestricted — go ahead
 
-    # Check if this specific action is safe
     action = args.get("action", "")
+
+    # Ask the permission engine, which is the one place that decides this.
+    #
+    # SAFE_ACTIONS below is a second allowlist answering the same question,
+    # and two lists drift: this one named only "screenshot" as safe for
+    # computer_settings, so NOVA stopped to ask "should I proceed?" before
+    # reading a battery percentage — out loud, mid-conversation — while the
+    # permission engine had already decided that was fine. Defer to the
+    # engine; keep the list below only for when it cannot be reached.
+    try:
+        from nova_core import permissions as _perm
+        decision = _perm.check_tool("nova", tool_name, args=args)
+        if decision.effect is _perm.Effect.ALLOW:
+            return None
+        if decision.effect is _perm.Effect.DENY:
+            return f"Refused: {decision.reason}."
+    except Exception:
+        pass                      # fall back to the static list below
+
     safe_for_this_tool = SAFE_ACTIONS.get(tool_name, set())
     if action in safe_for_this_tool:
         return None  # read-only variant — go ahead

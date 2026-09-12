@@ -1594,7 +1594,7 @@ def _execute_tool_sync(tool_name: str, args: dict, meta: dict) -> str:
     if _extra is not None:
         return _extra
 
-    if not _TOOL_AVAILABILITY.get(tool_name):
+    if not _tool_available(tool_name):
         return f"Tool '{tool_name}' is unavailable (module missing)."
     try:
         module  = importlib.import_module(f"actions.{tool_name}")
@@ -1611,6 +1611,26 @@ def _execute_tool_sync(tool_name: str, args: dict, meta: dict) -> str:
     except Exception as e:
         log.exception(f"Tool execution failed: {tool_name}")
         return f"Tool '{tool_name}' error: {e}"
+
+
+def _tool_available(tool_name: str) -> bool:
+    """Is this tool's module importable? Works out the answer if nobody has.
+
+    The availability map used to be filled in only by main(), which is the
+    *terminal* entry point. The desktop app runs through desk.bridge and never
+    calls it, so the map stayed empty there and every module-based tool
+    answered "unavailable (module missing)" — file_controller,
+    computer_settings, open_app, the lot. The modules were importable the
+    whole time; nothing had asked.
+
+    That is the shape of "it works in the terminal but fails in the app", and
+    the fix is for the question to answer itself the first time it is asked
+    rather than depending on which entry point happened to run.
+    """
+    global _TOOL_AVAILABILITY
+    if not _TOOL_AVAILABILITY:
+        _TOOL_AVAILABILITY = _validate_tool_modules()
+    return bool(_TOOL_AVAILABILITY.get(tool_name))
 
 
 def _validate_tool_modules() -> Dict[str, bool]:

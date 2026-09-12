@@ -23,9 +23,32 @@ from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
 
 def _get_volume_interface() -> IAudioEndpointVolume:
-    devices = AudioUtilities.GetSpeakers()
-    interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+    """The endpoint volume interface, across pycaw's two shapes.
+
+    GetSpeakers() used to return the COM device directly. In current pycaw
+    (20251023) it returns an AudioDevice wrapper with no .Activate, and the
+    real device is on ._dev — so the old call raised "'AudioDevice' object has
+    no attribute 'Activate'" and every volume request came back as "Volume
+    control failed... install pycaw", on a machine where pycaw was installed
+    and working perfectly.
+    """
+    speakers = AudioUtilities.GetSpeakers()
+    device = getattr(speakers, "_dev", speakers)
+    interface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
     return cast(interface, POINTER(IAudioEndpointVolume))
+
+
+def get_volume() -> float:
+    """Current master volume, 0.0-1.0."""
+    return float(_get_volume_interface().GetMasterVolumeLevelScalar())
+
+
+def set_volume(level: float) -> float:
+    """Set master volume to an absolute 0.0-1.0. Returns what it became."""
+    level = max(0.0, min(1.0, float(level)))
+    vol = _get_volume_interface()
+    vol.SetMasterVolumeLevelScalar(level, None)
+    return float(vol.GetMasterVolumeLevelScalar())
 
 
 def step_volume(delta: float) -> float:
