@@ -257,20 +257,23 @@ def main() -> int:
     # desk.win_overlay.AmbientOverlay is NOT used: it creates a layered Win32
     # window with no WM_PAINT handler and never draws anything.
 
-    # Ambient is a bar, not a bead.
+    # Ambient is a bead, not a bar.
     #
-    # It was a 72px circle showing only the orb, which meant NOVA could be
-    # heard in ambient mode but never read — and when she is the only thing on
-    # screen, what she just said is the most useful thing to show. The shape
-    # is now a short rectangle: presence on the left, words on the right.
+    # It briefly became a 460x104 panel with the transcript beside the orb,
+    # and that is a miniature application window sitting on the desktop — the
+    # opposite of ambient. What belongs here is presence: a small orb the user
+    # can see, drag and click, and nothing else. The transcript lives in the
+    # full interface, where there is room for it.
+    #
+    # 44px is sized against the close button of an ordinary window — a little
+    # larger, so it is comfortably clickable and its state is readable at a
+    # glance, while still small enough to leave on top of real work.
     #
     # pywebview does not honour small sizes exactly (it reported 200x100 for a
     # 96px request), so the real bounds are forced with SetWindowPos once the
     # HWND exists.
-    AMBIENT_W, AMBIENT_H = 460, 104
-    #: Corner radius for the rounded-rectangle window region. Half the height
-    #: gives fully round ends, which reads as a pill rather than a dialog.
-    AMBIENT_PX = AMBIENT_H // 2
+    AMBIENT_PX = 44
+    AMBIENT_W = AMBIENT_H = AMBIENT_PX
 
     ambient_window = None
     try:
@@ -380,7 +383,7 @@ def main() -> int:
             pass
 
     def _round_window(hwnd, px) -> bool:
-        """Clip the ambient window to a rounded rectangle.
+        """Clip the ambient window to a circle.
 
         WebView2 renders through DirectComposition, which bypasses layered-
         window colour keying — SetLayeredWindowAttributes(LWA_COLORKEY) reports
@@ -396,12 +399,9 @@ def main() -> int:
         try:
             import ctypes
             u, g = ctypes.windll.user32, ctypes.windll.gdi32
-            radius = min(px, AMBIENT_H)
-            rgn = g.CreateRoundRectRgn(0, 0, AMBIENT_W + 1, AMBIENT_H + 1,
-                                       radius, radius)
+            rgn = g.CreateEllipticRgn(0, 0, px + 1, px + 1)
             ok = u.SetWindowRgn(hwnd, rgn, True)
-            _log(f"Ambient clipped to rounded rect "
-                 f"({AMBIENT_W}x{AMBIENT_H}, r={radius}): {bool(ok)}")
+            _log(f"Ambient clipped to circle ({px}px): {bool(ok)}")
             return bool(ok)
         except Exception as e:
             _log(f"Ambient clip failed: {e}")
@@ -434,6 +434,31 @@ def main() -> int:
             return 0
 
     # ── the one authority for ambient visibility ──────────────────────
+    def _set_screen_watching(on: bool) -> None:
+        """Turn NOVA's screen awareness on with ambient mode, off with it.
+
+        Ambient is a presence over the desktop, so what is on the desktop is
+        part of what she is aware of — the user asked for that by switching to
+        it, and a button would only be a second way to say the same thing. The
+        full interface is the opposite: she looks when asked, and not before.
+        """
+        try:
+            import json as _json
+            import urllib.request
+
+            from desk import bridge as _bridge
+            req = urllib.request.Request(
+                f"{DESK_URL}/api/live/screen",
+                data=_json.dumps({"watching": bool(on)}).encode(),
+                headers={"Content-Type": "application/json",
+                         "X-NOVA-Desk": _bridge.run_token},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=3) as r:
+                r.read()
+        except Exception as e:
+            # Vision is an enhancement; never let it disturb the window logic.
+            _log(f"screen awareness toggle failed: {e}")
+
     def _ambient_watch():
         """Show the orb only while the main window is not the user's view of NOVA.
 
@@ -499,6 +524,7 @@ def main() -> int:
                         continue
                     if want:
                         _log("Ambient ON (main minimised=%s foreground=%s)" % (minimised, nova_fg))
+                        _set_screen_watching(True)
                         ambient_window.show()
                         # Geometry and the layered style must be re-asserted
                         # AFTER show(): pywebview re-applies its own window size
@@ -525,6 +551,11 @@ def main() -> int:
                                 _round_window(amb_hwnd, AMBIENT_PX)
                     else:
                         _log("Ambient OFF (main window is visible)")
+                        # Back in the full interface, NOVA stops watching the
+                        # screen. Ambient mode is her looking over the desktop;
+                        # the full window is the user looking at her, and she
+                        # should only look when asked.
+                        _set_screen_watching(False)
                         if amb_hwnd:
                             _remember_ambient_pos(amb_hwnd)   # user may have dragged it
                         ambient_window.hide()

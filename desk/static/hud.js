@@ -369,63 +369,29 @@
 
   const AMBIENT = new URLSearchParams(location.search).get("mode") === "ambient";
 
-  /* Ambient is a bar: NOVA's presence on the left, her words on the right.
-     Built here rather than in index.html because the ambient window loads the
-     same page as the full interface — this is the one place that knows which
-     surface it is. */
-  function buildAmbientShell() {
-    const stage = document.querySelector(".stage");
-    const orbBox = document.getElementById("orb-container");
-    if (!stage || !orbBox || document.getElementById("ambient-bar")) return null;
-
-    const bar = document.createElement("div");
-    bar.id = "ambient-bar";
-    bar.className = "ambient-bar";
-
-    const orbSlot = document.createElement("div");
-    orbSlot.className = "ambient-orb";
-    orbSlot.appendChild(orbBox);
-
-    const side = document.createElement("div");
-    side.className = "ambient-side";
-    side.innerHTML =
-      '<div class="ambient-state" id="ambient-state">Ready</div>' +
-      '<div class="ambient-text" id="ambient-text"></div>';
-
-    bar.appendChild(orbSlot);
-    bar.appendChild(side);
-    stage.appendChild(bar);
-    return bar;
-  }
-
-  /* What NOVA is saying, as she says it.
-
-     Transcript fragments arrive a few words at a time, so they are appended
-     to the current line rather than replacing it — replacing it makes the
-     text flicker through single words and reads as broken. A new turn clears
-     it. Only the tail is kept: this is a 460px bar, not a chat log. */
-  const AMBIENT_MAX_CHARS = 240;
-  let ambientLine = "";
-
-  function ambientSay(text, { reset = false } = {}) {
-    const el = document.getElementById("ambient-text");
-    if (!el) return;
-    ambientLine = reset ? text : (ambientLine + " " + text).trim();
-    if (ambientLine.length > AMBIENT_MAX_CHARS) {
-      ambientLine = "…" + ambientLine.slice(-AMBIENT_MAX_CHARS);
-    }
-    el.textContent = ambientLine;
-    el.scrollTop = el.scrollHeight;
-  }
-
-  function ambientState(label) {
-    const el = document.getElementById("ambient-state");
-    if (el) el.textContent = label;
+  /* Ambient mode is NOVA watching over the desktop, so the screen is part of
+     what she is watching. No button: the user asked for it by switching to
+     ambient. In the full interface the opposite holds — she looks only when
+     asked, because there the user is looking at NOVA, not past her. */
+  async function startAmbientScreenAwareness() {
+    try {
+      await fetch("/api/live/screen", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-NOVA-Desk": TOKEN },
+        body: JSON.stringify({ watching: true }),
+      });
+    } catch (e) { /* voice still works without it */ }
   }
 
   function initAmbient() {
     document.body.dataset.mode = "ambient";
-    buildAmbientShell();
+    // The session may not exist yet on a cold start; retry briefly rather
+    // than silently leaving her blind.
+    let tries = 0;
+    const arm = setInterval(() => {
+      startAmbientScreenAwareness();
+      if (++tries >= 6) clearInterval(arm);
+    }, 2500);
 
     // Reveal the shell immediately and drop the splash. app.js only unhides
     // #app at the end of its boot sequence, and the init overlay sits on top
@@ -457,23 +423,6 @@
           const map = { streaming: "listening", connected: "listening",
                         connecting: "thinking", error: "error", closed: "offline" };
           if (map[ev.state]) orb.setState(map[ev.state]);
-          const words = { listening: "Listening", thinking: "Thinking",
-                          speaking: "Speaking", ready: "Ready",
-                          connecting: "Connecting", offline: "Offline",
-                          error: "Voice unavailable" };
-          if (words[ev.state]) ambientState(words[ev.state]);
-        } else if (ev.type === "transcript" && ev.role === "nova" && ev.text) {
-          ambientSay(ev.text);
-          ambientState("Speaking");
-        } else if (ev.type === "transcript" && ev.role === "user" && ev.text) {
-          // A new user turn replaces the old answer rather than appending to
-          // it: the bar shows the exchange happening now, not a history.
-          ambientSay("", { reset: true });
-          ambientState("Thinking");
-        } else if (ev.type === "turn_complete") {
-          ambientState("Listening");
-        } else if (ev.type === "interrupted") {
-          ambientState("Listening");
         } else if (ev.type === "task_start") orb.setState("working");
         else if (ev.type === "agent_start") orb.setState("delegating");
         else if (ev.type === "task_done") orb.setState("idle");

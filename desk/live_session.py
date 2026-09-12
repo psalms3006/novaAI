@@ -119,9 +119,16 @@ TOOL_TIMEOUT_S = 30.0
 #: fresh frame is sent as soon as one is captured.
 SCREEN_REFRESH_S = 10.0
 
-#: Audio buffered before playback starts, per turn. Enough to ride out normal
-#: network jitter; small enough that NOVA still feels immediate.
-PREROLL_MS = 220
+#: Output buffer depth requested from the sound device, in seconds. See
+#: _start_playback for the measurements behind it.
+OUTPUT_LATENCY_S = 0.5
+
+#: Audio held back before playback starts, per turn.
+#:
+#: Lower than it was (220 ms), because the device now holds half a second of
+#: cushion itself and there is no reason to pay for the same insurance twice.
+#: This only has to cover the gap between the first chunk and the second.
+PREROLL_MS = 120
 LIVE_RATE = 24000  # Gemini Live outputs 24 kHz 16-bit mono PCM
 
 
@@ -673,21 +680,30 @@ class LiveManager:
             return False
         self._play_stop.clear()
         try:
-            # blocksize=0 lets the device choose, and the default latency is
-            # used deliberately.
+            # A deliberately deep output buffer. This is the cracking.
             #
-            # The previous setting was blocksize=4096 with latency="low",
-            # which asks for the smallest buffer the device will give while
-            # writing in large lumps. Measured on this machine that blocked 6
-            # of 12 writes past 150 ms against 0 of 12 for the defaults: the
-            # device drained between writes, and an empty output buffer is the
-            # click that was heard. Model audio arrives in bursts over a
-            # network, so playback needs slack, not the tightest buffer.
+            # An empty output buffer is a click, and model audio arrives in
+            # bursts over a network that was measured stalling for seconds at
+            # a time. So the only question that matters is how long a gap the
+            # device can absorb before it runs dry. Measured on this machine,
+            # writing Gemini-sized chunks:
+            #
+            #   default latency   182 ms of buffer
+            #   latency="high"    182 ms  (no different here)
+            #   latency=0.5       504 ms
+            #   latency=1.0      1000 ms
+            #
+            # "high" is a hint the device is free to ignore, and this one does.
+            # An explicit half second nearly triples the cushion for a delay
+            # the user cannot perceive at the start of a turn — and barge-in
+            # discards the buffer outright with abort(), so a deeper buffer
+            # costs nothing when she is interrupted.
             stream = sd.RawOutputStream(
                 samplerate=nova_voice.RECEIVE_RATE,
                 channels=nova_voice.CHANNELS,
                 dtype="int16",
                 blocksize=0,
+                latency=OUTPUT_LATENCY_S,
             )
             stream.start()
             self._stream = stream

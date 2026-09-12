@@ -377,11 +377,6 @@ function handleLiveEvent(ev) {
       // something the user has to remember they enabled.
       state.screenWatching = !!ev.watching;
       document.body.classList.toggle("screen-watching", state.screenWatching);
-      if (screenBtn) {
-        screenBtn.setAttribute("aria-pressed", state.screenWatching ? "true" : "false");
-        screenBtn.classList.toggle("active", state.screenWatching);
-        screenBtn.textContent = state.screenWatching ? "Seeing screen" : "See screen";
-      }
       if (ev.reason) addTranscript_nova("NOVA can't watch the screen: " + ev.reason);
       break;
     case "audio_level":
@@ -619,10 +614,21 @@ function toggleRightField(show) {
   if (field) field.classList.toggle("active", show);
 }
 
-/* ── Onboarding ────────────────────────────────────── */
+/* ── Onboarding ──────────────────────────────────────
+   Shown once, on a machine that has never been set up. Once the user has
+   chosen — a key, a server, or offline — it must not come back.
+
+   It used to reappear seconds later, repeatedly. closeOnboarding() re-polled
+   the status and re-ran the same check, so anything that left the backend's
+   "onboarded" flag unset put the screen straight back up. Pasting a Gemini
+   key did exactly that: the key was stored correctly, the flag was not set,
+   and the only escape was picking offline, which did set it. The flag is
+   fixed at the source; this latch makes the loop impossible regardless. */
 function maybeShowOnboarding() {
+  if (state.onboardingDone) return;
   const a = (state.statusData || {}).auth || {};
   if (a.onboarded || a.has_credential) {
+    state.onboardingDone = true;
     $("onboard-modal").style.display = "none";
     return;
   }
@@ -630,8 +636,11 @@ function maybeShowOnboarding() {
 }
 
 function closeOnboarding() {
+  state.onboardingDone = true;
   $("onboard-modal").style.display = "none";
-  refreshStatus().then(maybeShowOnboarding);
+  // Refresh so the rest of the interface reflects the new mode, but never
+  // re-open this screen off the back of it.
+  refreshStatus();
 }
 
 /* ── Settings Modal ────────────────────────────────── */
@@ -1137,20 +1146,6 @@ async function toggleMute() {
 }
 if (muteBtn) muteBtn.addEventListener("click", toggleMute);
 
-/* Screen awareness is off until asked for, and visibly on once it is. Nothing
-   about opening ambient mode enables it: the screen is the most sensitive
-   thing NOVA can be given, so it is always a deliberate act. */
-const screenBtn = $("btn-screen");
-if (screenBtn) {
-  screenBtn.addEventListener("click", async () => {
-    const on = await setScreenWatching(!state.screenWatching);
-    state.screenWatching = on;
-    screenBtn.setAttribute("aria-pressed", on ? "true" : "false");
-    screenBtn.classList.toggle("active", on);
-    screenBtn.textContent = on ? "Seeing screen" : "See screen";
-    document.body.classList.toggle("screen-watching", on);
-  });
-}
 
 // Voice button (legacy control, hidden in the HUD layout)
 const voiceBtn = $("btn-voice");

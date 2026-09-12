@@ -387,6 +387,25 @@ def resolve() -> dict:
     global _last_status
     env_key = os.getenv("GEMINI_API_KEY", "").strip()
 
+    # An explicit choice of offline outranks an ambient key.
+    #
+    # A GEMINI_API_KEY in the environment — from .env, or exported by a
+    # developer shell — used to win unconditionally, so a user who chose
+    # "work offline" still had every request going to Gemini while the
+    # interface said offline. That is the reported "offline mode still runs on
+    # Gemini? it's all confusing", and it is worse than confusing: the one
+    # setting whose entire purpose is to stop network calls did not stop them.
+    if _get_setting("auth_mode") == "offline":
+        if env_key and env_key != _SENTINEL:
+            os.environ.pop("GEMINI_API_KEY", None)
+        _last_status = {
+            "mode": "offline", "onboarded": bool(_get_setting("onboarded")),
+            "cloud_configured": False, "cloud_error": "",
+            "byok_present": bool(load_byok()), "byok_masked": "",
+            "has_credential": False, "chosen_offline": True,
+        }
+        return dict(_last_status)
+
     if env_key and env_key != _SENTINEL:
         mode = "env"
         cloud_error = ""
@@ -436,11 +455,19 @@ def resolve() -> dict:
 
 
 def set_byok(api_key: str) -> dict:
-    """Store a user-provided key securely and re-resolve. Never returns the key."""
+    """Store a user-provided key securely and re-resolve. Never returns the key.
+
+    Marking the user onboarded is part of this, not an afterthought. Pasting a
+    key *is* choosing how NOVA connects, and leaving the flag unset meant the
+    first-run screen reappeared seconds after the key was accepted, over and
+    over, until the user gave up and picked offline — which did set it. The
+    key was being stored correctly the whole time; only the "you have chosen"
+    flag was missing, so the choice could never stick.
+    """
     if not valid_key_format(api_key):
         raise ValueError("That key looks too short to be valid. Paste the full key.")
     store_byok(api_key.strip())
-    set_many({"auth_mode": "byok"})
+    set_many({"auth_mode": "byok", "onboarded": True})
     return apply_runtime()
 
 

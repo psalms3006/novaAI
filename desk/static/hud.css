@@ -636,78 +636,28 @@ body[data-mode="ambient"] .stage {
   display: block;
 }
 
-/* ── the ambient bar ──────────────────────────────────────────────────────
-   Presence on the left, what NOVA is saying on the right. The window itself
-   is clipped to a rounded rectangle by the shell (SetWindowRgn), so this only
-   has to paint inside it — but it must paint an opaque ground, because the
-   region clip removes the corners rather than making the middle transparent.
+/* ── the ambient orb ──────────────────────────────────────────────────────
+   Presence, and nothing else. The window is a 44px circle clipped by the
+   shell (SetWindowRgn), so there is no rectangle to see; everything here
+   exists to make sure nothing paints outside the orb itself.
+
+   It was briefly a 460px bar with the transcript beside the orb. That is a
+   miniature application window sitting on the desktop, which is the opposite
+   of ambient — the transcript belongs in the full interface, where there is
+   room for it.
    ───────────────────────────────────────────────────────────────────────── */
-body[data-mode="ambient"] .ambient-bar {
-  display: grid;
-  grid-template-columns: 92px 1fr;
-  align-items: center;
-  gap: 10px;
+body[data-mode="ambient"] .stage {
+  padding: 0;
+  gap: 0;
   height: 100vh;
-  width: 100vw;
-  padding: 0 18px 0 4px;
-  box-sizing: border-box;
-  background: linear-gradient(100deg, #05080f 0%, #070d18 55%, #05080f 100%);
-  border: 1px solid rgba(120, 190, 255, .16);
-  border-radius: 52px;
+  display: block;
 }
-
-body[data-mode="ambient"] .ambient-orb {
-  position: relative;
-  width: 92px;
-  height: 92px;
-}
-body[data-mode="ambient"] .ambient-orb .orb-container {
-  position: absolute;
-  inset: 0;
-  height: 92px;
-  width: 92px;
-  min-height: 0;
-}
-
-body[data-mode="ambient"] .ambient-side {
-  min-width: 0;                 /* or the grid column refuses to shrink */
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 5px;
-  height: 100%;
-  padding: 14px 0;
-  box-sizing: border-box;
-}
-
-body[data-mode="ambient"] .ambient-state {
-  font-family: var(--hud-mono);
-  font-size: 9px;
-  letter-spacing: .2em;
-  text-transform: uppercase;
-  color: rgba(150, 200, 255, .62);
-  flex: 0 0 auto;
-}
-
-body[data-mode="ambient"] .ambient-text {
-  font-size: 12.5px;
-  line-height: 1.38;
-  color: rgba(226, 240, 255, .94);
-  overflow: hidden;
-  /* Three lines, then it scrolls itself. A bar that grows with the sentence
-     would resize the window mid-speech. */
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  word-break: break-word;
-}
-body[data-mode="ambient"] .ambient-text:empty::before {
-  content: "";
-}
-
-/* The orb canvas fills its slot in the bar, not the whole window. */
 body[data-mode="ambient"] .orb-container {
   min-height: 0;
+  height: 100vh;
+  width: 100vw;
+  margin: 0;
+  padding: 0;
 }
 
 /* Mute is a secondary control: present, unobtrusive, never the way in. */
