@@ -1439,7 +1439,7 @@ def _execute_tool_sync(tool_name: str, args: dict, meta: dict) -> str:
         from nova_core import trust as _trust
         _decision = _perm.check_tool(
             meta.get("principal", "nova") if isinstance(meta, dict) else "nova",
-            tool_name, trust=_trust.current_trust())
+            tool_name, trust=_trust.current_trust(), args=args)
         if _decision.effect is _perm.Effect.DENY:
             _why = _trust.current_source()
             return (f"Refused: {_decision.reason}."

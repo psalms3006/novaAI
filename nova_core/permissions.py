@@ -54,11 +54,23 @@ class Capability(str, enum.Enum):
     FILE_DELETE = "FILE_DELETE"
     CODE_EXECUTE = "CODE_EXECUTE"
     PROCESS_CONTROL = "PROCESS_CONTROL"
+    #: Starting an application, as distinct from killing one. Launching
+    #: Spotify because the user said "open Spotify" is not the same act as
+    #: terminating a process, and charging both at the same rate meant NOVA
+    #: asked permission to do the thing she had just been told to do.
+    APP_LAUNCH = "APP_LAUNCH"
     NETWORK_READ = "NETWORK_READ"
     NETWORK_WRITE = "NETWORK_WRITE"
     BROWSER_READ = "BROWSER_READ"
     BROWSER_INTERACT = "BROWSER_INTERACT"
     SYSTEM_SETTINGS = "SYSTEM_SETTINGS"
+    #: Observing the machine — battery, volume level, running windows. Reads
+    #: nothing of the user's data and changes nothing.
+    SYSTEM_READ = "SYSTEM_READ"
+    #: Adjustments that are trivially observable and trivially reversible:
+    #: volume, brightness. Granted without a prompt because the user asked for
+    #: them, but still mutating, so untrusted content cannot reach them.
+    SYSTEM_ADJUST = "SYSTEM_ADJUST"
     CREDENTIAL_ACCESS = "CREDENTIAL_ACCESS"
     USER_DATA = "USER_DATA"
     MEMORY_READ = "MEMORY_READ"
@@ -75,7 +87,8 @@ class Capability(str, enum.Enum):
 #: explicitly agreeing.
 MUTATING = frozenset({
     Capability.FILE_WRITE, Capability.FILE_DELETE, Capability.CODE_EXECUTE,
-    Capability.PROCESS_CONTROL, Capability.NETWORK_WRITE,
+    Capability.PROCESS_CONTROL, Capability.APP_LAUNCH,
+    Capability.SYSTEM_ADJUST, Capability.NETWORK_WRITE,
     Capability.BROWSER_INTERACT, Capability.SYSTEM_SETTINGS,
     Capability.MEMORY_WRITE, Capability.SELF_MODIFY,
 })
@@ -157,8 +170,9 @@ DEFAULT_GRANTS: dict[str, Grant] = {
     "nova": Grant(
         "nova",
         _caps(C.FILE_READ, C.FILE_WRITE, C.FILE_DELETE, C.CODE_EXECUTE,
-              C.PROCESS_CONTROL, C.NETWORK_READ, C.NETWORK_WRITE,
+              C.PROCESS_CONTROL, C.APP_LAUNCH, C.NETWORK_READ, C.NETWORK_WRITE,
               C.BROWSER_READ, C.BROWSER_INTERACT, C.SYSTEM_SETTINGS,
+              C.SYSTEM_READ, C.SYSTEM_ADJUST,
               C.USER_DATA, C.MEMORY_READ, C.MEMORY_WRITE, C.SCREEN_READ,
               C.AUDIO_READ, C.MIC_CONTROL,
               # NOVA could already edit its own source behind a confirmation
@@ -205,7 +219,7 @@ DEFAULT_GRANTS: dict[str, Grant] = {
     "CONTROL": Grant(
         "CONTROL",
         _caps(C.FILE_READ, C.FILE_WRITE, C.FILE_DELETE, C.PROCESS_CONTROL,
-              C.SYSTEM_SETTINGS),
+              C.APP_LAUNCH, C.SYSTEM_SETTINGS, C.SYSTEM_READ, C.SYSTEM_ADJUST),
         confirm=_caps(C.FILE_DELETE, C.PROCESS_CONTROL, C.SYSTEM_SETTINGS),
         description="The privileged one. Everything dangerous is confirmable.",
     ),
@@ -252,7 +266,7 @@ TOOL_CAPABILITIES: dict[str, frozenset[Capability]] = {
     "browser_read": _caps(C.BROWSER_READ, C.NETWORK_READ),
     "browser_control": _caps(C.BROWSER_READ, C.NETWORK_READ),
     "browser_interact": _caps(C.BROWSER_INTERACT, C.NETWORK_READ),
-    "open_app": _caps(C.PROCESS_CONTROL),
+    "open_app": _caps(C.APP_LAUNCH),
     "close_app": _caps(C.PROCESS_CONTROL),
     "file_controller": _caps(C.FILE_READ, C.FILE_WRITE),
     # Reads and parses a file the user pointed at; it does not write back.
@@ -291,14 +305,99 @@ HARMLESS_TOOLS: frozenset[str] = frozenset({
     "get_time", "get_date", "calculator", "noop", "echo",
 })
 
+#: Tools whose actions span a wide range of risk, and which are therefore
+#: judged by the action rather than by the tool alone.
+_ACTION_AWARE_TOOLS: frozenset[str] = frozenset({
+    "computer_settings", "computer_control", "desktop_control",
+    "file_controller", "nova_memory",
+})
 
-def capabilities_for_tool(tool: str) -> frozenset[Capability] | None:
-    """What a tool needs, or None if it declares nothing (and is denied)."""
+
+#: Actions that only look. A tool is not one risk level — `computer_settings`
+#: covers both "what is the battery at" and "restart the machine", and
+#: charging the whole tool at the higher rate meant NOVA asked "should I
+#: proceed?" before reading a battery percentage. In a voice assistant that is
+#: not caution, it is an assistant that cannot be used: every observation
+#: becomes a negotiation.
+READ_ONLY_ACTIONS: frozenset[str] = frozenset({
+    "battery", "get_volume", "get_brightness", "get_settings", "status",
+    "info", "list", "read", "find", "search", "inspect", "get", "screenshot",
+    "active_window", "list_windows", "system_info", "processes",
+})
+
+#: Adjustments the user is plainly authorising by asking for them. "Turn the
+#: volume up" is not a request that benefits from "are you sure?" — it is
+#: trivially observable and trivially reversible.
+LOW_RISK_ACTIONS: frozenset[str] = frozenset({
+    "volume_up", "volume_down", "volume_mute", "set_volume",
+    "brightness_up", "brightness_down", "set_brightness",
+})
+
+#: ...and the ones that genuinely warrant stopping to ask, whatever the user
+#: just said, mapped to the capability that actually describes them.
+#:
+#: Mapping matters rather than merely listing. Falling back to the tool's
+#: declared set let `file_controller` with action="delete" through on
+#: FILE_WRITE, which is not the permission being exercised — deleting a file
+#: is FILE_DELETE, and that is the one the policy stops to confirm.
+ALWAYS_CONFIRM_ACTIONS: dict[str, Capability] = {
+    "shutdown": Capability.SYSTEM_SETTINGS,
+    "restart": Capability.SYSTEM_SETTINGS,
+    "sleep": Capability.SYSTEM_SETTINGS,
+    "hibernate": Capability.SYSTEM_SETTINGS,
+    "logoff": Capability.SYSTEM_SETTINGS,
+    "lock": Capability.SYSTEM_SETTINGS,
+    "registry": Capability.SYSTEM_SETTINGS,
+    "delete": Capability.FILE_DELETE,
+    "rmdir": Capability.FILE_DELETE,
+    "format": Capability.FILE_DELETE,
+    "kill": Capability.PROCESS_CONTROL,
+    "terminate": Capability.PROCESS_CONTROL,
+}
+
+
+def _action_of(args: dict | None) -> str:
+    if not isinstance(args, dict):
+        return ""
+    for key in ("action", "cmd", "command", "op"):
+        v = args.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip().lower()
+    return ""
+
+
+def capabilities_for_tool(tool: str,
+                          args: dict | None = None) -> frozenset[Capability] | None:
+    """What a tool needs, or None if it declares nothing (and is denied).
+
+    `args` lets a tool be judged by what it is actually being asked to do.
+    Without it every action of a multi-purpose tool is charged at the rate of
+    its most dangerous one.
+    """
     name = (tool or "").strip()
     if not name:
         return None
     if name in HARMLESS_TOOLS:
         return frozenset()
+
+    action = _action_of(args)
+    if action and name in _ACTION_AWARE_TOOLS:
+        strict = ALWAYS_CONFIRM_ACTIONS.get(action)
+        if strict is not None:
+            return _caps(strict)
+        if action in READ_ONLY_ACTIONS:
+            # A real capability, not an empty set. "Needs no capabilities"
+            # means allowed unconditionally — including for a request shaped
+            # by a web page — and that is not what "read the battery level"
+            # should mean.
+            if action == "screenshot":
+                return _caps(Capability.SCREEN_READ)
+            if name == "file_controller":
+                return _caps(Capability.FILE_READ)
+            return _caps(Capability.SYSTEM_READ)
+        if action in LOW_RISK_ACTIONS:
+            return _caps(Capability.SYSTEM_ADJUST)
+
     exact = TOOL_CAPABILITIES.get(name)
     if exact is not None:
         return exact
@@ -397,9 +496,10 @@ class PermissionEngine:
             Effect.ALLOW, capability, principal, "granted"), tool, trust)
 
     def check_tool(self, principal: str, tool: str, *,
-                   trust: Trust = Trust.USER) -> Decision:
+                   trust: Trust = Trust.USER,
+                   args: dict | None = None) -> Decision:
         """Check every capability a tool needs. The strictest answer wins."""
-        needed = capabilities_for_tool(tool)
+        needed = capabilities_for_tool(tool, args)
         if needed is None:
             return self._record(Decision(
                 Effect.DENY, None, principal,
@@ -471,8 +571,9 @@ def reset_engine() -> None:
         _engine = None
 
 
-def check_tool(principal: str, tool: str, *, trust: Trust = Trust.USER) -> Decision:
-    return engine().check_tool(principal, tool, trust=trust)
+def check_tool(principal: str, tool: str, *, trust: Trust = Trust.USER,
+               args: dict | None = None) -> Decision:
+    return engine().check_tool(principal, tool, trust=trust, args=args)
 
 
 __all__ = [
