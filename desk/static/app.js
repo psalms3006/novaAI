@@ -394,6 +394,18 @@ function handleLiveEvent(ev) {
     case "turn_complete":
       convoSettle();
       break;
+    case "tool_call":
+      // Same reasoning as the ambient orb: seconds of silence while a tool
+      // runs should look like work, not like a dead session.
+      setOrb("thinking");
+      if (Array.isArray(ev.tools) && ev.tools.length) {
+        const label = $("orb-label");
+        if (label) label.textContent = ev.tools[0].replace(/_/g, " ");
+      }
+      break;
+    case "tool_result":
+      setOrb("thinking");
+      break;
     case "audio":
       // NOVA Core owns playback (server-side sounddevice). If this ever fires
       // again it means two surfaces would speak at once, so ignore it.

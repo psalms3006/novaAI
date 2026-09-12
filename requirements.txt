@@ -84,6 +84,12 @@ pycaw>=20240210; sys_platform == 'win32'
 comtypes>=1.4.0; sys_platform == 'win32'
 screen-brightness-control>=0.24.0; sys_platform == 'win32'
 
+# ── Windows in-application control (actions/app_control.py) ──────────────────
+# Reads the UI Automation tree so NOVA can find a control by its name and
+# click or type into it. Without this, app_control degrades to "module
+# missing" and NOVA can launch an application but not operate it.
+pywinauto>=0.6.8; sys_platform == 'win32'
+
 # ── Optional — OCR ─────────────────────────────────────────────────────────────
 # Only needed for screen text extraction via Tesseract.
 pytesseract>=0.3.10

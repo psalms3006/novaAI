@@ -865,6 +865,30 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "app_control",
+        "description": (
+            "Work *inside* an application that is already open: find its "
+            "controls by name, click them, type into them, press keys, and "
+            "wait for it to be ready. Use after open_app when the task is "
+            "more than launching -- searching within an app, pressing its "
+            "buttons, filling its fields. Call 'inspect' first to see what "
+            "the window actually offers, then act on a control by its name. "
+            "Reads the accessibility tree, so it needs no coordinates."),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "list_windows | wait_for | focus | inspect | click | type | press"},
+                "window": {"type": "STRING", "description": "Part of the window title, e.g. 'Spotify'. Matched case-insensitively."},
+                "control": {"type": "STRING", "description": "Name of the control to click or type into, as shown by 'inspect'"},
+                "control_type": {"type": "STRING", "description": "Optional: Button, Edit, ListItem, TabItem, MenuItem..."},
+                "text": {"type": "STRING", "description": "Text to type"},
+                "keys": {"type": "STRING", "description": "Keys to press, e.g. '{ENTER}', '^s', '%{F4}'"},
+                "timeout": {"type": "NUMBER", "description": "Seconds to wait (wait_for)"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
         "name": "generate_document",
         "description": (
             "Create a real document file and save it. Use this whenever the "
@@ -1668,7 +1692,7 @@ def _validate_tool_modules() -> Dict[str, bool]:
     tool_modules = [
         "open_app", "close_app", "web_search", "file_controller",
         "computer_settings", "browser_control", "file_processor",
-        "generate_document",
+        "generate_document", "app_control",
     ]
     available: Dict[str, bool] = {}
     if importlib.util.find_spec("actions") is None:

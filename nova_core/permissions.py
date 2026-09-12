@@ -273,6 +273,11 @@ TOOL_CAPABILITIES: dict[str, frozenset[Capability]] = {
     # not a destructive act, so it does not stop to confirm; it still declares
     # FILE_WRITE, so untrusted content cannot make NOVA write files.
     "generate_document": _caps(C.FILE_WRITE),
+    # Drives an application the user asked to be driven. Looking at a window
+    # is a read; clicking and typing inside it is not, so it declares
+    # PROCESS_CONTROL and the action-aware resolver lets inspection through
+    # while interaction is still governed.
+    "app_control": _caps(C.PROCESS_CONTROL),
     # Reads and parses a file the user pointed at; it does not write back.
     "file_processor": _caps(C.FILE_READ),
     # The desktop automation surface: launches things and changes settings.
@@ -313,7 +318,7 @@ HARMLESS_TOOLS: frozenset[str] = frozenset({
 #: judged by the action rather than by the tool alone.
 _ACTION_AWARE_TOOLS: frozenset[str] = frozenset({
     "computer_settings", "computer_control", "desktop_control",
-    "file_controller", "nova_memory",
+    "file_controller", "nova_memory", "app_control",
 })
 
 
@@ -335,6 +340,10 @@ READ_ONLY_ACTIONS: frozenset[str] = frozenset({
 LOW_RISK_ACTIONS: frozenset[str] = frozenset({
     "volume_up", "volume_down", "volume_mute", "set_volume",
     "brightness_up", "brightness_down", "set_brightness",
+    # Driving an application the user just asked to be driven. Clicking a
+    # button inside Spotify is not a system-level act, and confirming each
+    # one would make a multi-step task unusable by voice.
+    "focus", "click", "type", "type_text", "press", "hotkey",
 })
 
 #: ...and the ones that genuinely warrant stopping to ask, whatever the user

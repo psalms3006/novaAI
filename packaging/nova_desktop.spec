@@ -87,6 +87,15 @@ hidden = [
     "actions.generate_document", "docx", "reportlab",
     "reportlab.platypus", "reportlab.lib.styles", "reportlab.lib.pagesizes",
     "openpyxl", "pptx",
+    # In-application control. pywinauto is imported inside the functions that
+    # use it, so static analysis never sees it and the packaged app would say
+    # "UI automation is unavailable on this machine" while working fine from
+    # source. The UIA backend reaches Windows through comtypes, which builds
+    # its COM wrappers into comtypes.gen at runtime.
+    "pywinauto", "pywinauto.keyboard", "pywinauto.timings",
+    "pywinauto.controls", "pywinauto.controls.uia_controls",
+    "pywinauto.uia_defines", "pywinauto.uia_element_info",
+    "comtypes.client", "comtypes.gen", "comtypes.stream",
     # mind map (ES modules served as static files, not imported by Python)
     # core modules
     "core", "core.event_bus", "core.boot", "core.verification_engine",

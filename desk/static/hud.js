@@ -423,6 +423,13 @@
           const map = { streaming: "listening", connected: "listening",
                         connecting: "thinking", error: "error", closed: "offline" };
           if (map[ev.state]) orb.setState(map[ev.state]);
+        } else if (ev.type === "tool_call") {
+          // A tool can legitimately take seconds — a web search, a file
+          // search across a drive. Silence for that long reads as NOVA
+          // having died; the orb says she is working instead.
+          orb.setState("working");
+        } else if (ev.type === "tool_result") {
+          orb.setState("thinking");
         } else if (ev.type === "task_start") orb.setState("working");
         else if (ev.type === "agent_start") orb.setState("delegating");
         else if (ev.type === "task_done") orb.setState("idle");
