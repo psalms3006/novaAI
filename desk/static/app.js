@@ -396,8 +396,10 @@ function handleLiveEvent(ev) {
       break;
     case "tool_call":
       // Same reasoning as the ambient orb: seconds of silence while a tool
-      // runs should look like work, not like a dead session.
-      setOrb("thinking");
+      // runs should look like work, not like a dead session. Same state name
+      // as the bead uses, too -- one runtime showing two surfaces, so NOVA
+      // should not be a different colour depending on which one is open.
+      setOrb("working");
       if (Array.isArray(ev.tools) && ev.tools.length) {
         const label = $("orb-label");
         if (label) label.textContent = ev.tools[0].replace(/_/g, " ");
