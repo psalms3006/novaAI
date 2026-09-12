@@ -255,7 +255,9 @@ TTS_VOLUME             = _cfg("tts",        "volume",          0.95)
 PHONE_PORT             = _cfg("server",     "phone_port",      5050)
 UI_PORT                = _cfg("server",     "ui_port",         8080)
 _MEM_EXTRACT_EVERY_N   = _cfg("memory",     "extract_every_n", 5)
-_MIN_GAP_BETWEEN_CALLS  = _cfg("rate_limit", "min_gap_secs",    0.0)
+#: How far apart to space REST calls *once the quota has actually complained*.
+#: This is not a standing delay — see _gemini_generate_with_delay.
+_RATE_LIMIT_GAP_S      = _cfg("rate_limit", "min_gap_secs",    6.0)
 OFFLINE_MODELS         = _cfg("offline",    "models",         ["tinyllama"])
 OFFLINE_TIMEOUTS       = _cfg("offline",    "timeouts",       {"tinyllama": 15})
 
@@ -464,14 +466,34 @@ user_name = ""
 _mem_extract_turn_counter: int = 0  # [FIX-3] count turns for extraction gate
 # ── Rate-limited Gemini wrapper ──────────────────────────────────────────────
 _last_gemini_call: float = 0.0
-_MIN_GAP_BETWEEN_CALLS: float = 6.0  # 6 s = safe for 10 RPM free quota
+
+#: The current spacing between REST calls. Zero unless the quota has actually
+#: refused something.
+#:
+#: This used to be a flat 6 s before *every* call, on the reasoning that 6 s
+#: is safe for a 10 RPM free key. The cost of that reasoning was paid on every
+#: turn by every user: asking NOVA the time meant sitting through a six-second
+#: sleep before the request was even sent, and the reply could not arrive in
+#: less than that no matter how fast the model was.
+#:
+#: It was also redundant. A 429 already triggers a real backoff window
+#: (_record_rate_limit), which is the mechanism that protects the quota, and
+#: it is wired into every REST caller. Paying the worst case up front as well
+#: made the common case slow to defend against something already defended.
+#:
+#: So the gap now starts at nothing and is only imposed once the quota has
+#: complained, decaying back as calls start succeeding again.
+_MIN_GAP_BETWEEN_CALLS: float = 0.0
+
 
 def _gemini_generate_with_delay(client, **kwargs):
-    """Wrapper that enforces a minimum delay between Gemini REST API calls."""
+    """Call Gemini, spacing requests only while the quota is unhappy."""
     global _last_gemini_call
-    elapsed = time.time() - _last_gemini_call
-    if elapsed < _MIN_GAP_BETWEEN_CALLS:
-        time.sleep(_MIN_GAP_BETWEEN_CALLS - elapsed)
+    gap = _MIN_GAP_BETWEEN_CALLS
+    if gap > 0:
+        elapsed = time.time() - _last_gemini_call
+        if elapsed < gap:
+            time.sleep(gap - elapsed)
     _last_gemini_call = time.time()
     return client.models.generate_content(**kwargs)
 
@@ -488,6 +510,10 @@ def _is_rate_limited() -> bool:
 
 def _record_rate_limit() -> None:
     """Called on any 429 — doubles the backoff window (max 30 min)."""
+    global _MIN_GAP_BETWEEN_CALLS
+    # The quota has actually objected, so now it is worth spacing calls out.
+    # This is the only thing that turns the delay on.
+    _MIN_GAP_BETWEEN_CALLS = _RATE_LIMIT_GAP_S
     nova_state._rest_backoff_secs = min(max(nova_state._rest_backoff_secs * 2, 120), 1800)
     nova_state._rest_backoff_until = time.time() + nova_state._rest_backoff_secs
     log.warning(
@@ -498,7 +524,15 @@ def _record_rate_limit() -> None:
 
 def _reset_rate_limit() -> None:
     """Called on a successful REST call — resets backoff."""
+    global _MIN_GAP_BETWEEN_CALLS
     nova_state._rest_backoff_secs = 0.0
+    # Ease the spacing off rather than dropping it the instant one call gets
+    # through: the next request after a 429 succeeding does not mean the quota
+    # has refilled. Halving recovers full speed within a few calls while still
+    # backing away from the limit if it is still there.
+    if _MIN_GAP_BETWEEN_CALLS:
+        _MIN_GAP_BETWEEN_CALLS = (0.0 if _MIN_GAP_BETWEEN_CALLS < 0.5
+                                  else _MIN_GAP_BETWEEN_CALLS / 2)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

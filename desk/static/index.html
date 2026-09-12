@@ -231,7 +231,21 @@
     <div class="modal modal-wide">
       <h2>Welcome to NOVA</h2>
       <p style="color:var(--muted)">Your personal AI with real capabilities -- memory, files,
-        vision, voice, research and computer control. Choose how NOVA should connect:</p>
+        vision, voice, research and computer control.</p>
+      <!-- Asked before the connection choice because it is the one thing NOVA
+           needs in order to speak to this person rather than at them. Left
+           blank she asks out loud on the first greeting instead. -->
+      <div class="card onboard-card" style="margin-bottom:14px">
+        <h3>What should NOVA call you?</h3>
+        <p class="desc">She'll use this when she greets you. Leave it blank and she'll ask.</p>
+        <div class="field"><label>Your name</label>
+          <input type="text" id="ob-name" placeholder="e.g. Ada" autocomplete="off" maxlength="60"></div>
+        <div class="field"><label>How is it said? <span style="opacity:.6">(optional)</span></label>
+          <input type="text" id="ob-name-say" placeholder="e.g. AY-duh" autocomplete="off" maxlength="80"></div>
+        <p class="desc" id="ob-name-echo" style="min-height:1em"></p>
+        <button class="btn-sm primary" id="ob-name-btn">Save name</button>
+      </div>
+      <p style="color:var(--muted)">Choose how NOVA should connect:</p>
       <div class="onboard-grid">
         <div class="card onboard-card">
           <h3>NOVA Cloud</h3>

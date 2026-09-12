@@ -375,6 +375,19 @@ def _log(msg: str, *a: Any) -> None:
         print(msg % a if a else msg)
 
 
+#: Values that mean "nobody has said who this is". "User" is the shipped
+#: default in desk/settings.py, so it arrives looking exactly like a real
+#: answer — and greeting someone as "User" is worse than admitting you don't
+#: know them.
+_PLACEHOLDER_NAMES = frozenset({"", "user", "there", "none", "unknown", "unset"})
+
+
+def _known_name(meta: dict) -> str:
+    """The user's name, or empty when it was never actually given."""
+    name = (meta.get("user_name") or "").strip()
+    return "" if name.lower() in _PLACEHOLDER_NAMES else name
+
+
 def _resolve(name: str, default: Any = None) -> Any:
     try:
         import nova as _nova
@@ -1388,13 +1401,31 @@ class LiveManager:
             )
         else:
             meta = _load_meta()
-            name = (meta.get("user_name") or "").strip() or "there"
-            prompt = (
-                f"The user just opened this session. Greet {name} right now, out loud, "
-                "in 1-2 short spoken sentences — warm, a little informal, varying your "
-                "phrasing rather than reusing a stock line. End by asking what they need. "
-                "Do not wait for them to speak first."
-            )
+            name = _known_name(meta)
+            if name:
+                say = (meta.get("user_name_pronunciation") or "").strip()
+                how = (f' Their name is pronounced "{say}" — say it that way. '
+                       if say else " ")
+                prompt = (
+                    f"The user just opened this session. Greet {name} right now, out loud, "
+                    "in 1-2 short spoken sentences — warm, a little informal, varying your "
+                    f"phrasing rather than reusing a stock line.{how}"
+                    "End by asking what they need. Do not wait for them to speak first."
+                )
+            else:
+                # Nobody has told her who this is. Guessing, or falling back to
+                # "there" forever, both skip the one question that makes every
+                # later greeting personal -- so ask it once, properly, and get
+                # the spelling and the sound of it rather than an approximation
+                # she will mispronounce for the rest of the relationship.
+                prompt = (
+                    "The user just opened this session and you do not know their name "
+                    "yet. Greet them warmly in one short spoken sentence, say you don't "
+                    "think you've caught their name, and ask what you should call them. "
+                    "Ask them to spell it if it's unusual, and to say it once so you "
+                    "know how it sounds. Keep it to two short sentences and do not "
+                    "invent a name. Do not wait for them to speak first."
+                )
 
         try:
             if self._trace:
@@ -1693,6 +1724,24 @@ class LiveManager:
                 now = time.monotonic()
                 same_turn = self._turn_count == last_sent_turn
                 if same_turn and (now - last_sent_at) < SCREEN_REFRESH_S:
+                    continue
+
+                # Never push a picture through a socket that is already
+                # struggling to carry the conversation.
+                #
+                # A frame is around 32 KB against 32 KB/s of microphone audio,
+                # so on a link with little headroom one screenshot is most of
+                # a second during which the user's voice is queueing behind
+                # it. Measured on a real session: 588 KB of frames, mic sends
+                # climbing to twenty seconds, and 180 frames of speech thrown
+                # away because the queue behind them filled up.
+                #
+                # The screen is context; the voice is the conversation. When
+                # there is not room for both, the picture waits.
+                backlog = self._mic_queue.qsize() if self._mic_queue else 0
+                if backlog > MIC_QUEUE_FRAMES // 4:
+                    _log("[LIVE] holding screen frame: %d mic frames queued",
+                         backlog)
                     continue
 
                 await session.send_client_content(

@@ -514,11 +514,27 @@ async function sendText(text, imagePath) {
   if (state.streaming) return;
 
   const msg = text.trim();
+
+  // If NOVA is listening, type *into* the conversation she is already having
+  // rather than starting a silent second one. She answers out loud and the
+  // transcript comes back on the event bus, so the same turn lands on every
+  // surface — which is what typing while talking should do.
+  if (state.voiceMode || state.liveWs) {
+    try {
+      const j = await api_json("/api/live/text", {
+        method: "POST", body: JSON.stringify({ message: msg }),
+      });
+      if (j.ok) { setOrb("thinking"); return; }
+      // Not connected after all — fall through to the text model below.
+    } catch (e) { /* fall through to REST */ }
+  }
+
   state.streaming = true;
   setOrb("thinking");
 
   // Add user message to transcript
   addTranscript(msg, "user");
+  convoAppend("user", msg);
 
   // Hide placeholder
   const placeholder = $("transcript-placeholder");
@@ -554,6 +570,11 @@ async function sendText(text, imagePath) {
 
     if (fullText) {
       addTranscript(fullText, "nova");
+      // The command-centre feed only ever heard the voice path, so a typed
+      // conversation left it reading "Nothing said yet." while the exchange
+      // was plainly happening on the stage above it.
+      convoAppend("nova", fullText);
+      convoSettle();
     }
 
     // Update conversation list
@@ -1258,8 +1279,15 @@ if (confirmNoBtn) {
   });
 }
 
-// Poll for confirmations
-setInterval(async () => {
+// Poll for confirmations.
+//
+// Only from the window that can actually show one. The ambient bead hides
+// every modal by stylesheet, so its copy of this loop spent the whole session
+// asking a question it could not act on -- which is why the server was seeing
+// this endpoint twice a second rather than once.
+const CONFIRM_POLL_MS =
+  new URLSearchParams(location.search).get("mode") === "ambient" ? 0 : 2500;
+if (CONFIRM_POLL_MS) setInterval(async () => {
   try {
     const j = await api_json("/api/confirm/pending");
     const pending = j.pending || [];
@@ -1269,9 +1297,45 @@ setInterval(async () => {
       $("confirm-modal").classList.add("open");
     }
   } catch (e) { /* noop */ }
-}, 1200);
+}, CONFIRM_POLL_MS);
 
-// Onboarding
+// Onboarding — name first.
+//
+// Read the spelling back as it is typed. A name NOVA will say out loud for
+// the rest of the relationship is worth one second of "is this right?", and
+// seeing it letter by letter catches the silent misspelling that a person
+// would otherwise only notice weeks later.
+const obName = $("ob-name");
+const obNameSay = $("ob-name-say");
+const obNameEcho = $("ob-name-echo");
+if (obName && obNameEcho) {
+  const echo = () => {
+    const n = obName.value.trim();
+    const say = (obNameSay?.value || "").trim();
+    if (!n) { obNameEcho.textContent = ""; return; }
+    obNameEcho.textContent =
+      `NOVA will call you "${n}" — spelled ${n.toUpperCase().split("").join(" ")}` +
+      (say ? `, said "${say}".` : ".");
+  };
+  obName.addEventListener("input", echo);
+  obNameSay?.addEventListener("input", echo);
+}
+const obNameBtn = $("ob-name-btn");
+if (obNameBtn) {
+  obNameBtn.addEventListener("click", async () => {
+    const name = (obName?.value || "").trim();
+    if (!name) { toast("Leave it blank and NOVA will ask you out loud."); return; }
+    try {
+      const j = await api_json("/api/settings/profile", {
+        method: "POST",
+        body: JSON.stringify({ user_name: name,
+                               user_name_pronunciation: (obNameSay?.value || "").trim() }),
+      });
+      toast(j.user_name ? `NOVA will call you ${j.user_name}` : "Saved");
+    } catch (e) { toast(e.message); }
+  });
+}
+
 const obByokBtn = $("ob-byok-btn");
 if (obByokBtn) {
   obByokBtn.addEventListener("click", async () => {

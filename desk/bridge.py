@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import queue
 import os
 import secrets
@@ -147,6 +148,7 @@ def _meta_dict() -> dict:
     # The desktop's own identity source is authoritative: default is the neutral
     # "User" (never an inherited developer name); a name set in Settings persists.
     m["user_name"] = desk_settings.get("user_name") or "User"
+    m["user_name_pronunciation"] = desk_settings.get("user_name_pronunciation") or ""
     m.setdefault("user_gender", "")
     m.setdefault("channel", "desktop")
     return m
@@ -967,6 +969,38 @@ def api_live_mute():
     if "muted" in data:
         return jsonify(mgr.set_muted(bool(data.get("muted"))))
     return jsonify(mgr.set_muted(not mgr.muted))
+
+
+@app.post("/api/live/text")
+@require_token
+def api_live_text():
+    """Type into the live conversation instead of speaking into it.
+
+    Typing and talking were two separate conversations: text went to the REST
+    model and came back as text on screen, voice went to the live session and
+    came back as sound, and neither knew the other had happened. So a question
+    typed mid-conversation got a silent answer, and NOVA had no memory of it
+    the moment you spoke again.
+
+    Sent this way the typed words join the same session the voice is in. The
+    answer is spoken *and* arrives as a transcript, which is what "reply in
+    both" means, and the turn is part of one conversation either way.
+
+    Returns not-connected when no session is live; the caller falls back to
+    the REST path, which is the right behaviour when voice is simply off.
+    """
+    data = request.get_json(silent=True) or {}
+    text = (data.get("message") or data.get("text") or "").strip()
+    if not text:
+        return jsonify({"ok": False, "reason": "empty"}), 400
+    mgr = desk_live.get_live_manager()
+    result = mgr.send_text(text)
+    if result.get("ok"):
+        # Echo the user's own line to the surfaces straight away. The model
+        # transcribes what it *hears*, so a typed turn would otherwise leave
+        # NOVA's reply on screen with nothing above it.
+        publish_transcript(text, role="user")
+    return jsonify(result)
 
 
 @app.post("/api/live/screen")
@@ -1817,6 +1851,13 @@ def api_settings_profile():
     if name:
         desk_settings.set_many({"user_name": name})
         _META["user_name"] = name
+    # How the name is *said*, which the spelling often does not tell you.
+    # Stored whenever it is offered so the voice layer can be told once
+    # rather than mispronouncing it every session.
+    if "user_name_pronunciation" in data:
+        say = (data.get("user_name_pronunciation") or "").strip()
+        desk_settings.set_many({"user_name_pronunciation": say})
+        _META["user_name_pronunciation"] = say
     return jsonify({"ok": True, "user_name": desk_settings.get("user_name") or "User"})
 
 
@@ -2293,6 +2334,15 @@ def run_desk_server(meta, port: int | None = None) -> None:
         pass
 
     from werkzeug.serving import make_server
+
+    # Stop logging a line per HTTP request. Two surfaces poll this server
+    # several times a second, and every one of those was formatted and
+    # written to nova.log through the root handler -- 8 MB of
+    # "GET /api/confirm/pending 200" in a single session, constant disk I/O
+    # on the audio path, and any real error buried a thousand lines deep.
+    # Warnings and errors from the server still come through.
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
     host = os.getenv("NOVA_DESK_HOST", "127.0.0.1")
     _server = make_server(host, port, app, threaded=True)
     print(f"[NOVA] 🖥  NOVA Desktop backend ready at http://{host}:{port}")

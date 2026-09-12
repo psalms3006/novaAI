@@ -298,16 +298,60 @@ export class NovaOrb3D {
 
     this._onResize = () => this.resize();
     window.addEventListener("resize", this._onResize);
+
+    // The window is not the only thing that changes this canvas's size, and
+    // on the path that actually matters it changes without one: this is an
+    // ES module, so it can finish loading before the stage has been laid
+    // out, measure nothing, and then never hear about the layout that
+    // follows. Watching the element itself catches that first real size,
+    // and every later one — panels opening, the drawer sliding, the window
+    // going to the ambient bead and back.
+    try {
+      this._ro = new ResizeObserver(() => this.resize());
+      this._ro.observe(this.canvas);
+    } catch (e) {
+      // No ResizeObserver: fall back to measuring once the frame has
+      // settled, which covers the load-order case if not the rest.
+      requestAnimationFrame(() => this.resize());
+    }
+    this.resize();
+  }
+
+  /** Pull the camera to whatever distance makes the form fill this canvas.
+   *
+   * The stage is a wide box — 838x312 in the command centre — and the field
+   * of view is vertical, so on any landscape canvas it is the height that
+   * decides how big NOVA looks. Solving for the distance rather than fixing
+   * it keeps her the same size in the frame whatever shape the frame is,
+   * which is the difference between filling the stage and floating in the
+   * middle of it.
+   */
+  _fitDistance(aspect) {
+    const halfFov = (this.camera.fov * Math.PI) / 180 / 2;
+    // The visible form is the 1.25 shell plus its displacement, and the
+    // particle halo sits a little outside that. Fitting the shell and
+    // letting the halo run to the edges is what "fills the frame" means
+    // here; fitting the halo instead leaves the orb looking small.
+    const radius = this.compact ? 1.44 : 1.52;
+    return radius / (Math.tan(halfFov) * Math.min(1, aspect));
   }
 
   resize() {
     if (!this._ok) return;
     const r = this.canvas.getBoundingClientRect();
-    const w = Math.max(2, r.width), h = Math.max(2, r.height);
+    // A canvas that has not been laid out yet reports zero. Clamping that to
+    // 2x2 produced an aspect of 1, and because the only thing that ever
+    // called resize() again was a window resize event that never came, the
+    // camera kept projecting square into a canvas nearly three times wider
+    // than it is tall — which is why NOVA rendered as an egg. Nothing to
+    // measure means nothing to do: wait for the observer to see real numbers.
+    if (r.width < 1 || r.height < 1) return;
+    const w = r.width, h = r.height;
     this.renderer.setSize(w, h, false);
     this.composer.setSize(w, h);
     this.bloom.setSize(w / 2, h / 2);
     this.camera.aspect = w / h;
+    this.camera.position.setZ(this._fitDistance(this.camera.aspect));
     this.camera.updateProjectionMatrix();
   }
 
@@ -339,6 +383,8 @@ export class NovaOrb3D {
     this._running = false;
     if (this._raf) cancelAnimationFrame(this._raf);
     window.removeEventListener("resize", this._onResize);
+    // An observer left watching a canvas keeps the whole orb alive with it.
+    try { if (this._ro) { this._ro.disconnect(); this._ro = null; } } catch (e) { /* gone already */ }
   }
 
   dispose() {
