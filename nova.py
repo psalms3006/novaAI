@@ -71,6 +71,7 @@ import importlib
 import importlib.util
 import re
 import socket
+import tempfile
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Set
 from dataclasses import dataclass, field
@@ -1280,17 +1281,54 @@ def _execute_computer_control(args: dict) -> str:
             return f"Moved mouse to ({x}, {y})"
 
         elif action == "screenshot":
-            path = args.get(
-                "path",
-                str(Path.home() / "Desktop" / f"nova_cap_{int(time.time())}.png")
-            )
+            # Not the Desktop. A capture NOVA took to answer a question is
+            # working state, not something the user asked to keep, and
+            # dropping nova_cap_1789173246.png on their desktop every time she
+            # glances at the screen is litter they then have to clean up. It
+            # goes to the temp directory unless a destination was named.
+            path = args.get("path") or str(
+                Path(tempfile.gettempdir()) / f"nova_cap_{int(time.time())}.png")
             pyautogui.screenshot(path)
+            if not Path(path).exists():
+                return f"Screenshot failed: nothing was written to {path}"
             return f"Screenshot saved: {path}"
 
         elif action == "wait":
             secs = float(args.get("seconds", 1))
             time.sleep(secs)
             return f"Waited {secs}s"
+
+        elif action == "active_window":
+            # Which application is the user actually looking at.
+            #
+            # Every "click that", "search in here" or "is it playing yet"
+            # starts by knowing what has focus. Reading it from the window
+            # manager is instant and exact, where inferring it from a
+            # screenshot is a model call that can be wrong.
+            try:
+                import ctypes
+                from ctypes import wintypes
+                u = ctypes.windll.user32
+                hwnd = u.GetForegroundWindow()
+                if not hwnd:
+                    return "No window currently has focus."
+                length = u.GetWindowTextLengthW(hwnd)
+                buf = ctypes.create_unicode_buffer(length + 1)
+                u.GetWindowTextW(hwnd, buf, length + 1)
+                pid = wintypes.DWORD()
+                u.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                name = ""
+                try:
+                    import psutil
+                    name = psutil.Process(pid.value).name()
+                except Exception:
+                    pass
+                title = buf.value or "(untitled)"
+                return (f"Active window: {title}"
+                        + (f" - {name}" if name else "")
+                        + f" (pid {pid.value})")
+            except Exception as e:
+                return f"Could not read the active window: {e}"
 
         elif action == "list_windows":
             try:
