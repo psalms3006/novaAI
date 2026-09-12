@@ -291,6 +291,28 @@ def _foreground_title() -> str:
     return buf.value or ""
 
 
+def _is_hung(handle: int, title: str = "") -> bool:
+    """Has this window stopped answering?
+
+    Ranking prefers a live window, but when every match is stuck there is
+    nothing to prefer and the dead one comes back anyway. Its title is no
+    help -- Windows adds "(Not Responding)" only once it gives up and paints
+    a ghost, so a window can be refusing input for seconds while still
+    advertising its normal name.
+    """
+    import ctypes
+    from ctypes import wintypes
+    if "not responding" in (title or "").lower():
+        return True
+    try:
+        user32 = ctypes.windll.user32
+        user32.IsHungAppWindow.argtypes = [wintypes.HWND]
+        user32.IsHungAppWindow.restype = wintypes.BOOL
+        return bool(user32.IsHungAppWindow(handle))
+    except Exception:
+        return False
+
+
 def _foreground_handle() -> int:
     """Which window actually has the foreground, by identity.
 
@@ -470,8 +492,8 @@ def _act_type(args: dict) -> str:
     # into one is the exact failure this layer exists to prevent. Caught by
     # its own test: Notepad hung, the keystrokes went nowhere, and the tool
     # cheerfully reported success.
-    if "not responding" in wtitle.lower():
-        return (f"{title or 'That window'} is not responding, so it can't "
+    if _is_hung(handle, wtitle):
+        return (f"{wtitle or 'That window'} is not responding, so it can't "
                 "accept input. Nothing was typed.")
 
     # Focus through Win32 and type with the keyboard. Neither needs the
@@ -623,7 +645,7 @@ def _act_press(args: dict) -> str:
         if found is None:
             return f"I couldn't find a window matching {title!r}."
         handle, target = found
-        if "not responding" in target.lower():
+        if _is_hung(handle, target):
             return (f"{target} is not responding, so it can't accept input. "
                     f"I didn't press {keys}.")
         _raise(handle)

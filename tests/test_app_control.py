@@ -166,6 +166,16 @@ class TypingRefusalTests(unittest.TestCase):
             out = A.execute({"action": "type", "window": "Notepad", "text": "hi"})
         self.assertIn("nothing was typed", out.lower())
 
+    def test_a_stuck_window_is_refused_even_while_titled_normally(self):
+        """Ranking prefers a live window; when all of them are stuck there is
+        no live one to prefer, and Windows has not renamed it yet."""
+        with mock.patch.object(A, "_find_handle", return_value=(1, "Spotify")), \
+             mock.patch.object(A, "_is_hung", return_value=True), \
+             mock.patch.object(A, "_raise") as raised:
+            out = A.execute({"action": "type", "window": "Spotify", "text": "hi"})
+        self.assertIn("nothing was typed", out.lower())
+        raised.assert_not_called()
+
     def test_empty_text_is_refused(self):
         self.assertIn("nothing to type",
                       A.execute({"action": "type", "window": "x", "text": ""}).lower())
