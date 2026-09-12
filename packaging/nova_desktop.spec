@@ -152,10 +152,17 @@ a = Analysis(
         # To re-enable semantic search, drop torch/transformers from `excludes`,
         # add "sentence_transformers" to `hidden`, and restore the line below.
         # (os.path.join(ROOT, "nova_embedder"), "nova_embedder"),
+        # The second element is the destination DIRECTORY, not a filename.
+        # Naming the file there produced _internal/nova_config.toml/ as a
+        # folder with the file inside it, so the config loader -- which quite
+        # correctly tests is_file() -- skipped it and the packaged app ran on
+        # defaults for every setting the file exists to control. It only
+        # looked fine in development because the working directory was the
+        # repo, which has a real nova_config.toml in it.
         # first-run key template (users copy it next to NOVA.exe as ".env")
-        (os.path.join(ROOT, ".env.template"), ".env.template"),
+        (os.path.join(ROOT, ".env.template"), "."),
         # runtime config template (model selection etc.) — no secrets inside
-        (os.path.join(ROOT, "nova_config.toml"), "nova_config.toml"),
+        (os.path.join(ROOT, "nova_config.toml"), "."),
     ],
     hiddenimports=hidden,
     hookspath=[],

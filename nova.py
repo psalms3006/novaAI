@@ -189,6 +189,16 @@ try:
             _exe_dir / "config" / "nova_config.toml",
             Path(os.getenv("APPDATA", "")) / "NOVA" / "config" / "nova_config.toml",
         ]
+        # The bundled copy lives where PyInstaller unpacks data, which is
+        # _internal/ and not beside the exe. Without this the packaged app
+        # found no config at all unless it happened to be started from a
+        # directory that had one, and silently used defaults instead.
+        _meipass = getattr(sys, "_MEIPASS", "")
+        if _meipass:
+            _cfg_candidates += [
+                Path(_meipass) / "nova_config.toml",
+                Path(_meipass) / "config" / "nova_config.toml",
+            ]
     _cfg_path = next((p for p in _cfg_candidates if p.is_file()), None)
     _NOVA_CFG = _tomllib.loads(_cfg_path.read_text(encoding="utf-8")) if _cfg_path else {}
 except Exception:
