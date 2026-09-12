@@ -269,6 +269,10 @@ TOOL_CAPABILITIES: dict[str, frozenset[Capability]] = {
     "open_app": _caps(C.APP_LAUNCH),
     "close_app": _caps(C.PROCESS_CONTROL),
     "file_controller": _caps(C.FILE_READ, C.FILE_WRITE),
+    # Writes a new file where the user asked for one. Creating a document is
+    # not a destructive act, so it does not stop to confirm; it still declares
+    # FILE_WRITE, so untrusted content cannot make NOVA write files.
+    "generate_document": _caps(C.FILE_WRITE),
     # Reads and parses a file the user pointed at; it does not write back.
     "file_processor": _caps(C.FILE_READ),
     # The desktop automation surface: launches things and changes settings.

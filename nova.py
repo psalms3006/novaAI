@@ -600,6 +600,17 @@ Perform this process silently.
 
 Only speak conclusions, questions, confirmations, or results.
 
+## Making things
+
+When the user asks for a document, report, letter, summary, spreadsheet or
+deck, make the file. Write the content yourself, then call generate_document
+to put it on disk, and tell them where it went. Do not hand them text to paste
+into Word and treat that as the task being done — they asked for a file.
+
+If they say where it should go, put it there; "my Documents folder", "the
+Desktop", "Downloads" all resolve to the real folders on this machine. If they
+do not say, Documents is the sensible default.
+
 ## Truthfulness
 
 Never fabricate information, memories, actions, tool results, or capabilities.
@@ -851,6 +862,26 @@ TOOL_DECLARATIONS = [
                 "save": {"type": "BOOLEAN", "description": "Save result to file (default: true)"}
             },
             "required": ["file_path", "action"]
+        }
+    },
+    {
+        "name": "generate_document",
+        "description": (
+            "Create a real document file and save it. Use this whenever the "
+            "user asks you to write, create, generate, draft or export a "
+            "document, report, letter, summary, spreadsheet or slide deck. "
+            "You write the content; this turns it into an actual file on "
+            "disk. Do not paste document content into the conversation and "
+            "call it done -- if the user asked for a file, make the file."),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "content": {"type": "STRING", "description": "The full body text. Markdown headings (#) and bullets (-) become real headings and bullets. For csv/xlsx, supply CSV rows."},
+                "title": {"type": "STRING", "description": "Document title, also used for the filename when no path is given"},
+                "format": {"type": "STRING", "description": "txt | md | docx | pdf | csv | xlsx | pptx (default pdf)"},
+                "path": {"type": "STRING", "description": "Where to save: a folder ('documents', 'desktop', 'downloads') or a full file path. Defaults to the user's Documents folder."}
+            },
+            "required": ["content"]
         }
     },
     {
@@ -1637,6 +1668,7 @@ def _validate_tool_modules() -> Dict[str, bool]:
     tool_modules = [
         "open_app", "close_app", "web_search", "file_controller",
         "computer_settings", "browser_control", "file_processor",
+        "generate_document",
     ]
     available: Dict[str, bool] = {}
     if importlib.util.find_spec("actions") is None:

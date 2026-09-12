@@ -81,6 +81,12 @@ hidden = [
     # time, so naming it here is what stops the packaged build from reporting
     # "screen sharing unavailable" on a machine where it works fine in source.
     "desk.screen_share", "mss", "mss.windows", "mss.base",
+    # Document generation. These are imported lazily inside the writers, so
+    # static analysis does not see them and the packaged app would report
+    # "a required library is missing" on a machine where it is not.
+    "actions.generate_document", "docx", "reportlab",
+    "reportlab.platypus", "reportlab.lib.styles", "reportlab.lib.pagesizes",
+    "openpyxl", "pptx",
     # mind map (ES modules served as static files, not imported by Python)
     # core modules
     "core", "core.event_bus", "core.boot", "core.verification_engine",
