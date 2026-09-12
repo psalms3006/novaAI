@@ -420,7 +420,16 @@ def api_status():
         "online": online,
         "connectivity": connectivity,
         "degraded": bool(_resolve("_rest_backoff_until") or False),
-        "model": _VISION_MODEL,
+        # Name the model that will actually answer, not the one we would
+        # prefer. Without a key NOVA falls back to the local model, and
+        # reporting the cloud model anyway turned "why is this taking
+        # eighteen seconds?" into an unanswerable question: the window said
+        # ONLINE and named a Gemini model while a 1.5B model on the user's
+        # own CPU was doing the work.
+        "model": (_VISION_MODEL if _GEMINI_KEY
+                  else (local_intel.get("model") or "local")),
+        "preferred_model": _VISION_MODEL,
+        "serving": "cloud" if _GEMINI_KEY else "local",
         "has_key": bool(_GEMINI_KEY),
         "gemini": bool(_HAS_GEMINI),
         "tools": tools,

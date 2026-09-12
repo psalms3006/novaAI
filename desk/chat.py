@@ -498,6 +498,16 @@ def _model_error_message(error: str) -> str:
     if "503" in err or "UNAVAILABLE" in err or "high demand" in err:
         return ("The AI model is temporarily overloaded (503). "
                 "Please wait a moment and try again.")
+    if "PerDay" in err or "perday" in err.replace("_", "").replace("-", "").lower():
+        # "Wait and retry" is wrong advice for a daily cap and sends people
+        # looking for a fault that isn't there — the key is fine, the day's
+        # allowance is spent. Say which limit it was and what actually
+        # changes it.
+        return ("Your Gemini key has used up its requests for today — this is "
+                "the free tier's daily limit, not a fault. It resets at "
+                "midnight Pacific time. Until then NOVA will answer from the "
+                "local model, which is slower; a paid key in Settings → "
+                "Account removes the cap.")
     if "429" in err or "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
         return "The AI model quota was reached (429). Please wait and retry."
     if "401" in err or "API key" in err or "api key" in err:

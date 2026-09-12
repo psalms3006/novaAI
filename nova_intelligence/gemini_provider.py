@@ -155,6 +155,17 @@ class GeminiProvider:
     @staticmethod
     def _is_retryable(err: str) -> bool:
         e = (err or "").lower()
+        # A day's quota does not refill in four seconds.
+        #
+        # Every 429 used to be treated as a passing squall worth waiting out:
+        # three retries at 1s, 2s and 4s, repeated against each fallback
+        # model. Against a per-minute limit that is right. Against
+        # GenerateRequestsPerDayPerProjectPerModel it is thirteen seconds of
+        # certain failure before NOVA can say anything at all — and the user
+        # sees only a very long pause. Fail fast so the fallback, or the
+        # explanation, arrives immediately.
+        if "perday" in e.replace("_", "").replace("-", ""):
+            return False
         return any(tok in e for tok in (
             "503", "429", "500", "502", "504",
             "unavailable", "resource_exhausted", "high demand",

@@ -115,6 +115,104 @@ class ScreenBackpressureTests(unittest.TestCase):
         self.assertGreater(MIC_QUEUE_FRAMES // 4, 0)
 
 
+class InstalledKeyTests(unittest.TestCase):
+    """An installed NOVA has to find the key where the user put it.
+
+    Bare load_dotenv() walks up from the calling module's directory, which in
+    a frozen build is a path inside the PyInstaller archive. So the file the
+    install guide tells people to drop next to NOVA.exe was never read, NOVA
+    fell back to the local 1.5B model, and a one-word reply took eighteen
+    seconds while the window still said ONLINE.
+    """
+
+    def test_the_frozen_build_looks_beside_the_exe_and_in_appdata(self):
+        import nova
+        seen = []
+        exe = Path(r"C:\Program Files\NOVA\NOVA.exe")
+        with mock.patch.object(nova.sys, "frozen", True, create=True), \
+             mock.patch.object(nova.sys, "executable", str(exe)), \
+             mock.patch.dict(nova.os.environ, {"APPDATA": r"C:\Users\x\AppData\Roaming"}), \
+             mock.patch.object(Path, "is_file", return_value=True), \
+             mock.patch.object(nova, "load_dotenv", side_effect=lambda *a, **k: seen.append(a[0] if a else None)):
+            nova._load_env_files()
+        self.assertIn(exe.parent / ".env", seen,
+                      "the install folder is where BUILD.md sends people")
+        self.assertIn(Path(r"C:\Users\x\AppData\Roaming") / "NOVA" / ".env", seen)
+
+    def test_development_still_uses_the_ordinary_search(self):
+        """Unfrozen, nothing changes: the bare call is what dev relies on."""
+        import nova
+        seen = []
+        with mock.patch.object(nova.sys, "frozen", False, create=True), \
+             mock.patch.object(nova, "load_dotenv",
+                               side_effect=lambda *a, **k: seen.append(a[0] if a else None)):
+            nova._load_env_files()
+        self.assertEqual(seen, [None])
+
+    def test_an_existing_key_is_never_overridden(self):
+        """A key already in the environment outranks any file on disk."""
+        import nova
+        calls = []
+        with mock.patch.object(nova.sys, "frozen", False, create=True), \
+             mock.patch.object(nova, "load_dotenv",
+                               side_effect=lambda *a, **k: calls.append(k)):
+            nova._load_env_files()
+        self.assertTrue(all(c.get("override") is False for c in calls), calls)
+
+
+class HonestModelReportingTests(unittest.TestCase):
+    def test_status_names_the_model_that_will_actually_answer(self):
+        """Reporting the cloud model while a local one answers hides the cause."""
+        src = (ROOT / "desk" / "bridge.py").read_text(encoding="utf-8")
+        block = src[src.index('"connectivity": connectivity'):]
+        block = block[:block.index('"tools": tools')]
+        self.assertIn('"serving"', block)
+        self.assertIn("_GEMINI_KEY else", block)
+
+
+class DailyQuotaTests(unittest.TestCase):
+    """A day's allowance does not refill in four seconds.
+
+    Measured against a real key: four calls succeed at ~1.5s, then every
+    subsequent one returns 429 with quotaId
+    GenerateRequestsPerDayPerProjectPerModel. Treating that like a passing
+    squall cost three retries at 1s, 2s and 4s, repeated per fallback model —
+    thirteen seconds of guaranteed failure before NOVA could say anything,
+    which the user experiences as NOVA simply being slow.
+    """
+
+    DAILY = ("429 RESOURCE_EXHAUSTED quota exceeded. "
+             "quotaId: GenerateRequestsPerDayPerProjectPerModel")
+    MINUTE = ("429 RESOURCE_EXHAUSTED quota exceeded. "
+              "quotaId: GenerateRequestsPerMinutePerProjectPerModel")
+
+    def test_a_daily_cap_is_not_retried(self):
+        from nova_intelligence.gemini_provider import GeminiProvider
+        self.assertFalse(GeminiProvider._is_retryable(self.DAILY))
+
+    def test_a_per_minute_limit_is_still_retried(self):
+        """Waiting genuinely helps here, so the old behaviour is right."""
+        from nova_intelligence.gemini_provider import GeminiProvider
+        self.assertTrue(GeminiProvider._is_retryable(self.MINUTE))
+
+    def test_transient_failures_are_still_retried(self):
+        from nova_intelligence.gemini_provider import GeminiProvider
+        for err in ("503 UNAVAILABLE", "500 internal", "connection reset",
+                    "504 timeout", "model is overloaded"):
+            with self.subTest(err=err):
+                self.assertTrue(GeminiProvider._is_retryable(err))
+
+    def test_the_user_is_told_it_is_a_daily_cap_not_a_fault(self):
+        from desk.chat import _model_error_message
+        msg = _model_error_message(self.DAILY)
+        self.assertIn("today", msg.lower())
+        self.assertNotIn("please wait and retry", msg.lower())
+
+    def test_an_ordinary_429_still_says_wait(self):
+        from desk.chat import _model_error_message
+        self.assertIn("wait", _model_error_message(self.MINUTE).lower())
+
+
 class ConnectivityQuietTests(unittest.TestCase):
     def test_the_probe_stands_down_during_a_live_stream(self):
         from nova_intelligence.connectivity import ConnectivityManager

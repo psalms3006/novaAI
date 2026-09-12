@@ -169,7 +169,44 @@ except ImportError:
 #  ENVIRONMENT & CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-load_dotenv()
+def _load_env_files() -> None:
+    """Find the user's .env, including in an installed copy.
+
+    Bare load_dotenv() walks up from the *calling module's* directory. Frozen,
+    that directory is a path inside the PyInstaller archive, so the search
+    never touches the filesystem the user can see — and the install folder is
+    exactly where BUILD.md tells them to put the file. The result was an
+    installed NOVA that read no key, quietly fell back to the local 1.5B
+    model, and answered "reply with OK" in eighteen seconds while the window
+    still said ONLINE and named a Gemini model.
+
+    So when frozen, look where a person would have put it: beside the exe
+    first, then %APPDATA%\\NOVA, which survives reinstalling over the top.
+    The development path is unchanged.
+    """
+    candidates = []
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).parent / ".env")
+        appdata = os.getenv("APPDATA")
+        if appdata:
+            candidates.append(Path(appdata) / "NOVA" / ".env")
+
+    for path in candidates:
+        try:
+            if path.is_file():
+                load_dotenv(path, override=False)
+        except Exception:
+            continue
+
+    # Always run the normal search too: it is what development relies on, and
+    # override=False above means a file already found keeps precedence.
+    try:
+        load_dotenv(override=False)
+    except Exception:
+        pass
+
+
+_load_env_files()
 # Desktop credential layer (cloud session / DPAPI-sealed BYOK). No-op when
 # GEMINI_API_KEY is already set — the dev .env workflow is untouched.
 try:
