@@ -10,8 +10,8 @@
     "confirmed": true,
     "created": 1788699046.1203432,
     "updated": 1788699046.1203432,
-    "last_accessed": 1789308311.8886852,
-    "access_count": 59,
+    "last_accessed": 1789310910.348989,
+    "access_count": 60,
     "decay": {
       "active": false,
       "expires": null
@@ -31,8 +31,8 @@
     "confirmed": true,
     "created": 1789303138.196817,
     "updated": 1789303138.196817,
-    "last_accessed": 1789308311.8886852,
-    "access_count": 4,
+    "last_accessed": 1789310910.348989,
+    "access_count": 5,
     "decay": {
       "active": false,
       "expires": null
@@ -52,8 +52,29 @@
     "confirmed": true,
     "created": 1789310723.6425257,
     "updated": 1789310723.648573,
-    "last_accessed": 1789310723.648573,
-    "access_count": 0,
+    "last_accessed": 1789310910.348989,
+    "access_count": 1,
+    "decay": {
+      "active": false,
+      "expires": null
+    },
+    "superseded_by": null,
+    "versions": [],
+    "meta": {}
+  },
+  {
+    "id": "mem_6164c011eb6f",
+    "text": "User wants me to speak in a British Roadman dialect.",
+    "type": "fact",
+    "importance": 0.7,
+    "confidence": 1.0,
+    "source": "explicit",
+    "project": "",
+    "confirmed": true,
+    "created": 1789310795.715216,
+    "updated": 1789310795.715216,
+    "last_accessed": 1789310910.348989,
+    "access_count": 1,
     "decay": {
       "active": false,
       "expires": null

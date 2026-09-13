@@ -382,6 +382,18 @@ def _log(msg: str, *a: Any) -> None:
 _PLACEHOLDER_NAMES = frozenset({"", "user", "there", "none", "unknown", "unset"})
 
 
+def _voice_language() -> str:
+    """BCP-47 language the microphone is expected to be speaking."""
+    try:
+        from desk import settings as _s
+        val = str(_s.get("voice_language", "") or "").strip()
+        if val:
+            return val
+    except Exception:
+        pass
+    return os.getenv("NOVA_VOICE_LANGUAGE", "").strip() or "en-US"
+
+
 def _mic_device():
     """Which input device to listen on, or None for the system default.
 
@@ -1267,7 +1279,16 @@ class LiveManager:
                     prebuilt_voice_config=gtypes.PrebuiltVoiceConfig(
                         voice_name=self._voice,
                     )
-                )
+                ),
+                # Tell it what language to expect.
+                #
+                # Left to guess, it guesses badly on an accent it was not
+                # expecting: this user's English came back transcribed as
+                # French — "Oui", "mais tu peux m'appeler" — which is not a
+                # microphone problem or a model problem but an unanswered
+                # question. A hint costs nothing and is overridable, because
+                # the right answer is different for every user.
+                language_code=_voice_language(),
             ),
         )
 
