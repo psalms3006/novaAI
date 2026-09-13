@@ -63,7 +63,11 @@ def test_a_full_mic_queue_drops_the_oldest_audio_not_the_newest():
     """A live conversation is not a recording. When the queue backs up, the
     frames worth keeping are the ones just spoken."""
     src = io.open("desk/live_session.py", encoding="utf-8").read()
-    cb = src[src.index("def _cb(indata"):src.index("try:\n            self._mic_stream")]
+    # Anchored on the callback itself rather than on whatever line happens to
+    # follow it. The previous anchor was the exact indentation of the line
+    # before sd.InputStream, so adding one line above it broke this test
+    # without anything about the behaviour having changed.
+    cb = src[src.index("def _cb(indata"):src.index("sd.InputStream(")]
     assert "get_nowait" in cb, "the callback still discards the newest frame"
     assert "_mic_dropped" in cb, "dropped frames are not counted"
 

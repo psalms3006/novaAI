@@ -10,8 +10,29 @@
     "confirmed": true,
     "created": 1788699046.1203432,
     "updated": 1788699046.1203432,
-    "last_accessed": 1789171951.3145251,
-    "access_count": 54,
+    "last_accessed": 1789306312.70226,
+    "access_count": 58,
+    "decay": {
+      "active": false,
+      "expires": null
+    },
+    "superseded_by": null,
+    "versions": [],
+    "meta": {}
+  },
+  {
+    "id": "mem_c3d513f3a412",
+    "text": "User's name is Demai.",
+    "type": "fact",
+    "importance": 0.7,
+    "confidence": 1.0,
+    "source": "explicit",
+    "project": "",
+    "confirmed": true,
+    "created": 1789303138.196817,
+    "updated": 1789303138.196817,
+    "last_accessed": 1789306312.70226,
+    "access_count": 3,
     "decay": {
       "active": false,
       "expires": null

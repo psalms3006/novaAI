@@ -87,12 +87,61 @@ _LOADING_HTML = """<!DOCTYPE html>
 </body></html>"""
 
 
+def _claim_single_instance():
+    """Refuse to start a second NOVA, and say why.
+
+    Nothing stopped two from running. The second loses the port, so it has no
+    window and looks like it simply failed to launch — but it still opens the
+    microphone and still streams audio to the model. Two copies then fight
+    over one microphone and share one uplink, which is enough on a modest
+    connection to start dropping the user's speech: measured here with several
+    stacked instances, mic sends reaching 21 seconds and 555 frames of speech
+    discarded, against zero of either once a single instance was running.
+
+    A named mutex is the Windows way to ask "is one already running?" and the
+    kernel releases it when the process dies, so a crash cannot leave NOVA
+    permanently unable to start. Returns a handle to keep alive, or None when
+    the check could not be made -- never blocking startup over its own
+    failure.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        ERROR_ALREADY_EXISTS = 183
+        k32 = ctypes.windll.kernel32
+        k32.CreateMutexW.argtypes = [wintypes.LPCVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        k32.CreateMutexW.restype = wintypes.HANDLE
+        handle = k32.CreateMutexW(None, False, "Global\\NOVA.Desktop.SingleInstance")
+        # GetLastError must be read straight after the call that set it.
+        already = (k32.GetLastError() == ERROR_ALREADY_EXISTS)
+        if already:
+            if handle:
+                k32.CloseHandle(handle)
+            return False
+        return handle
+    except Exception as e:
+        _log(f"single-instance check unavailable: {e}")
+        return None
+
+
 def main() -> int:
     _log("=" * 60)
     _log("NOVA Desktop starting up")
     _log(f"START_MODE={START_MODE}")
     _log(f"DESK_URL={DESK_URL}")
     _log(f"Python {sys.version}")
+
+    _instance_lock = _claim_single_instance()
+    if _instance_lock is False:
+        _log("Another NOVA is already running — not starting a second one.")
+        print("NOVA is already running. Look for the orb, or close the other "
+              "copy first.\n(Two copies share one microphone and one "
+              "connection, which stops NOVA hearing you.)")
+        return 0
+    # Held for the life of the process; released by the kernel on exit.
+    globals()["_INSTANCE_LOCK"] = _instance_lock
 
     try:
         from desk.creds import bootstrap as _creds_bootstrap

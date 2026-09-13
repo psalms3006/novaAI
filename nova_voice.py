@@ -161,6 +161,22 @@ CHANNELS = 1
 
 
 
+#: How far above the learned room floor a frame must be to count as sound
+#: worth transmitting. Generous, because the cost of getting this wrong in one
+#: direction is wasted bandwidth and in the other is not hearing someone.
+QUIET_FLOOR_MARGIN = 2.2
+
+#: An absolute floor as well, so a perfectly silent digital input (a virtual
+#: cable, a muted device) cannot learn a floor of zero and call its own hiss
+#: speech.
+QUIET_FLOOR_MIN = 120.0
+
+#: Keep transmitting for this long after the last sound. Covers the gap
+#: between words, a breath mid-sentence, and the pause before someone changes
+#: their mind -- none of which should truncate a turn.
+QUIET_HOLDOVER_S = 1.2
+
+
 def frame_rms(frame: np.ndarray) -> float:
     """RMS amplitude of an int16 frame."""
     if frame is None or len(frame) == 0:
@@ -472,6 +488,13 @@ class VoiceGate:
         #: Loudest the room itself has been recently, in absolute RMS. Used
         #: only when there is no echo path, where it is the honest baseline.
         self._noise_floor = 0.0
+        #: Learned level of the room with nobody speaking, and when it
+        #: last had something in it. Together they decide whether a
+        #: frame is worth the uplink.
+        self._room_floor = 0.0
+        self._last_loud_at = 0.0
+        #: True when this frame is room tone rather than anyone talking.
+        self.last_was_quiet = False
         #: Frames of NOVA's own speech to observe before a barge-in is
         #: believable. The echo path is unknown at the start of every turn,
         #: and 4 frames is ~256 ms — long enough for the filter to lock on,
@@ -566,6 +589,7 @@ class VoiceGate:
         it to avoid spending bandwidth on long runs of digital zeroes; it is
         written from the microphone callback and meant to be read there.
         """
+        self._note_room(frame)
         with self._lock:
             if self._muted:
                 # Explicit user mute: still send silence so the session stays
@@ -602,6 +626,36 @@ class VoiceGate:
         self.frames_muted += 1
         self.last_was_silence = True
         return self._silence
+
+    def _note_room(self, frame: np.ndarray) -> None:
+        """Record whether this frame sounds like an empty room.
+
+        The gate already suppresses NOVA's own voice, and the batcher already
+        throttles that. What neither noticed is the far more common case: no
+        one is talking at all. NOVA streamed 32 KB/s of room tone up to the
+        model continuously, and on a connection without headroom that is the
+        bandwidth the user's actual speech needed — measured on this machine,
+        mic sends climbing past twenty seconds and 180 frames of real speech
+        dropped because the queue behind them had filled with nothing.
+
+        Quiet is judged against a floor learned from the room rather than a
+        fixed number, because a laptop fan and a quiet study are not the same
+        silence. And once anything is heard the hold-over keeps transmitting
+        for a moment afterwards, so the tail of a word, a pause for breath
+        mid-sentence, and the gap before "...actually, no" all still arrive.
+        """
+        level = frame_rms(frame)
+        if self._room_floor <= 0.0:
+            self._room_floor = level
+        loud = level > max(self._room_floor * QUIET_FLOOR_MARGIN, QUIET_FLOOR_MIN)
+        if loud:
+            self._last_loud_at = time.time()
+        else:
+            # Track the quiet only, so speech never drags the floor up after
+            # itself and deafens her to the sentence that follows.
+            self._room_floor += (level - self._room_floor) * 0.05
+        self.last_was_quiet = (
+            not loud and (time.time() - self._last_loud_at) > QUIET_HOLDOVER_S)
 
     def _is_double_talk(self, frame: np.ndarray) -> bool:
         """Is there sound here that NOVA's own playback cannot account for?

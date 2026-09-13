@@ -29,6 +29,7 @@ _DEFAULTS = {
     # ── identity ───────────────────────────────────────────────
     "user_name": "User",            # neutral default; user may change it
     "user_name_pronunciation": "",  # how to say it, when spelling does not say
+    "mic_device": "",               # input device name or index; blank = system default
     "user_system_prompt": "",       # user's custom NOVA instructions (reaches inference)
     # ── appearance (applied client-side, persisted server-side) ──
     "theme": "dark",                # dark | light

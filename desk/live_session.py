@@ -382,6 +382,49 @@ def _log(msg: str, *a: Any) -> None:
 _PLACEHOLDER_NAMES = frozenset({"", "user", "there", "none", "unknown", "unset"})
 
 
+def _mic_device():
+    """Which input device to listen on, or None for the system default.
+
+    Plugging in headphones can change which device Windows calls "default",
+    and a machine can carry several inputs that all look plausible — a webcam
+    array, a virtual cable, the built-in mic. Being able to name the one NOVA
+    should use is the difference between "she cannot hear me" and a setting.
+
+    Accepts an index, or any part of a device name (case-insensitive).
+    Anything unrecognised falls back to the default rather than failing to
+    open a microphone at all.
+    """
+    want = ""
+    try:
+        from desk import settings as _s
+        want = str(_s.get("mic_device", "") or "").strip()
+    except Exception:
+        pass
+    want = want or os.getenv("NOVA_MIC_DEVICE", "").strip()
+    if not want:
+        return None
+    if want.isdigit():
+        return int(want)
+    try:
+        import sounddevice as _sd
+        for i, d in enumerate(_sd.query_devices()):
+            if d.get("max_input_channels", 0) > 0 and want.lower() in d.get("name", "").lower():
+                return i
+    except Exception as e:
+        _log("[LIVE] could not resolve mic_device %r: %s", want, e)
+    _log("[LIVE] mic_device %r matched nothing; using the system default", want)
+    return None
+
+
+def _mic_device_name(device) -> str:
+    try:
+        import sounddevice as _sd
+        info = _sd.query_devices(device if device is not None else None, "input")
+        return str(info.get("name", "?"))
+    except Exception:
+        return "default input"
+
+
 def _known_name(meta: dict) -> str:
     """The user's name, or empty when it was never actually given."""
     name = (meta.get("user_name") or "").strip()
@@ -657,8 +700,34 @@ class LiveManager:
             "turns": self._turn_count,
             "audio_out_kb": round(self._audio_bytes_out / 1024, 1),
             "audio_in_kb": round(self._audio_bytes_in / 1024, 1),
+            # What the microphone gate actually did with those bytes.
+            #
+            # audio_in_kb counts everything handed to the socket, and the gate
+            # transmits *silence* rather than nothing while NOVA is speaking —
+            # so a session can report megabytes sent while the model has heard
+            # nothing but digital zeroes. That is indistinguishable from a
+            # working microphone unless these are visible, and it is exactly
+            # the shape of "she talks but cannot hear me".
+            "mic": self._gate_stats(),
             "screen": self._screen.status(),
             "error": self._last_error,
+        }
+
+    def _gate_stats(self) -> dict:
+        g = getattr(self, "_gate", None)
+        if g is None:
+            return {"available": False}
+        sent = int(getattr(g, "frames_sent", 0))
+        muted = int(getattr(g, "frames_muted", 0))
+        total = sent + muted
+        return {
+            "available": True,
+            "frames_sent": sent,
+            "frames_muted": muted,
+            "heard_pct": round(100.0 * sent / total, 1) if total else 0.0,
+            "barge_ins": int(getattr(g, "barge_ins", 0)),
+            "speaking": bool(getattr(g, "speaking", False)),
+            "muted": bool(getattr(g, "muted", False)),
         }
 
     def subscribe(self) -> queue.Queue:
@@ -995,7 +1064,13 @@ class LiveManager:
             # mute-while-speaking, echo cancellation, barge-in detection.
             try:
                 frame = self._gate.process(np.asarray(indata).reshape(-1))
-                payload = batcher.add(frame, self._gate.last_was_silence)
+                # Two kinds of nothing: the gate muting NOVA's own voice, and
+                # a room with no one talking in it. Both are zeroes as far as
+                # the model is concerned, and neither is worth 32 KB/s of a
+                # connection the user's next sentence has to fit through.
+                payload = batcher.add(
+                    frame,
+                    self._gate.last_was_silence or self._gate.last_was_quiet)
             except Exception:
                 return
             if payload is None:
@@ -1037,15 +1112,16 @@ class LiveManager:
                 pass            # loop shutting down
 
         try:
+            device = _mic_device()
             self._mic_stream = sd.InputStream(
                 samplerate=MIC_RATE, channels=1, dtype="int16",
-                blocksize=MIC_BLOCK, callback=_cb,
+                blocksize=MIC_BLOCK, callback=_cb, device=device,
             )
             self._mic_stream.start()
             self._mic_active = True
             self._mic_dropped = 0
-            _log("[LIVE] mic opened (16 kHz mono, %d-frame blocks, "
-                 "%.1fs queue)", MIC_BLOCK,
+            _log("[LIVE] mic opened (%s, 16 kHz mono, %d-frame blocks, "
+                 "%.1fs queue)", _mic_device_name(device), MIC_BLOCK,
                  MIC_QUEUE_FRAMES * MIC_BLOCK / MIC_RATE)
         except Exception as e:
             # Same reasoning as above: a device that is missing, busy or
