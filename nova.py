@@ -2237,9 +2237,21 @@ def main() -> None:
         # Auto-detect and start Ollama if needed
         _local_runtime = LocalRuntimeManager(auto_start=True, auto_stop=True)
         _local_runtime.detect()
+        _have_cloud = bool(HAS_GEMINI and GEMINI_API_KEY)
         if _local_runtime.state.name == "NOT_INSTALLED":
             print("  Ollama............not installed (local AI unavailable)")
+        elif _have_cloud:
+            # Detected, deliberately not started. Ollama holds a model in
+            # memory for a fallback that mostly never comes, and on an 8 GB
+            # machine that is about a gigabyte taken from the machine NOVA is
+            # supposed to be helping with — enough, measured here, to run it
+            # out of memory entirely. OllamaProvider starts it the first time
+            # the fallback is actually wanted.
+            print("  Ollama............installed (starts if the cloud fails)")
         else:
+            # No cloud key, so the local model *is* the brain. Warm it now
+            # rather than making the user wait through a cold start on their
+            # first question.
             _local_runtime.ensure_running()
         atexit.register(_local_runtime.stop)
 
@@ -2249,6 +2261,10 @@ def main() -> None:
 
         _ollama_model = get_model_manager().current_model
         _ollama_provider = OllamaProvider(model=_ollama_model)
+        # Hand the provider the runtime so it can start Ollama the first time
+        # a fallback actually needs it. Without this the deferred start above
+        # would simply mean no local model at all.
+        _ollama_provider.runtime = _local_runtime
 
         _gemini_provider = None
         if HAS_GEMINI and GEMINI_API_KEY:

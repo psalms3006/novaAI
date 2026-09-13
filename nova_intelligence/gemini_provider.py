@@ -313,6 +313,125 @@ class GeminiProvider:
             latency_ms=latency,
         )
 
+    def stream_complete(
+        self,
+        messages: List[Dict[str, Any]],
+        system: str = "",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+    ) -> Iterator[tuple]:
+        """Stream a round that may also call tools.
+
+        Yields ``("text", chunk)`` as words arrive and finally
+        ``("done", GenerateResult)`` carrying the whole reply and any tool
+        calls — so a caller can show the answer being written and still get
+        the structured result it needs to dispatch tools.
+
+        The reason this exists: a round with tools used to go through
+        complete(), which waits for the entire response before anything can
+        be shown. Measured, the first word of a twenty-word reply appeared
+        after 9-10 seconds — the full round trip — when the model had begun
+        producing it in about one. The whole wait was NOVA's, not the
+        model's.
+
+        Function calls do arrive in the stream, as parts on the chunks, so
+        the old reason for not streaming here ("tool calls come in the full
+        response") does not hold; they simply have to be accumulated across
+        chunks rather than read once at the end.
+        """
+        from google.genai import types as gtypes
+
+        t0 = time.time()
+        client = self._get_client()
+
+        contents = []
+        for m in messages:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            if role == "system":
+                system = content
+                continue
+            contents.append(gtypes.Content(
+                role=_gemini_role(role),
+                parts=[gtypes.Part(text=content or " ")],
+            ))
+        if not contents:
+            yield ("done", GenerateResult(error="No messages to process",
+                                          provider="gemini"))
+            return
+
+        contents = _normalize_contents(contents)
+        config = gtypes.GenerateContentConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+        )
+        if system:
+            config.system_instruction = system
+        if tools:
+            config.tools = _to_gemini_tools(tools)
+
+        models_to_try = [self._model] + [m for m in self.FALLBACK_MODELS if m != self._model]
+        last_error = ""
+
+        for model in models_to_try:
+            for attempt in range(self.MAX_RETRIES):
+                parts_text: List[str] = []
+                tool_calls: List[Dict[str, Any]] = []
+                emitted = False
+                try:
+                    for chunk in client.models.generate_content_stream(
+                        model=model, contents=contents, config=config,
+                    ):
+                        for call in _response_tool_calls(chunk):
+                            if call not in tool_calls:
+                                tool_calls.append(call)
+                        piece = getattr(chunk, "text", None)
+                        if piece:
+                            parts_text.append(piece)
+                            emitted = True
+                            yield ("text", piece)
+
+                    latency = (time.time() - t0) * 1000
+                    self._health.record_success(latency)
+                    yield ("done", GenerateResult(
+                        text="".join(parts_text),
+                        tool_calls=tool_calls,
+                        provider="gemini",
+                        model=model,
+                        latency_ms=latency,
+                    ))
+                    return
+                except Exception as e:
+                    last_error = str(e)
+                    if emitted:
+                        # Half a reply is already on the user's screen. Retrying
+                        # would write a second answer underneath the first, so
+                        # keep what arrived and stop.
+                        latency = (time.time() - t0) * 1000
+                        yield ("done", GenerateResult(
+                            text="".join(parts_text), tool_calls=tool_calls,
+                            provider="gemini", model=model, latency_ms=latency,
+                            error="" if parts_text else last_error))
+                        return
+                    if self._is_retryable(last_error) and attempt < self.MAX_RETRIES - 1:
+                        delay = self.RETRY_DELAYS[attempt]
+                        log.warning(
+                            "[GEMINI] transient stream error on %s (attempt %d/%d),"
+                            " retrying in %.1fs: %s",
+                            model, attempt + 1, self.MAX_RETRIES, delay, last_error[:160],
+                        )
+                        time.sleep(delay)
+                        continue
+                    log.warning("[GEMINI] stream %s failed (attempt %d): %s",
+                                model, attempt + 1, last_error[:160])
+                    break
+
+        self._health.record_failure(last_error)
+        yield ("done", GenerateResult(
+            error=last_error or "All Gemini models failed",
+            provider="gemini", latency_ms=(time.time() - t0) * 1000))
+
     def stream(
         self,
         messages: List[Dict[str, Any]],

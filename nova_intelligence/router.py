@@ -283,6 +283,108 @@ class IntelligenceRouter:
             provider="none",
         )
 
+    def stream_complete(
+        self,
+        messages: List[Dict[str, Any]],
+        system: str = "",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+        require_tools: bool = False,
+        require_vision: bool = False,
+    ) -> Iterator[tuple]:
+        """Stream a round that may also call tools, with provider failover.
+
+        Yields ``("text", chunk)`` then a final ``("done", GenerateResult)``.
+
+        A provider without stream_complete is not a failure: its complete()
+        is used and the whole answer arrives as one chunk, which is exactly
+        the behaviour everything had before. That keeps the local model — and
+        any future provider — working without having to implement streaming
+        first.
+
+        Like stream(), failover only happens before the first chunk reaches
+        the caller. Once text is on screen, switching providers would splice
+        two different answers together.
+        """
+        ranked = self.rank_providers(
+            require_tools=require_tools,
+            require_vision=require_vision,
+            tool_names=[t.get("name") for t in (tools or [])],
+        )
+        if not ranked:
+            yield ("done", GenerateResult(
+                error="No intelligence provider available. "
+                      "Check Ollama or network connection.",
+                provider="none"))
+            return
+
+        errors: List[str] = []
+        first_choice = ranked[0].name
+        for provider in ranked:
+            self._note_provider_used(provider.name)
+            started = time.time()
+            local = provider_is_local(provider)
+            emitted = False
+            result = None
+            try:
+                streamer = getattr(provider, "stream_complete", None)
+                if streamer is None:
+                    result = provider.complete(
+                        messages=messages, system=system, tools=tools,
+                        temperature=temperature, max_tokens=max_tokens,
+                    )
+                    if result and not result.error and result.text:
+                        emitted = True
+                        yield ("text", result.text)
+                else:
+                    for kind, payload in streamer(
+                        messages=messages, system=system, tools=tools,
+                        temperature=temperature, max_tokens=max_tokens,
+                    ):
+                        if kind == "text":
+                            emitted = True
+                            yield ("text", payload)
+                        else:
+                            result = payload
+            except Exception as e:
+                try:
+                    provider.health.record_failure(str(e))
+                except Exception:
+                    pass
+                _telemetry_call(provider, started, local, status="error",
+                                error_code=type(e).__name__)
+                errors.append(f"{provider.name}: {e}")
+                log.warning("[ROUTER] %s raised while streaming: %s", provider.name, e)
+                if emitted:
+                    yield ("done", GenerateResult(error=str(e), provider=provider.name))
+                    return
+                continue
+
+            if result is None or result.error:
+                err = (result.error if result else "no result")
+                _telemetry_call(provider, started, local, status="error",
+                                error_code="provider_error")
+                errors.append(f"{provider.name}: {err}")
+                log.warning("[ROUTER] %s returned error while streaming: %s",
+                            provider.name, str(err)[:200])
+                if emitted:
+                    yield ("done", result or GenerateResult(
+                        error=err, provider=provider.name))
+                    return
+                continue
+
+            _telemetry_call(provider, started, local, status="success")
+            if provider.name != first_choice and local:
+                _telemetry_event("OFFLINE_FALLBACK", provider=provider.name)
+            yield ("done", result)
+            return
+
+        log.error("[ROUTER] all providers failed while streaming: %s", errors)
+        yield ("done", GenerateResult(
+            error="; ".join(errors) or "All intelligence providers failed.",
+            provider="none"))
+
     def stream(
         self,
         messages: List[Dict[str, Any]],

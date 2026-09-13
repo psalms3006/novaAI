@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Tuple
 
 from . import trace as desk_trace
 from nova_core import trust as _trust
+from nova_intelligence.provider import GenerateResult
 import nova as _nova
 
 log = _nova.log
@@ -306,13 +307,11 @@ def run_turn(
     # 1. First model round (streaming preferred, full-response fallback)
     followup_msgs = list(messages)
     desk_trace.mark("first_round_start")
-    r_text, tool_calls, tokens = _first_round(followup_msgs, stop_event, streaming)
-    desk_trace.mark("first_round_done", chars=len(r_text or ""), tools=len(tool_calls or []), token_events=len(tokens or []))
-    for t in tokens:
-        yield t
-        # Publish progress for thinking agent while streaming tokens
-        if t.get("type") == "token" and _publish_agent_progress:
-            _publish_agent_progress("thinking-" + task_id, action="Generating response")
+    r_text, tool_calls = yield from _first_round(followup_msgs, stop_event, streaming)
+    desk_trace.mark("first_round_done", chars=len(r_text or ""),
+                    tools=len(tool_calls or []))
+    if _publish_agent_progress:
+        _publish_agent_progress("thinking-" + task_id, action="Generating response")
     tool_events = []
 
     # Publish thinking agent start if no tools (pure text response)
@@ -430,8 +429,12 @@ def run_turn(
 
 
 def _first_round(messages, stop_event, streaming):
-    """Return (text, tool_calls, tokens_list_of_events).
-    
+    """Yield token events as they arrive; return (text, tool_calls).
+
+    A generator rather than a function that returns a finished list, because
+    the whole point is that the caller can forward each word the moment it
+    exists instead of after the last one does.
+
     Provider-agnostic: routes through IntelligenceRouter when available,
     falls back to Gemini-specific path when router unavailable.
     Returns offline message if no AI backend is initialized.
@@ -441,7 +444,14 @@ def _first_round(messages, stop_event, streaming):
         import nova
         router = getattr(nova, "_nova_router", None)
         if router:
-            return _router_round(router, messages, use_tools=True, stop_event=stop_event, streaming=streaming)
+            if streaming:
+                return (yield from _router_round_streaming(router, messages))
+            text, calls, toks = _router_round(
+                router, messages, use_tools=True,
+                stop_event=stop_event, streaming=False)
+            for t in toks:
+                yield t
+            return text, calls
     except Exception as e:
         log.debug("router round failed, using Gemini path: %s", e)
 
@@ -454,7 +464,9 @@ def _first_round(messages, stop_event, streaming):
         if router is None:
             user_msg = messages[-1].get("content", "") if messages else ""
             log.info("Brain not initialized (router=None), returning offline response")
-            return _get_offline_response(user_msg), [], []
+            msg = _get_offline_response(user_msg)
+            yield _ev("token", text=msg)
+            return msg, []
     except Exception:
         pass
 
@@ -462,20 +474,30 @@ def _first_round(messages, stop_event, streaming):
     if HAS_GEMINI and GEMINI_API_KEY and genai and gtypes:
         if streaming:
             try:
-                return _stream_round(messages, use_tools=True, stop_event=stop_event)
+                text, calls, toks = _stream_round(
+                    messages, use_tools=True, stop_event=stop_event)
+                for t in toks:
+                    yield t
+                return text, calls
             except Exception as e:
                 log.error("streaming round failed; falling back to offline: %s", e)
                 # Don't try _full_round too — if streaming failed (SSL/network),
                 # full round will also fail and waste another 10+ seconds.
                 user_msg = messages[-1].get("content", "") if messages else ""
-                return _get_offline_response(user_msg), [], []
+                msg = _get_offline_response(user_msg)
+                yield _ev("token", text=msg)
+                return msg, []
         text, tool_calls = _full_round(messages, use_tools=True)
-        return text, tool_calls, []
+        if text:
+            yield _ev("token", text=text)
+        return text, tool_calls
 
     # No AI backend available — return offline message
     user_msg = messages[-1].get("content", "") if messages else ""
     log.info("No AI backend available, returning offline response")
-    return _get_offline_response(user_msg), [], []
+    msg = _get_offline_response(user_msg)
+    yield _ev("token", text=msg)
+    return msg, []
 
 
 def _model_error_message(error: str) -> str:
@@ -570,6 +592,76 @@ def _finish_round(messages, stop_event, streaming):
     return text, []
 
 
+def _collect_stream(router, router_msgs, system, sink=None):
+    """Run a tool-capable round, handing text to `sink` as it arrives.
+
+    `sink` is called with each chunk so the caller can put words on screen
+    while the model is still writing them. Passing None just collects, which
+    is what any caller that cannot yield needs.
+    """
+    result = None
+    for kind, payload in router.stream_complete(
+        messages=router_msgs, system=system,
+        tools=TOOL_DECLARATIONS, require_tools=True,
+    ):
+        if kind == "text":
+            if sink is not None and payload:
+                sink(payload)
+        else:
+            result = payload
+    return result or GenerateResult(error="no result from router", provider="none")
+
+
+def _router_round_streaming(router, messages):
+    """Generator form of the first round: yields token events, returns result.
+
+    The first round is where the latency lives — it is the one that has to
+    wait for the model — and it was the one round that never streamed,
+    because tool calls were believed to arrive only in a complete response.
+    They arrive in the stream too. So the words now reach the screen as they
+    are written, and the tool calls are accumulated on the way past.
+    """
+    system = _system_text(messages)
+    router_msgs = [{"role": m.get("role", "user"), "content": m.get("content", "")}
+                   for m in messages]
+    desk_trace.mark("model_call_start", mode="stream", tools=True)
+
+    pending: List[dict] = []
+    result = None
+    for kind, payload in router.stream_complete(
+        messages=router_msgs, system=system,
+        tools=TOOL_DECLARATIONS, require_tools=True,
+    ):
+        if kind == "text":
+            if payload:
+                if not pending:
+                    desk_trace.mark("first_token")
+                pending.append(payload)
+                yield _ev("token", text=payload)
+        else:
+            result = payload
+
+    result = result or GenerateResult(error="no result from router", provider="none")
+    desk_trace.mark("model_call_done", provider=result.provider, model=result.model,
+                    model_ms=int(result.latency_ms), chars=len(result.text or ""),
+                    tool_calls=len(result.tool_calls or []),
+                    err=(result.error or "")[:60])
+
+    if result.error:
+        log.error("router stream returned error: %s", result.error)
+        err_text = _model_error_message(result.error)
+        # Nothing was shown yet, so the error is the whole answer.
+        if not pending:
+            yield _ev("token", text=err_text)
+        return err_text, []
+    if not result.text and not result.tool_calls:
+        log.warning("router stream returned empty result")
+        msg = "I received your message but couldn't produce a response. Please try again."
+        yield _ev("token", text=msg)
+        return msg, []
+    return result.text or "", result.tool_calls or []
+
+
 def _router_round(router, messages, use_tools, stop_event=None, streaming=True):
     """Route a turn through the IntelligenceRouter.
     
@@ -586,12 +678,7 @@ def _router_round(router, messages, use_tools, stop_event=None, streaming=True):
     if use_tools:
         try:
             desk_trace.mark("model_call_start", mode="complete", tools=True)
-            result = router.complete(
-                messages=router_msgs,
-                system=system,
-                tools=TOOL_DECLARATIONS,
-                require_tools=True,
-            )
+            result = _collect_stream(router, router_msgs, system, sink=None)
             desk_trace.mark("model_call_done", provider=result.provider, model=result.model, model_ms=int(result.latency_ms), chars=len(result.text or ""), tool_calls=len(result.tool_calls or []), err=(result.error or "")[:60])
             # Emit any text as tokens so the UI shows it
             tokens = []

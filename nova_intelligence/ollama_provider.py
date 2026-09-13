@@ -124,6 +124,11 @@ class OllamaProvider:
             self._refresh_availability_async()
         return self._avail_check_result
 
+    #: Set by nova.main() so a stopped-but-installed Ollama can be woken when
+    #: it is actually wanted. Left None, this provider behaves exactly as it
+    #: always did: not running means not available.
+    runtime = None
+
     def _probe_availability(self) -> bool:
         result = False
         if self.is_running():
@@ -134,9 +139,52 @@ class OllamaProvider:
                     result = any(self._model in m for m in models)
             except Exception:
                 result = False
+        elif self._can_be_started():
+            # Installed but not running. NOVA no longer starts Ollama at boot
+            # when a cloud key is present -- it held about a gigabyte on an
+            # 8 GB machine for a fallback that mostly never happens. But
+            # "stopped" must not mean "unavailable", or the router would
+            # filter the local model out at the moment the cloud fails and
+            # report having no provider at all.
+            #
+            # So it is started here, in the background, and reported as
+            # available: usable, not necessarily warm. If the start fails the
+            # call errors and the router moves on to the next provider, which
+            # is the behaviour a genuinely dead provider should get anyway.
+            self._start_runtime_async()
+            result = True
         self._avail_check_result = result
         self._avail_check_time = time.time()
         return result
+
+    def _can_be_started(self) -> bool:
+        rt = self.runtime
+        if rt is None:
+            return False
+        try:
+            return getattr(rt.state, "name", "") != "NOT_INSTALLED"
+        except Exception:
+            return False
+
+    def _start_runtime_async(self) -> None:
+        """Bring Ollama up without blocking the turn that asked for it."""
+        with self._avail_lock:
+            if getattr(self, "_starting", False):
+                return
+            self._starting = True
+
+        def _run():
+            try:
+                log.info("[OLLAMA] starting local runtime on first use")
+                self.runtime.ensure_running()
+            except Exception as e:
+                log.warning("[OLLAMA] could not start local runtime: %s", e)
+            finally:
+                with self._avail_lock:
+                    self._starting = False
+                self._avail_check_time = 0.0   # re-probe for real next time
+
+        threading.Thread(target=_run, name="ollama-start", daemon=True).start()
 
     def _refresh_availability_async(self) -> None:
         with self._avail_lock:
