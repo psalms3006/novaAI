@@ -10,8 +10,8 @@
     "confirmed": true,
     "created": 1788699046.1203432,
     "updated": 1788699046.1203432,
-    "last_accessed": 1789306312.70226,
-    "access_count": 58,
+    "last_accessed": 1789308311.8886852,
+    "access_count": 59,
     "decay": {
       "active": false,
       "expires": null
@@ -31,8 +31,29 @@
     "confirmed": true,
     "created": 1789303138.196817,
     "updated": 1789303138.196817,
-    "last_accessed": 1789306312.70226,
-    "access_count": 3,
+    "last_accessed": 1789308311.8886852,
+    "access_count": 4,
+    "decay": {
+      "active": false,
+      "expires": null
+    },
+    "superseded_by": null,
+    "versions": [],
+    "meta": {}
+  },
+  {
+    "id": "mem_0ee14dbac1e9",
+    "text": "User's nickname is Minau.",
+    "type": "fact",
+    "importance": 0.9,
+    "confidence": 1.0,
+    "source": "explicit",
+    "project": "",
+    "confirmed": true,
+    "created": 1789310723.6425257,
+    "updated": 1789310723.648573,
+    "last_accessed": 1789310723.648573,
+    "access_count": 0,
     "decay": {
       "active": false,
       "expires": null

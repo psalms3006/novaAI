@@ -151,6 +151,31 @@ RESIDUAL_SMOOTHING_FRAMES = 5
 #: transient without making the user repeat themselves.
 BARGE_IN_CHUNKS = 2
 
+#: Sustained frames required to call it an interruption when there is *no*
+#: echo path — headphones, or a speaker the microphone cannot hear.
+#:
+#: With an echo path the canceller does the discriminating: NOVA's voice
+#: subtracts out and whatever survives is the room. On headphones there is
+#: nothing to subtract, so the only question left is "is this the user or the
+#: room?", and two frames cannot answer it. The room wins that argument
+#: constantly: measured against this machine's own recorded room tone, with
+#: nobody speaking at all, the gate fired eight times a minute — NOVA cutting
+#: her own sentence off every few seconds, which is indistinguishable from
+#: being broken.
+#:
+#: Swept against that recording rather than guessed. False cut-offs per 15 s
+#: of silence, and detections when a voice is mixed in:
+#:
+#:      6 frames -> 1 false, 13 real       12 frames -> 1 false,  9 real
+#:      8 frames -> 1 false, 11 real       16 frames -> 0 false,  8 real
+#:     10 frames -> 1 false, 10 real       20 frames -> 0 false,  7 real
+#:
+#: Sixteen frames is just over a second. That is how long someone has to keep
+#: talking before NOVA yields, which is a real cost — but the error it
+#: replaces is her interrupting herself, and only one of those two is
+#: survivable in a conversation.
+NO_ECHO_BARGE_IN_CHUNKS = 16
+
 #: Ignore the mic this long after NOVA stops speaking, so the speaker's
 #: decaying tail is not mistaken for the user starting a turn.
 SPEAK_COOLDOWN_S = 0.25
@@ -767,7 +792,9 @@ class VoiceGate:
 
         with self._lock:
             self._speech_runs += 1
-            triggered = self._speech_runs >= self._barge_in_chunks
+            needed = (self._barge_in_chunks if self.last_echo_path
+                      else max(self._barge_in_chunks, NO_ECHO_BARGE_IN_CHUNKS))
+            triggered = self._speech_runs >= needed
             if triggered:
                 self._speech_runs = 0
         return triggered

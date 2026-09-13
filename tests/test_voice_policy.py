@@ -19,6 +19,7 @@ import numpy as np
 
 from nova_voice import (
     BARGE_IN_CHUNKS,
+    NO_ECHO_BARGE_IN_CHUNKS,
     BARGE_IN_FLOOR_RMS,
     REF_TAIL_S,
     SPEAK_COOLDOWN_S,
@@ -105,13 +106,21 @@ def test_mic_reopens_after_cooldown():
     assert g.process(f) == f.tobytes()
 
 
+
+#: These fixtures hand the gate no playback reference, so there is no echo
+#: path and the headphone rule applies: without NOVA's own voice to subtract,
+#: the detector needs to watch the sound persist before believing a person is
+#: behind it. The behaviour under test is unchanged — "sustained, not a
+#: spike" — only how much counts as sustained.
+SUSTAINED = NO_ECHO_BARGE_IN_CHUNKS
+
 # ── barge-in ─────────────────────────────────────────────────────────────────
 
 def test_barge_in_requires_sustained_speech():
     fired = []
     g = gate(on_barge_in=lambda: fired.append(1))
     g.set_speaking(True)
-    for _ in range(BARGE_IN_CHUNKS - 1):
+    for _ in range(SUSTAINED - 1):
         g.process(loud())
         assert fired == [], "interrupted before the evidence was in"
     g.process(loud())
@@ -121,7 +130,7 @@ def test_barge_in_requires_sustained_speech():
 def test_barge_in_sends_real_audio_so_the_model_also_stops():
     g = gate()
     g.set_speaking(True)
-    for _ in range(BARGE_IN_CHUNKS - 1):
+    for _ in range(SUSTAINED - 1):
         g.process(loud())
     f = loud()
     assert g.process(f) == f.tobytes()
@@ -130,7 +139,7 @@ def test_barge_in_sends_real_audio_so_the_model_also_stops():
 def test_barge_in_clears_speaking_state():
     g = gate()
     g.set_speaking(True)
-    for _ in range(BARGE_IN_CHUNKS):
+    for _ in range(SUSTAINED):
         g.process(loud())
     assert g.speaking is False
 
@@ -207,7 +216,7 @@ def test_the_tail_guard_expires():
     time.sleep(REF_TAIL_S + 0.05)
     fired = []
     g._on_barge_in = lambda: fired.append(1)
-    for _ in range(BARGE_IN_CHUNKS + 3):
+    for _ in range(SUSTAINED + 3):
         g.process(loud())
     assert fired == [1], "still deaf long after the speaker went quiet"
 
