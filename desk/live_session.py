@@ -1227,6 +1227,19 @@ class LiveManager:
             asyncio.set_event_loop(self._loop)
             self._loop.run_until_complete(self._connect_and_run())
         except Exception as e:
+            # Asked to stop? Then the loop ending is the thing that was asked
+            # for, not a failure.
+            #
+            # stop() ends the session by calling loop.stop(), which makes
+            # run_until_complete raise "Event loop stopped before Future
+            # completed" — and that was landing here and being published as a
+            # fatal error on the way out of every single clean shutdown. The
+            # orb turned red, the window reported a dead voice session, and
+            # the state was set to ERROR underneath stop() as it was setting
+            # CLOSED. Nothing was wrong; NOVA had simply been switched off.
+            if not self._should_reconnect():
+                _log("[LIVE] loop ended on shutdown: %s", e)
+                return
             _log("[LIVE] loop died: %s", e)
             self._last_error = str(e)
             with self._state_lock:

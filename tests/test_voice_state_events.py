@@ -154,3 +154,45 @@ def test_speaking_is_drawn_as_speaking_not_as_idle():
     block = bridge.split("orb_map = {", 1)[1].split("}", 1)[0]
     assert re.search(r'"speaking"\s*:\s*"speaking"', block), (
         "NOVA talking looks the same as NOVA doing nothing")
+
+
+# ── shutting down is not a failure ───────────────────────────────────────────
+
+def manager_at(state):
+    m = ls.LiveManager.__new__(ls.LiveManager)
+    m._state = state
+    m._state_lock = threading.Lock()
+    m._subscribers = []
+    m._subs_lock = threading.Lock()
+    m._last_error = ""
+    m._published = []
+    m._publish = lambda ev: m._published.append(ev)
+    return m
+
+
+def _die(m):
+    """Run the session loop against a coroutine that ends the way stop() ends it."""
+    async def boom():
+        raise RuntimeError("Event loop stopped before Future completed.")
+    m._connect_and_run = boom
+    m._run_loop()
+
+
+def test_a_clean_shutdown_does_not_report_an_error():
+    """stop() ends the session by stopping the event loop, which makes
+    run_until_complete raise. That was published as a fatal error on the way
+    out of every clean shutdown: red orb, "voice session failed", and the
+    state set to ERROR underneath stop() as it set CLOSED."""
+    m = manager_at(ls.LiveState.DISCONNECTING)
+    _die(m)
+    assert states(m) == [], "switching NOVA off looked like NOVA breaking"
+    assert m._state is ls.LiveState.DISCONNECTING, "shutdown was overwritten"
+
+
+def test_a_loop_that_dies_while_running_still_reports_it():
+    """The other direction matters just as much: a session that falls over on
+    its own must not be mistaken for someone closing the window."""
+    m = manager_at(ls.LiveState.STREAMING)
+    _die(m)
+    assert states(m) == ["error"]
+    assert m._state is ls.LiveState.ERROR
