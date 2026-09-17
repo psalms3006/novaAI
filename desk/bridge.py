@@ -914,6 +914,20 @@ def api_vision():
 @app.post("/api/voice/start")
 @require_token
 def api_voice_start():
+    # Push-to-talk is the fallback for when the live session cannot run. It is
+    # not a second way to listen *while* it is running: that would be two
+    # capture streams on one device, which on Windows generally succeeds and
+    # then splits the input between them, so NOVA mishears intermittently with
+    # nothing anywhere reporting a fault.
+    if desk_live.get_live_manager().owns_microphone:
+        return jsonify({
+            "ok": False,
+            "message": ("NOVA is already listening through the live voice "
+                        "session, so push-to-talk is not needed. Stop the "
+                        "voice session first if you want to record."),
+            "reason": "live_session_owns_microphone",
+            **desk_voice.status(),
+        })
     ok, msg = desk_voice.start_capture()
     return jsonify({"ok": ok, "message": msg, **desk_voice.status()})
 

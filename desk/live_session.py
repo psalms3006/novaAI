@@ -1080,6 +1080,19 @@ class LiveManager:
     def muted(self) -> bool:
         return self._gate.muted
 
+    @property
+    def owns_microphone(self) -> bool:
+        """Is this session holding the microphone open right now?
+
+        Asked by the push-to-talk path before it opens one of its own. Two
+        capture streams on one device is the "hidden audio managers fighting
+        over the microphone" case: on Windows the second open usually
+        succeeds, and what follows is two readers splitting the same input
+        with neither getting a clean signal — a failure that presents as NOVA
+        intermittently mishearing rather than as an error anyone can see.
+        """
+        return bool(self._mic_active)
+
     def _start_mic(self) -> None:
         if self._mic_active:
             return
