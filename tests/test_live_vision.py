@@ -74,11 +74,16 @@ def test_the_default_angle_is_the_screen():
     assert session()._vision_in_session({})
 
 
-def test_the_camera_still_belongs_to_core():
-    """mss grabs displays. The webcam is a different device and a different
-    pipeline, and pretending otherwise would capture the screen and call it a
-    photo of the user."""
-    assert not session()._vision_in_session({"angle": "camera"})
+def test_the_camera_is_a_source_not_a_separate_pipeline():
+    """Looking through the webcam is the same conversational act as looking at
+    the screen, and it was the slower of the two: three consecutive camera
+    calls in one session took 11.6s, 10.0s and then a timeout, 33 seconds of
+    a blocked conversation."""
+    assert session()._vision_in_session({"angle": "camera"})
+
+
+def test_an_angle_that_is_not_a_source_still_goes_to_core():
+    assert not session()._vision_in_session({"angle": "telescope"})
 
 
 @pytest.mark.parametrize("arg", ls.LiveManager._VISION_NEEDS_CORE)
@@ -102,7 +107,7 @@ def test_capturing_returns_at_once_and_asks_NOVA_to_say_so():
     """The silence is the bug. A tool call blocks the turn, so the answer has
     to be "I'm looking", said immediately, not the description."""
     m = session()
-    resp = asyncio.run(m._look_at_screen(FakeFC(), {"question": "read this"}))
+    resp = asyncio.run(m._look(FakeFC(), {"question": "read this"}))
     out = resp.response["output"].lower()
     assert "say" in out and "looking" in out
     assert "do not describe" in out, (
@@ -112,7 +117,7 @@ def test_capturing_returns_at_once_and_asks_NOVA_to_say_so():
 
 def test_capturing_holds_the_frame_for_the_end_of_the_turn():
     m = session()
-    asyncio.run(m._look_at_screen(FakeFC(), {"question": "read this"}))
+    asyncio.run(m._look(FakeFC(), {"question": "read this"}))
     assert m._pending_vision is not None
     jpeg, mime, question = m._pending_vision
     assert mime == "image/jpeg"
@@ -124,13 +129,13 @@ def test_capturing_holds_the_frame_for_the_end_of_the_turn():
 def test_the_users_question_travels_with_the_frame():
     """The model has to answer what was asked, not describe the desktop."""
     m = session()
-    asyncio.run(m._look_at_screen(FakeFC(), {"question": "what error is this?"}))
+    asyncio.run(m._look(FakeFC(), {"question": "what error is this?"}))
     assert m._pending_vision[2] == "what error is this?"
 
 
 def test_a_missing_question_still_asks_something():
     m = session()
-    asyncio.run(m._look_at_screen(FakeFC(), {}))
+    asyncio.run(m._look(FakeFC(), {}))
     assert m._pending_vision[2].strip()
 
 
@@ -139,8 +144,8 @@ def test_a_capture_that_fails_says_so_and_does_not_stay_busy(monkeypatch):
     m = session()
     monkeypatch.setattr(ls, "capture_once",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no mss")))
-    resp = asyncio.run(m._look_at_screen(FakeFC(), {}))
-    assert "could not capture" in resp.response["output"].lower()
+    resp = asyncio.run(m._look(FakeFC(), {}))
+    assert "could not use" in resp.response["output"].lower()
     assert m._pending_vision is None
     assert not m._vision_busy
     assert events(m, "vision_failed")
@@ -152,7 +157,7 @@ def test_the_frame_is_sent_as_its_own_turn():
     """Unlike an ambient frame, this one is the question. It closes the turn
     so the model answers instead of filing the picture away as context."""
     m = session()
-    asyncio.run(m._look_at_screen(FakeFC(), {"question": "read this"}))
+    asyncio.run(m._look(FakeFC(), {"question": "read this"}))
     s = FakeSession()
     asyncio.run(m._send_pending_vision(s))
 
@@ -165,7 +170,7 @@ def test_the_frame_is_sent_as_its_own_turn():
 
 def test_sending_clears_the_frame_and_the_busy_flag():
     m = session()
-    asyncio.run(m._look_at_screen(FakeFC(), {}))
+    asyncio.run(m._look(FakeFC(), {}))
     asyncio.run(m._send_pending_vision(FakeSession()))
     assert m._pending_vision is None
     assert not m._vision_busy
@@ -173,7 +178,7 @@ def test_sending_clears_the_frame_and_the_busy_flag():
 
 def test_sending_twice_does_not_send_the_frame_twice():
     m = session()
-    asyncio.run(m._look_at_screen(FakeFC(), {}))
+    asyncio.run(m._look(FakeFC(), {}))
     s = FakeSession()
     asyncio.run(m._send_pending_vision(s))
     asyncio.run(m._send_pending_vision(s))
@@ -184,7 +189,7 @@ def test_a_send_that_fails_tells_the_model_rather_than_going_quiet():
     """NOVA has already said out loud that she is looking. Failing silently
     leaves that sentence as the whole answer."""
     m = session()
-    asyncio.run(m._look_at_screen(FakeFC(), {}))
+    asyncio.run(m._look(FakeFC(), {}))
     asyncio.run(m._send_pending_vision(FakeSession(fail=True)))
     assert not m._vision_busy
     assert events(m, "vision_failed")
@@ -196,7 +201,7 @@ def test_looking_at_the_screen_is_visible_in_the_activity_stream():
     """Reading the user's screen is the most sensitive thing NOVA does. It is
     never something that happens without the interface showing it."""
     m = session()
-    asyncio.run(m._look_at_screen(FakeFC(), {}))
+    asyncio.run(m._look(FakeFC(), {}))
     asyncio.run(m._send_pending_vision(FakeSession()))
     kinds = [e.type for e in m._published]
     assert kinds == ["vision_capture", "vision_captured", "vision_sent"]
@@ -214,7 +219,7 @@ def test_no_screenshot_is_written_to_disk(tmp_path, monkeypatch):
     before = set(tmp_path.rglob("*"))
 
     m = session()
-    asyncio.run(m._look_at_screen(FakeFC(), {"question": "read this"}))
+    asyncio.run(m._look(FakeFC(), {"question": "read this"}))
     asyncio.run(m._send_pending_vision(FakeSession()))
 
     assert set(tmp_path.rglob("*")) == before, "a picture of the screen was left behind"
@@ -271,7 +276,7 @@ def test_the_end_of_the_acknowledgement_is_what_sends_the_frame():
     m._trace = None
     m._play_generation = 0
 
-    asyncio.run(m._look_at_screen(FakeFC(), {"question": "read this"}))
+    asyncio.run(m._look(FakeFC(), {"question": "read this"}))
     s = TurnSession()
     asyncio.run(m._receiver(s))
 
@@ -338,7 +343,7 @@ def test_reading_text_is_answered_in_session():
 
 def test_the_reading_intent_survives_into_the_question():
     m = session()
-    asyncio.run(m._look_at_screen(FakeFC(), {"ocr_only": True,
+    asyncio.run(m._look(FakeFC(), {"ocr_only": True,
                                              "question": "what does it say?"}))
     asked = m._pending_vision[2].lower()
     assert "read" in asked and "text" in asked
@@ -378,3 +383,37 @@ def test_a_tool_timeout_tells_the_model_not_to_retry():
     import inspect
     src = inspect.getsource(ls.LiveManager._run_tool)
     assert "Do NOT" in src and "call it again" in src
+
+
+# ── the camera, which was the slow one ───────────────────────────────────────
+
+def test_the_camera_is_captured_through_core_not_re_implemented():
+    """Core owns the webcam: index, warm-up frames and compression are settled
+    there, and a second answer to "which camera" is a bug waiting to happen."""
+    import inspect
+    src = inspect.getsource(ls.LiveManager._capture_for)
+    assert "_capture_camera" in src
+
+
+def test_a_camera_look_asks_about_the_camera():
+    m = session()
+    captured = {}
+    import types
+    ls.LiveManager._capture_for = staticmethod(
+        lambda source: (captured.setdefault("source", source), (b"x" * 4000, "image/jpeg"))[1])
+    try:
+        asyncio.run(m._look(FakeFC(), {"angle": "camera"}))
+    finally:
+        del ls.LiveManager._capture_for
+    assert captured["source"] == "camera"
+    assert "camera" in m._pending_vision[2].lower()
+
+
+def test_the_acknowledgement_names_what_it_is_looking_through():
+    m = session()
+    ls.LiveManager._capture_for = staticmethod(lambda s: (b"x" * 4000, "image/jpeg"))
+    try:
+        resp = asyncio.run(m._look(FakeFC(), {"angle": "camera"}))
+    finally:
+        del ls.LiveManager._capture_for
+    assert "camera" in resp.response["output"].lower()

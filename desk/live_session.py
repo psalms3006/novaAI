@@ -2251,8 +2251,11 @@ class LiveManager:
     #: request silently falls back to the blocking path.
     VISION_BUSY_MAX_S = 20.0
 
+    #: Where a frame can come from without leaving the conversation.
+    _VISION_SOURCES = ("screen", "camera")
+
     def _vision_in_session(self, args: dict) -> bool:
-        """Can this 'vision' call be answered by showing the model the screen?
+        """Can this 'vision' call be answered by showing the model a picture?
 
         Logged either way. Which path a vision request takes is the difference
         between a one-second answer and a thirty-second silence, and there was
@@ -2260,8 +2263,8 @@ class LiveManager:
         """
         why = ""
         angle = str(args.get("angle", "screen") or "screen").lower()
-        if angle != "screen":
-            why = f"angle={angle!r} is Core's device"
+        if angle not in self._VISION_SOURCES:
+            why = f"angle={angle!r} is not something we can capture"
         elif any(args.get(k) for k in self._VISION_NEEDS_CORE):
             why = "needs " + ", ".join(k for k in self._VISION_NEEDS_CORE
                                        if args.get(k))
@@ -2278,7 +2281,18 @@ class LiveManager:
         _log("[LIVE] vision -> live session; args=%s", sorted(args))
         return True
 
-    async def _look_at_screen(self, fc: Any, args: dict) -> Any:
+    @staticmethod
+    def _capture_for(source: str) -> tuple[bytes, str]:
+        """One frame from `source`, in memory, ready to send."""
+        if source == "camera":
+            # Core owns the webcam: index, warm-up frames and compression are
+            # all settled there, and duplicating that here would mean two
+            # answers to "which camera".
+            from actions.screen_processor import _capture_camera
+            return _capture_camera(), "image/jpeg"
+        return capture_once()
+
+    async def _look(self, fc: Any, args: dict) -> Any:
         """Answer "what's on my screen?" inside the conversation, not beside it.
 
         The alternative — and what this replaces — was Core's vision tool: it
@@ -2302,36 +2316,41 @@ class LiveManager:
         already in context when someone asks, and it is throttled and
         deliberately low-resolution for it. This one was asked for.
         """
-        question = str(args.get("question") or "What is on my screen?").strip()
+        source = str(args.get("angle", "screen") or "screen").lower()
+        default_q = ("What can you see through my camera?" if source == "camera"
+                     else "What is on my screen?")
+        question = str(args.get("question") or default_q).strip()
         if args.get("ocr_only"):
             question = ("Read out all the text visible in this image, exactly "
                         "as written. " + question)
         self._vision_busy = True
         self._vision_busy_at = time.monotonic()
-        self._publish(LiveEvent("vision_capture", source="screen"))
+        self._publish(LiveEvent("vision_capture", source=source))
         try:
-            jpeg, mime = await asyncio.to_thread(capture_once)
+            jpeg, mime = await asyncio.to_thread(self._capture_for, source)
         except Exception as e:
             self._vision_busy = False
-            _log("[LIVE] screen capture failed: %s", e)
-            self._publish(LiveEvent("vision_failed", error=str(e)))
+            _log("[LIVE] %s capture failed: %s", source, e)
+            self._publish(LiveEvent("vision_failed", source=source, error=str(e)))
             return gtypes.FunctionResponse(
                 id=fc.id, name=fc.name,
-                response={"output": f"NOVA could not capture the screen: {e}"})
+                response={"output": f"NOVA could not use the {source}: {e}"})
 
         self._pending_vision = (jpeg, mime, question)
-        _log("[LIVE] screen captured for '%s' (%.0f kB)", question[:60],
+        _log("[LIVE] %s captured for '%s' (%.0f kB)", source, question[:60],
              len(jpeg) / 1024)
-        self._publish(LiveEvent("vision_captured", kb=round(len(jpeg) / 1024, 1),
+        self._publish(LiveEvent("vision_captured", source=source,
+                                kb=round(len(jpeg) / 1024, 1),
                                 question=question[:120]))
+        what = "camera" if source == "camera" else "screen"
         return gtypes.FunctionResponse(
             id=fc.id, name=fc.name,
             response={"output": (
-                "The screen has been captured and is being sent to you now. "
+                f"The {what} has been captured and is being sent to you now. "
                 "Say one short natural sentence to let the user know you are "
-                "looking — nothing more. Do not describe or guess what is on "
-                "the screen: the image arrives in the very next message, and "
-                "you will answer their question from it then.")})
+                "looking — nothing more. Do not describe or guess what you can "
+                f"see: the image arrives in the very next message, and you "
+                "will answer their question from it then.")})
 
     async def _run_tool(self, fc: Any) -> Any:
         """Execute one tool call off the event loop.
@@ -2343,7 +2362,7 @@ class LiveManager:
         name = fc.name
         args = dict(fc.args or {})
         if name == "vision" and self._vision_in_session(args):
-            return await self._look_at_screen(fc, args)
+            return await self._look(fc, args)
         t0 = time.time()
         budget = VISION_TIMEOUT_S if name == "vision" else TOOL_TIMEOUT_S
         try:
