@@ -975,6 +975,22 @@ class LiveManager:
             self._publish(LiveEvent("error", error="speaker_unavailable"))
             return
         self._last_audio_at = time.time()
+        # Announce the transition, not every chunk.
+        #
+        # Speaking is the longest-lived state in a conversation and the one
+        # the user most needs to see, because it is what tells them whether
+        # to wait or to talk. Every surface has handled it since it was
+        # written; nothing ever sent it, so the orb said "listening" for the
+        # whole time NOVA was audibly talking.
+        #
+        # Published here rather than in the playback worker because this is
+        # where the decision is made: audio exists, the speaker is alive, so
+        # NOVA is about to be heard. `speaking` is asked of the gate first
+        # because the gate is the one authority on it — and because a state
+        # event per chunk would be hundreds a turn, crossing the same
+        # WebSocket as the audio it is describing.
+        if not self._gate.speaking:
+            self._publish(LiveEvent("state", state="speaking"))
         self._gate.set_speaking(True)
         try:
             self._play_q.put_nowait(audio)

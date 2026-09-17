@@ -1087,10 +1087,24 @@ def api_live_ws(ws):
                 # Forward voice state events to unified event bus
                 if ev_dict.get("type") == "state":
                     state_val = ev_dict.get("state", "")
+                    # Every state the session can publish, named here.
+                    #
+                    # Anything missing fell through to "idle", and three of
+                    # the states NOVA spends nearly all her time in were
+                    # missing: a conversation showed an idle orb while she
+                    # was listening, thinking about it, and talking back.
+                    # The surfaces that open the voice socket directly were
+                    # fine; the ambient bar and the telemetry panel, which
+                    # deliberately read this bus instead, were not.
                     orb_map = {
                         "connecting": "thinking",
-                        "connected": "idle",
+                        "connected": "listening",
+                        "ready": "listening",
+                        "listening": "listening",
                         "streaming": "listening",
+                        "speaking": "speaking",
+                        "muted": "idle",
+                        "offline": "offline",
                         "disconnecting": "thinking",
                         "error": "error",
                         "closed": "offline",
