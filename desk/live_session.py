@@ -114,6 +114,16 @@ SURFACE_WAIT_S = 2.5
 #: tool does not take the session with it.
 TOOL_TIMEOUT_S = 30.0
 
+#: ...except for looking at something, which is a conversational act.
+#:
+#: Thirty seconds is a reasonable wait for a web search nobody is listening
+#: to. It is not a reasonable wait for "what's on my screen", where the user
+#: has asked a question out loud and is waiting in silence for an answer. The
+#: in-session path returns in well under a second; this bounds the cases that
+#: still have to go to Core — the webcam, saving a frame, face work — so one
+#: slow REST call cannot hold the conversation open.
+VISION_TIMEOUT_S = 12.0
+
 #: Longest a screen frame may go unrefreshed inside one conversational turn.
 #: Within a turn the screen rarely matters more than once; across turns a
 #: fresh frame is sent as soon as one is captured.
@@ -583,6 +593,9 @@ class LiveManager:
         #: second screenshot behind the first, and NOVA describes the screen
         #: twice.
         self._vision_busy = False
+        #: When that started, so a flag left behind by a turn that never
+        #: completed cannot lock the fast path out for the whole session.
+        self._vision_busy_at = 0.0
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -630,6 +643,20 @@ class LiveManager:
         if self._thread:
             self._thread.join(timeout=3.0)
         self._stop_mic()
+        # Stop the speaker here, explicitly.
+        #
+        # This used to be left to the `finally` inside _connect_and_run. But
+        # stop() ends the session by stopping the event loop, and a coroutine
+        # suspended when its loop stops is never resumed — so that `finally`
+        # did not run, `_play_thread` was never cleared, and the *next*
+        # session hit the guard at the top of _start_playback, returned False
+        # without logging anything, and ran with no speaker at all.
+        #
+        # The effect was NOVA going permanently mute after the first restart:
+        # "voice ready (speaker unavailable, mic ok)" and then "no speaker;
+        # skipping the greeting", for every session until the app itself was
+        # restarted. Seen five times in eight starts in one day's log.
+        self._stop_playback()
         self._session = None
         # Leave nothing of this session behind for the next one to find.
         #
@@ -793,8 +820,17 @@ class LiveManager:
         "speaker_unavailable". A greeting that starts mid-word is not a
         greeting.
         """
-        if self._play_thread is not None or not HAS_SD:
+        if not HAS_SD:
+            _log("[LIVE] no audio backend: NOVA cannot speak")
             return False
+        if self._play_thread is not None:
+            # Never fail silently here. Whatever left a worker behind, the
+            # answer is to clear it and open the speaker — a session that
+            # cannot talk is not a session, and it must not be reached by
+            # returning False from a bare guard with nothing in the log.
+            _log("[LIVE] speaker thread left over from a previous session; "
+                 "stopping it before opening the device")
+            self._stop_playback()
         self._play_stop.clear()
         try:
             # A deliberately deep output buffer. This is the cracking.
@@ -973,12 +1009,25 @@ class LiveManager:
         self._publish(LiveEvent("state", state="listening"))
 
     def _stop_playback(self) -> None:
+        """Stop the speaker and wait until it has actually let go of the device.
+
+        Returning before the worker has finished is how the next session found
+        the sound device still open. The worker closes the stream in its own
+        `finally`, so until it has run there is a live output stream on a
+        device the next `RawOutputStream` is about to ask for.
+        """
         self._play_stop.set()
         try:
             self._play_q.put_nowait(None)
         except Exception:
             pass
+        t = self._play_thread
         self._play_thread = None
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=2.0)
+            if t.is_alive():
+                _log("[LIVE] speaker thread did not stop within 2s")
+        self._speaker_alive = False
 
     def _enqueue_audio(self, audio: bytes) -> None:
         """Play a chunk and tell the surfaces how loud it is.
@@ -1423,6 +1472,7 @@ class LiveManager:
                     # busy flag left set is a NOVA who will not look at
                     # anything again until she is restarted.
                     self._vision_busy = False
+                    self._vision_busy_at = 0.0
                     self._gate.reset()
 
                     # Consumers before producers.
@@ -1901,20 +1951,50 @@ class LiveManager:
             self._publish(LiveEvent("error", error="tool_response_failed",
                                     message=str(e)))
 
-    #: Vision arguments that the live session cannot answer by looking.
-    #: OCR and face work run local models, and saving writes a file — all of
-    #: which belong to NOVA Core's vision pipeline, not to a picture dropped
-    #: into a conversation.
-    _VISION_NEEDS_CORE = ("ocr_only", "save", "detect_faces",
-                          "save_reference", "identify_user")
+    #: Vision arguments the live session genuinely cannot serve.
+    #:
+    #: Deliberately short. Saving writes a file and face work runs local
+    #: models against the webcam, so both belong to NOVA Core. Reading text
+    #: does not: the live model reads a screenshot perfectly well, and
+    #: sending "read this" to Core meant a second model over REST with the
+    #: conversation blocked behind it — which is the whole failure this
+    #: routing exists to avoid. It was also the common case, because "read
+    #: my screen" is how people ask.
+    _VISION_NEEDS_CORE = ("save", "detect_faces", "save_reference",
+                          "identify_user")
+
+    #: A capture that never reached the model must not lock the fast path out
+    #: for the rest of the session. If the acknowledging turn never completes
+    #: — a barge-in, a reconnect mid-turn — the flag is stale, and every later
+    #: request silently falls back to the blocking path.
+    VISION_BUSY_MAX_S = 20.0
 
     def _vision_in_session(self, args: dict) -> bool:
-        """Can this 'vision' call be answered by showing the model the screen?"""
-        if str(args.get("angle", "screen") or "screen").lower() != "screen":
-            return False            # the camera is Core's device, not ours
-        if any(args.get(k) for k in self._VISION_NEEDS_CORE):
+        """Can this 'vision' call be answered by showing the model the screen?
+
+        Logged either way. Which path a vision request takes is the difference
+        between a one-second answer and a thirty-second silence, and there was
+        no way to tell from the outside which one had been chosen.
+        """
+        why = ""
+        angle = str(args.get("angle", "screen") or "screen").lower()
+        if angle != "screen":
+            why = f"angle={angle!r} is Core's device"
+        elif any(args.get(k) for k in self._VISION_NEEDS_CORE):
+            why = "needs " + ", ".join(k for k in self._VISION_NEEDS_CORE
+                                       if args.get(k))
+        elif self._vision_busy:
+            if time.monotonic() - self._vision_busy_at > self.VISION_BUSY_MAX_S:
+                _log("[LIVE] vision busy flag was stale (%.0fs); clearing it",
+                     time.monotonic() - self._vision_busy_at)
+                self._vision_busy = False
+            else:
+                why = "a capture is already in flight"
+        if why:
+            _log("[LIVE] vision -> Core (%s); args=%s", why, sorted(args))
             return False
-        return not self._vision_busy
+        _log("[LIVE] vision -> live session; args=%s", sorted(args))
+        return True
 
     async def _look_at_screen(self, fc: Any, args: dict) -> Any:
         """Answer "what's on my screen?" inside the conversation, not beside it.
@@ -1941,7 +2021,11 @@ class LiveManager:
         deliberately low-resolution for it. This one was asked for.
         """
         question = str(args.get("question") or "What is on my screen?").strip()
+        if args.get("ocr_only"):
+            question = ("Read out all the text visible in this image, exactly "
+                        "as written. " + question)
         self._vision_busy = True
+        self._vision_busy_at = time.monotonic()
         self._publish(LiveEvent("vision_capture", source="screen"))
         try:
             jpeg, mime = await asyncio.to_thread(capture_once)
@@ -1979,14 +2063,24 @@ class LiveManager:
         if name == "vision" and self._vision_in_session(args):
             return await self._look_at_screen(fc, args)
         t0 = time.time()
+        budget = VISION_TIMEOUT_S if name == "vision" else TOOL_TIMEOUT_S
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(self._execute_tool, name, args),
-                timeout=TOOL_TIMEOUT_S)
+                timeout=budget)
         except asyncio.TimeoutError:
-            result = (f"'{name}' is taking longer than {TOOL_TIMEOUT_S:.0f} "
-                      "seconds; it may still be running.")
-            _log("[LIVE] tool %s timed out", name)
+            # Say it failed, and say not to try again.
+            #
+            # The old wording — "it may still be running" — read as an
+            # invitation to retry, and the model took it: four vision calls
+            # back to back, each timing out at thirty seconds, two full
+            # minutes during which NOVA said nothing at all. From the user's
+            # side that is an assistant that has stopped working.
+            result = (f"The '{name}' tool did not respond within "
+                      f"{budget:.0f} seconds and has been given up on. Do NOT "
+                      f"call it again for this request. Tell the user plainly "
+                      f"that it did not work this time, and carry on.")
+            _log("[LIVE] tool %s timed out after %.0fs", name, budget)
         except Exception as e:
             result = f"Tool '{name}' encountered an error: {str(e)[:200]}"
             _log("[LIVE] tool %s failed: %s", name, e)

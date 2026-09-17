@@ -244,3 +244,74 @@ def test_stopping_leaves_nothing_of_the_session_behind():
                  "_session", "_thread"):
         assert getattr(m, name) is None, f"{name} survived the session it belonged to"
     assert states(m)[-1] == "closed"
+
+
+# ── the speaker has to survive a restart ─────────────────────────────────────
+
+def playback_manager():
+    m = ls.LiveManager.__new__(ls.LiveManager)
+    m._state = ls.LiveState.STREAMING
+    m._state_lock = threading.Lock()
+    m._subscribers = []
+    m._subs_lock = threading.Lock()
+    m._published = []
+    m._publish = lambda ev: m._published.append(ev)
+    m._screen = type("S", (), {"stop": lambda self: None, "enabled": False})()
+    class _Loop:
+        def is_closed(self): return False
+        def is_running(self): return False
+        def call_soon_threadsafe(self, fn, *a): pass
+    m._loop = _Loop()
+    m._thread = None
+    m._mic_queue = q.Queue()
+    m._input_text_queue = q.Queue()
+    m._video_queue = q.Queue()
+    m._session = None
+    m._start_time = 0.0
+    m._turn_count = 0
+    m._mic_active = False
+    m._mic_stream = None
+    m._send_count = 0
+    m._mic_dropped = 0
+    m._play_stop = threading.Event()
+    m._play_q = q.Queue()
+    m._play_thread = threading.Thread(target=lambda: None)
+    m._play_thread.start()
+    m._speaker_alive = True
+    m._gate = nova_voice.VoiceGate(chunk_samples=1024, on_barge_in=lambda: None)
+    return m
+
+
+def test_stopping_releases_the_speaker():
+    """The bug that made NOVA permanently mute after one restart.
+
+    stop() ends the session by stopping the event loop, and a coroutine
+    suspended when its loop stops is never resumed — so the `finally` in
+    _connect_and_run that used to tear playback down never ran.
+    `_play_thread` stayed set, and the *next* session hit the guard at the top
+    of _start_playback, returned False without logging anything, and ran with
+    no speaker at all. Every session after the first reported "speaker
+    unavailable" and skipped the greeting, until the app itself was restarted.
+    """
+    m = playback_manager()
+    m.stop()
+    assert m._play_thread is None, (
+        "the speaker thread outlived its session; the next one will find the "
+        "device taken and run mute")
+    assert m._speaker_alive is False
+
+
+def test_a_left_over_speaker_thread_is_cleared_rather_than_refused():
+    """Whatever leaves a worker behind, the answer is to open the speaker.
+
+    A session that cannot talk is not a session, and it must never be reached
+    by returning False from a bare guard with nothing in the log.
+    """
+    import inspect
+    src = inspect.getsource(ls.LiveManager._start_playback)
+    head = src.split('"""')[2]                     # past the docstring
+    guard = head.split("if self._play_thread is not None:", 1)
+    assert len(guard) == 2, "the stale-thread guard is gone entirely"
+    body = guard[1].split("\n\n", 1)[0]
+    assert "_stop_playback" in body, (
+        "a left-over thread still makes the session silently mute")
