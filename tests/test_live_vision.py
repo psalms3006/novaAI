@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import queue as q
+import time
 import threading
 
 import pytest
@@ -53,6 +54,7 @@ def session():
     m._gate = nova_voice.VoiceGate(chunk_samples=1024, on_barge_in=lambda: None)
     m._pending_vision = None
     m._vision_busy = False
+    m._vision_busy_at = 0.0
     m._published = []
     m._publish = lambda ev: m._published.append(ev)
     return m
@@ -90,6 +92,7 @@ def test_a_second_look_is_refused_while_the_first_is_in_flight():
     """Otherwise two screenshots stack and NOVA describes the screen twice."""
     m = session()
     m._vision_busy = True
+    m._vision_busy_at = time.monotonic()
     assert not m._vision_in_session({})
 
 
@@ -318,3 +321,60 @@ def test_the_ambient_orb_shows_it_too():
     surface on which an invisible screen read would matter most."""
     hud = (ROOT / "desk" / "static" / "hud.js").read_text(encoding="utf-8")
     assert '"vision_capture"' in hud
+
+
+# ── routing, which is the difference between 1 s and 30 s ────────────────────
+
+def test_reading_text_is_answered_in_session():
+    """"Read my screen" is how people ask, and it was the case that went wrong.
+
+    ocr_only used to route to Core, which meant a second model over REST with
+    the conversation blocked behind it. The live model reads a screenshot
+    perfectly well.
+    """
+    assert session()._vision_in_session({"ocr_only": True,
+                                         "question": "read this error"})
+
+
+def test_the_reading_intent_survives_into_the_question():
+    m = session()
+    asyncio.run(m._look_at_screen(FakeFC(), {"ocr_only": True,
+                                             "question": "what does it say?"}))
+    asked = m._pending_vision[2].lower()
+    assert "read" in asked and "text" in asked
+    assert "what does it say?" in asked
+
+
+def test_a_stale_busy_flag_does_not_lock_the_fast_path_out():
+    """A capture whose turn never completed must not cost the whole session.
+
+    If the acknowledging turn is interrupted or the socket drops, the flag is
+    never cleared — and every later request silently falls back to the
+    blocking path for as long as the app runs.
+    """
+    m = session()
+    m._vision_busy = True
+    m._vision_busy_at = time.monotonic() - ls.LiveManager.VISION_BUSY_MAX_S - 1
+    assert m._vision_in_session({}), "a stale flag still blocks looking"
+    assert not m._vision_busy
+
+
+def test_a_fresh_capture_in_flight_is_still_respected():
+    m = session()
+    m._vision_busy = True
+    m._vision_busy_at = time.monotonic()
+    assert not m._vision_in_session({})
+
+
+def test_looking_is_bounded_more_tightly_than_other_tools():
+    """A web search nobody is listening to can take thirty seconds. A question
+    the user asked out loud and is waiting in silence for cannot."""
+    assert ls.VISION_TIMEOUT_S < ls.TOOL_TIMEOUT_S
+
+
+def test_a_tool_timeout_tells_the_model_not_to_retry():
+    """Four vision calls back to back, thirty seconds each, two minutes of
+    silence. The old wording invited exactly that."""
+    import inspect
+    src = inspect.getsource(ls.LiveManager._run_tool)
+    assert "Do NOT" in src and "call it again" in src

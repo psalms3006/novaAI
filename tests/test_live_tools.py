@@ -137,7 +137,12 @@ class ToolDispatchTests(unittest.TestCase):
 
         self.assertLess(elapsed, 3.0, "a wedged tool blocked the session")
         self.assertEqual(len(s.responses), 1, "no response after a timeout")
-        self.assertIn("longer", str(s.responses[0][0].response).lower())
+        # The wording matters as much as the timeout: "it may still be
+        # running" read as an invitation to retry and the model took it, four
+        # times over, for two minutes of silence.
+        said = str(s.responses[0][0].response).lower()
+        self.assertIn("did not respond", said)
+        self.assertIn("do not call it again", said)
 
     def test_a_failed_send_is_reported_not_swallowed(self):
         """The tool ran, the model never heard: NOVA will look broken."""
