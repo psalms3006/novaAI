@@ -418,11 +418,16 @@
         try { ev = JSON.parse(evt.data); } catch (e) { return; }
         const orb = window.__novaOrb;
         if (!orb) return;
+        // orb_state is the backend's own mapping of the voice state, and it
+        // is the only one. There used to be a second map here as well, and it
+        // named five states out of ten — so whether NOVA speaking showed as
+        // speaking depended on which of the two events arrived last. One
+        // runtime, one answer.
         if (ev.type === "orb_state" && ev.state) orb.setState(ev.state);
-        else if (ev.type === "voice_state") {
-          const map = { streaming: "listening", connected: "listening",
-                        connecting: "thinking", error: "error", closed: "offline" };
-          if (map[ev.state]) orb.setState(map[ev.state]);
+        else if (ev.type === "vision_capture") {
+          // Reading the user's screen is the most sensitive thing NOVA does.
+          // It is never something that happens without the orb showing it.
+          orb.setState("working");
         } else if (ev.type === "tool_call") {
           // A tool can legitimately take seconds — a web search, a file
           // search across a drive. Silence for that long reads as NOVA

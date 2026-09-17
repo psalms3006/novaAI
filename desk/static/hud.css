@@ -780,11 +780,18 @@ body[data-mode="ambient"] .orb-container {
    A ring around the orb rather than a banner: it is present in ambient mode,
    where the orb is the entire interface, and it cannot be scrolled away. */
 body.screen-watching #orb-canvas,
-body.screen-watching .orb-stage {
+body.screen-watching .orb-stage,
+body.vision-active #orb-canvas,
+body.vision-active .orb-stage {
   position: relative;
 }
+/* The same ring for a one-off look as for continuous watching. There is no
+   reason for "NOVA is reading your screen" to look like two different things
+   depending on which way she was asked. */
 body.screen-watching .orb-stage::after,
-body[data-mode="ambient"].screen-watching::after {
+body[data-mode="ambient"].screen-watching::after,
+body.vision-active .orb-stage::after,
+body[data-mode="ambient"].vision-active::after {
   content: "";
   position: absolute;
   inset: 0;

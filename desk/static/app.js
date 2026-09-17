@@ -408,6 +408,27 @@ function handleLiveEvent(ev) {
     case "tool_result":
       setOrb("thinking");
       break;
+    case "vision_capture":
+      // NOVA reading the screen must always be visible while it happens.
+      // This is the most sensitive thing she does, and the window showing
+      // "listening" through it would be the interface lying about it.
+      setOrb("working");
+      {
+        const label = $("orb-label");
+        if (label) label.textContent = "looking at your screen";
+      }
+      document.body.classList.add("vision-active");
+      break;
+    case "vision_sent":
+      // Captured and handed over; NOVA is reading it now.
+      setOrb("thinking");
+      document.body.classList.remove("vision-active");
+      break;
+    case "vision_failed":
+      document.body.classList.remove("vision-active");
+      addTranscript_nova("NOVA could not see the screen: "
+        + (ev.error || "the capture failed") + ".");
+      break;
     case "audio":
       // NOVA Core owns playback (server-side sounddevice). If this ever fires
       // again it means two surfaces would speak at once, so ignore it.

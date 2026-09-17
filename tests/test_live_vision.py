@@ -275,3 +275,46 @@ def test_the_end_of_the_acknowledgement_is_what_sends_the_frame():
     assert len(s.sent) == 1, "the turn ended and NOVA never looked"
     assert s.sent[0]["turn_complete"] is True
     assert m._pending_vision is None
+
+
+# ── and they reach the surfaces ──────────────────────────────────────────────
+
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_every_vision_event_is_forwarded_to_the_shared_event_bus():
+    """The ambient orb and the telemetry panel read that bus rather than
+    opening their own voice socket. An event missing from the forward list is
+    an event those surfaces never see."""
+    src = (ROOT / "desk" / "live_session.py").read_text(encoding="utf-8")
+    published = set(re.findall(r'LiveEvent\("(vision_[a-z_]+)"', src))
+    assert published, "no vision events are published at all"
+
+    bridge = (ROOT / "desk" / "bridge.py").read_text(encoding="utf-8")
+    block = bridge.split('ev_dict.get("type") in (', 1)[1].split("):", 1)[0]
+    forwarded = set(re.findall(r'"(vision_[a-z_]+)"', block))
+    assert not published - forwarded, (
+        f"published but never forwarded: {sorted(published - forwarded)}")
+
+
+def test_the_window_shows_that_NOVA_is_reading_the_screen():
+    app = (ROOT / "desk" / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'case "vision_capture":' in app
+    body = app.split('case "vision_capture":', 1)[1].split("break;", 1)[0]
+    assert "vision-active" in body, "nothing marks the screen as being read"
+
+
+def test_the_ring_that_marks_it_is_actually_styled():
+    """A class with no rule behind it is an interface that says nothing."""
+    css = (ROOT / "desk" / "static" / "hud.css").read_text(encoding="utf-8")
+    assert "body.vision-active .orb-stage::after" in css
+
+
+def test_the_ambient_orb_shows_it_too():
+    """Ambient mode is where the orb is the entire interface, so it is the
+    surface on which an invisible screen read would matter most."""
+    hud = (ROOT / "desk" / "static" / "hud.js").read_text(encoding="utf-8")
+    assert '"vision_capture"' in hud
