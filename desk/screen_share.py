@@ -79,6 +79,63 @@ CHANGE_THRESHOLD = 2.0
 #: timer forever, so it has to be nearly free.
 DIFF_EDGE_PX = 64
 
+#: The same two numbers for a frame captured because the user asked for it,
+#: rather than because the timer came round.
+#:
+#: "Read this" usually means text small enough that the ambient settings lose
+#: it, and resolution is what carries text — 1024 px on a 1366 px display is a
+#: 75% downscale, which is where small UI labels stop being legible. So the
+#: edge goes up to near-native and the quality does most of the saving.
+#: Measured on this 1366x768 display, capturing the whole desktop:
+#:
+#:     1024 px q55 (ambient)   96 kB
+#:     1280 px q70            175 kB
+#:     1536 px q78            231 kB
+#:
+#: This is paid once, when the user has asked and is waiting, rather than
+#: every two seconds forever — which is the only reason it can be afforded.
+ON_DEMAND_EDGE_PX = 1280
+ON_DEMAND_QUALITY = 70
+
+
+def _encode(img: "Image.Image", max_edge: int, quality: int) -> bytes:
+    """Downscale and JPEG-compress one frame, the one way."""
+    w, h = img.size
+    scale = min(1.0, max_edge / max(w, h))
+    if scale < 1.0:
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                         Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+
+def capture_once(max_edge: int = ON_DEMAND_EDGE_PX,
+                 quality: int = ON_DEMAND_QUALITY) -> tuple[bytes, str]:
+    """Grab the screen right now, for someone who asked to be looked at.
+
+    Separate from the sampler, and deliberately sharper than it. The sampler
+    is ambient: it runs forever, so every pixel it sends is a pixel it will
+    send again in two seconds, and it is tuned down accordingly. This runs
+    once because the user asked "what's on my screen" — the cost is paid once
+    and small text is the whole reason they asked.
+
+    Held in memory and returned. Nothing here writes a picture of the user's
+    screen to disk.
+
+    Raises rather than returning an empty frame: a caller that cannot see has
+    to know it cannot see, or it will describe a blank image with confidence.
+    """
+    if not HAS_MSS:
+        raise RuntimeError("mss is not installed, so NOVA cannot see the screen")
+    if not HAS_PIL:
+        raise RuntimeError("Pillow is not installed, so NOVA cannot see the screen")
+    with mss.mss() as sct:
+        monitor = sct.monitors[0]          # the whole virtual desktop
+        raw = sct.grab(monitor)
+    img = Image.frombytes("RGB", raw.size, raw.rgb)
+    return _encode(img, max_edge, quality), "image/jpeg"
+
 
 class ScreenShare:
     """Samples the screen and hands frames to a sink, while switched on.
@@ -204,14 +261,7 @@ class ScreenShare:
             return
         self._last_thumb = thumb
 
-        w, h = img.size
-        scale = min(1.0, MAX_EDGE_PX / max(w, h))
-        if scale < 1.0:
-            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))),
-                             Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
-        payload = buf.getvalue()
+        payload = _encode(img, MAX_EDGE_PX, JPEG_QUALITY)
 
         self._sink(payload, "image/jpeg")
         self.frames_sent += 1
@@ -219,5 +269,6 @@ class ScreenShare:
         self._last_sent_at = time.time()
 
 
-__all__ = ["ScreenShare", "MIN_INTERVAL_S", "MAX_INTERVAL_S", "MAX_EDGE_PX",
-           "JPEG_QUALITY", "CHANGE_THRESHOLD"]
+__all__ = ["ScreenShare", "capture_once", "MIN_INTERVAL_S", "MAX_INTERVAL_S",
+           "MAX_EDGE_PX", "JPEG_QUALITY", "CHANGE_THRESHOLD",
+           "ON_DEMAND_EDGE_PX", "ON_DEMAND_QUALITY"]

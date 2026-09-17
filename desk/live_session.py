@@ -25,7 +25,7 @@ from typing import Any
 import numpy as np
 
 import nova_voice
-from desk.screen_share import ScreenShare
+from desk.screen_share import ScreenShare, capture_once
 
 try:
     import sounddevice as sd
@@ -574,6 +574,15 @@ class LiveManager:
         # to arrive in the same conversation she is already having.
         self._screen = ScreenShare(sink=self._send_screen_frame, log=_log)
         self._video_queue: asyncio.Queue | None = None
+        #: A frame captured because the user asked to be looked at, waiting
+        #: for the turn that acknowledged the request to finish so it can be
+        #: put in front of the model. (jpeg, mime, question).
+        self._pending_vision: tuple[bytes, str, str] | None = None
+        #: True from the capture until the model has been shown the frame.
+        #: Without it a second 'vision' call arriving mid-capture stacks a
+        #: second screenshot behind the first, and NOVA describes the screen
+        #: twice.
+        self._vision_busy = False
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -1359,6 +1368,12 @@ class LiveManager:
                     # when the next is captured, the waiting one is already
                     # out of date.
                     self._video_queue = asyncio.Queue(maxsize=1)
+                    self._pending_vision = None
+                    # A frame captured for a session that then died is a
+                    # picture of a conversation that no longer exists, and a
+                    # busy flag left set is a NOVA who will not look at
+                    # anything again until she is restarted.
+                    self._vision_busy = False
                     self._gate.reset()
 
                     # Consumers before producers.
@@ -1739,6 +1754,19 @@ class LiveManager:
                         self._turn_done_flag = True
                         self._turn_count += 1
                         self._publish(LiveEvent("turn_complete", turn_count=self._turn_count))
+
+                        # The turn that just ended was NOVA saying she would
+                        # look. Now show her.
+                        #
+                        # Sent here rather than from the tool because a turn
+                        # cannot be interleaved: content pushed while the
+                        # model is still speaking is either ignored or cuts
+                        # the acknowledgement off mid-word. Waiting for the
+                        # turn to complete is what makes "let me take a
+                        # look — you're looking at a stack trace" one
+                        # continuous reply instead of two colliding ones.
+                        if self._pending_vision is not None:
+                            await self._send_pending_vision(session)
                         # Offer the finished exchange to long-term memory, off
                         # the event loop — deciding what is worth keeping can
                         # involve a model call and must never delay audio.
@@ -1764,6 +1792,47 @@ class LiveManager:
             self._publish(LiveEvent("error", error=str(e)))
             raise
 
+    async def _send_pending_vision(self, session: Any) -> None:
+        """Put the captured screen in front of the model, as a question.
+
+        `turn_complete=True`, unlike the ambient sampler, which sends frames
+        as pending context with `turn_complete=False` so NOVA does not
+        announce what she can see every two seconds. This frame *is* the
+        question — the user asked it and is waiting for the answer — so it
+        closes the turn and the model replies.
+        """
+        pending = self._pending_vision
+        self._pending_vision = None
+        if pending is None:
+            return
+        jpeg, mime, question = pending
+        try:
+            await session.send_client_content(
+                turns={"role": "user", "parts": [
+                    {"inline_data": {"mime_type": mime, "data": jpeg}},
+                    {"text": question},
+                ]},
+                turn_complete=True)
+            _log("[LIVE] screen sent to the model (%.0f kB)", len(jpeg) / 1024)
+            self._publish(LiveEvent("vision_sent",
+                                    kb=round(len(jpeg) / 1024, 1)))
+        except Exception as e:
+            # Losing the picture must not lose the conversation, but NOVA
+            # cannot silently fail to look at something she said she would
+            # look at — so the model is told, in the same turn, and says so.
+            _log("[LIVE] could not send the screen: %s", e)
+            self._publish(LiveEvent("vision_failed", error=str(e)))
+            try:
+                await session.send_client_content(
+                    turns={"role": "user", "parts": [{"text": (
+                        "The screen capture could not be delivered. Tell the "
+                        "user you were unable to see their screen this time.")}]},
+                    turn_complete=True)
+            except Exception:
+                pass
+        finally:
+            self._vision_busy = False
+
     async def _handle_tool_calls(self, session: Any, tool_call: Any) -> None:
         """Run the tools the model asked for and send the results back."""
         names = [fc.name for fc in tool_call.function_calls]
@@ -1783,6 +1852,72 @@ class LiveManager:
             self._publish(LiveEvent("error", error="tool_response_failed",
                                     message=str(e)))
 
+    #: Vision arguments that the live session cannot answer by looking.
+    #: OCR and face work run local models, and saving writes a file — all of
+    #: which belong to NOVA Core's vision pipeline, not to a picture dropped
+    #: into a conversation.
+    _VISION_NEEDS_CORE = ("ocr_only", "save", "detect_faces",
+                          "save_reference", "identify_user")
+
+    def _vision_in_session(self, args: dict) -> bool:
+        """Can this 'vision' call be answered by showing the model the screen?"""
+        if str(args.get("angle", "screen") or "screen").lower() != "screen":
+            return False            # the camera is Core's device, not ours
+        if any(args.get(k) for k in self._VISION_NEEDS_CORE):
+            return False
+        return not self._vision_busy
+
+    async def _look_at_screen(self, fc: Any, args: dict) -> Any:
+        """Answer "what's on my screen?" inside the conversation, not beside it.
+
+        The alternative — and what this replaces — was Core's vision tool: it
+        captures the screen, writes it to disk, and asks a *second* model
+        about it over REST, then hands the answer back as a string for the
+        live model to read out. That is a whole extra round trip on its own
+        quota, a picture of the user's screen on their filesystem, and several
+        seconds of complete silence while it happens, because a tool call
+        blocks the turn. The user asks NOVA to look at something and she
+        appears to have stopped working.
+
+        So the frame goes to the model that is already in the conversation.
+        The tool returns immediately with an instruction to say something
+        while the looking happens, and the image is sent the moment that
+        acknowledgement finishes — as its own turn, so the model answers the
+        question rather than filing the picture away as context. The screen
+        NOVA describes is then the screen as it was when asked about, seen by
+        the model that heard the question, in one round trip.
+
+        Notably not the ambient sampler: that path exists so the screen is
+        already in context when someone asks, and it is throttled and
+        deliberately low-resolution for it. This one was asked for.
+        """
+        question = str(args.get("question") or "What is on my screen?").strip()
+        self._vision_busy = True
+        self._publish(LiveEvent("vision_capture", source="screen"))
+        try:
+            jpeg, mime = await asyncio.to_thread(capture_once)
+        except Exception as e:
+            self._vision_busy = False
+            _log("[LIVE] screen capture failed: %s", e)
+            self._publish(LiveEvent("vision_failed", error=str(e)))
+            return gtypes.FunctionResponse(
+                id=fc.id, name=fc.name,
+                response={"output": f"NOVA could not capture the screen: {e}"})
+
+        self._pending_vision = (jpeg, mime, question)
+        _log("[LIVE] screen captured for '%s' (%.0f kB)", question[:60],
+             len(jpeg) / 1024)
+        self._publish(LiveEvent("vision_captured", kb=round(len(jpeg) / 1024, 1),
+                                question=question[:120]))
+        return gtypes.FunctionResponse(
+            id=fc.id, name=fc.name,
+            response={"output": (
+                "The screen has been captured and is being sent to you now. "
+                "Say one short natural sentence to let the user know you are "
+                "looking — nothing more. Do not describe or guess what is on "
+                "the screen: the image arrives in the very next message, and "
+                "you will answer their question from it then.")})
+
     async def _run_tool(self, fc: Any) -> Any:
         """Execute one tool call off the event loop.
 
@@ -1792,6 +1927,8 @@ class LiveManager:
         """
         name = fc.name
         args = dict(fc.args or {})
+        if name == "vision" and self._vision_in_session(args):
+            return await self._look_at_screen(fc, args)
         t0 = time.time()
         try:
             result = await asyncio.wait_for(
