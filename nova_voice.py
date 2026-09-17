@@ -558,8 +558,27 @@ class VoiceGate:
         still decaying into the microphone. An interruption does not — the
         user is mid-sentence, and swallowing the next quarter second of it is
         the difference between being heard and being ignored.
+
+        Only a *change* of state resets anything, and that is the whole point
+        of the guard below rather than an optimisation.
+
+        Everything this method clears is per-turn learning: the run of
+        consecutive speech frames a barge-in has to accumulate, the smoothing
+        window, and the leak floor it is measured against. The caller is the
+        playback path, which learns NOVA is speaking from each chunk of model
+        audio it is handed — so it says so once per chunk, hundreds of times
+        a turn. Re-running the reset on each of those zeroed the run of
+        speech frames between almost every microphone frame, and a run that
+        cannot reach two never reaches sixteen: measured on unambiguous
+        continuous speech, 60 frames (~3.8 s) of it produced zero barge-ins
+        with the redundant calls and one after 16 frames without them.
+
+        That is the reported failure exactly — NOVA could not be interrupted
+        by voice, only by the button.
         """
         with self._lock:
+            if bool(value) == self._speaking:
+                return
             self._speaking = bool(value)
             if not value:
                 self._last_speak_end = 0.0 if interrupted else time.time()

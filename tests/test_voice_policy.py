@@ -466,3 +466,59 @@ def test_no_self_interruption_across_rooms_and_couplings():
         assert got is None, (
             f"NOVA interrupted herself at {got} ms with {coupling:.0%} "
             f"coupling in a room at RMS {room}")
+
+
+# ── the speaking flag is a state, not a heartbeat ────────────────────────────
+
+def _barge_ins_over(frames: int, *, restate_each_frame: bool) -> int:
+    """Talk over NOVA for `frames`, optionally re-asserting that she is speaking.
+
+    `restate_each_frame` reproduces what the playback path does: it learns
+    NOVA is speaking from each chunk of model audio it is handed, so it says
+    so hundreds of times a turn rather than once.
+    """
+    rng = np.random.default_rng(7)
+    g = gate()
+    g.set_speaking(True)
+    for _ in range(frames):
+        if restate_each_frame:
+            g.set_speaking(True)
+        g.process(rng.normal(0, 6000, CHUNK).astype(np.int16))
+    return g.barge_ins
+
+
+def test_restating_speaking_does_not_reset_barge_in_progress():
+    """The bug that made NOVA interruptible only by the button.
+
+    Barge-in requires a run of consecutive speech frames — two with an echo
+    path to measure against, sixteen without one (headphones). Everything
+    `set_speaking(True)` clears is that run and the floor it is judged
+    against, so re-running the reset between microphone frames meant the run
+    restarted before it could ever complete. Measured before the fix: 60
+    frames of unambiguous continuous speech, zero barge-ins.
+    """
+    assert _barge_ins_over(60, restate_each_frame=True) > 0, (
+        "NOVA cannot be interrupted by voice while she is speaking")
+
+
+def test_the_speaking_flag_is_idempotent():
+    """Same speech, same outcome, however often the flag is re-asserted."""
+    assert (_barge_ins_over(20, restate_each_frame=True)
+            == _barge_ins_over(20, restate_each_frame=False))
+
+
+def test_restating_not_speaking_does_not_extend_the_mic_cooldown():
+    """A cooldown starts when speech ends. It does not restart on every poll.
+
+    The cooldown exists to cover the speaker's decaying tail, so it is
+    anchored to the moment NOVA stopped. Re-arming it from a caller that
+    merely repeats "not speaking" would hold the microphone shut for as long
+    as anything kept saying so.
+    """
+    g = gate()
+    g.set_speaking(True)
+    g.set_speaking(False)
+    time.sleep(SPEAK_COOLDOWN_S + 0.05)
+    g.set_speaking(False)
+    f = loud()
+    assert g.process(f) == f.tobytes(), "the cooldown was re-armed after it expired"
