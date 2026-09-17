@@ -1256,9 +1256,25 @@ class LiveManager:
             sys_prompt += f"\n\n[BACKGROUND MEMORY]\n{mem_ctx}"
         tool_decls = _resolve("TOOL_DECLARATIONS", [])
 
+        def _new_client():
+            """A client per connection attempt, never a reused one.
+
+            The client carries HTTP session state, and after a connection has
+            died that state is stale: reconnecting through it can reattach to a
+            socket the far end has already given up on, which looks from here
+            like a session that is connected and silent. A working reference
+            implementation of this same API makes the same call and says why in
+            one line -- "fresh client on every reconnect, avoids stale HTTP
+            session state" -- which matches the failure seen here: after a DNS
+            blip NOVA went on reporting 'streaming', went on sending audio, and
+            never heard anything again.
+            """
+            c = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+            _relax_websocket_keepalive(c)
+            return c
+
         try:
-            client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-            _relax_websocket_keepalive(client)
+            client = _new_client()
         except Exception as e:
             _log("[LIVE] client init failed: %s", e)
             self._last_error = f"client init failed: {e}"
@@ -1301,6 +1317,10 @@ class LiveManager:
             t0 = time.time()
             connected_ok = False
             try:
+                # Rebuilt per attempt; see _new_client. The first attempt reuses
+                # the one already made above, so a normal start costs nothing.
+                if consecutive_failures or self._offline:
+                    client = _new_client()
                 async with (client.aio.live.connect(model=self._model, config=config) as session,
                             asyncio.TaskGroup() as tg):
                     self._session = session
