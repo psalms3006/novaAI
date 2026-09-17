@@ -631,6 +631,20 @@ class LiveManager:
             self._thread.join(timeout=3.0)
         self._stop_mic()
         self._session = None
+        # Leave nothing of this session behind for the next one to find.
+        #
+        # The loop and its queues outlived stop(), and a straggler from the
+        # old session — a receive coroutine the SDK had not finished
+        # unwinding — could still reach for them. Once that loop is closed,
+        # touching it raises "Event loop is closed", which was seen published
+        # as a fatal voice error moments before a perfectly healthy reconnect.
+        # Cleared, the same straggler finds nothing and gives up quietly,
+        # which is what a dead session's remains should do.
+        self._loop = None
+        self._mic_queue = None
+        self._input_text_queue = None
+        self._video_queue = None
+        self._thread = None
         with self._state_lock:
             self._state = LiveState.CLOSED
         self._publish(LiveEvent("state", state="closed"))

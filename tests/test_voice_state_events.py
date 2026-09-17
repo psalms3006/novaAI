@@ -196,3 +196,51 @@ def test_a_loop_that_dies_while_running_still_reports_it():
     _die(m)
     assert states(m) == ["error"]
     assert m._state is ls.LiveState.ERROR
+
+
+# ── one session does not haunt the next ──────────────────────────────────────
+
+def test_stopping_leaves_nothing_of_the_session_behind():
+    """A stopped session's loop and queues must not outlive it.
+
+    They did, and a straggler from the old session — a receive coroutine the
+    SDK had not finished unwinding — could still reach for them. Once that
+    loop is closed, touching it raises "Event loop is closed", which was
+    observed published as a fatal voice error moments before a perfectly
+    healthy reconnect.
+    """
+    m = ls.LiveManager.__new__(ls.LiveManager)
+    m._state = ls.LiveState.STREAMING
+    m._state_lock = threading.Lock()
+    m._subscribers = []
+    m._subs_lock = threading.Lock()
+    m._published = []
+    m._publish = lambda ev: m._published.append(ev)
+    m._screen = type("S", (), {"stop": lambda self: None, "enabled": False})()
+    class _Loop:
+        def is_closed(self): return False
+        def is_running(self): return False
+        def call_soon_threadsafe(self, fn, *a): pass
+    m._loop = _Loop()
+    m._thread = None
+    m._mic_queue = q.Queue()
+    m._input_text_queue = q.Queue()
+    m._video_queue = q.Queue()
+    m._session = object()
+    m._start_time = 0.0
+    m._turn_count = 0
+    m._mic_active = False
+    m._mic_stream = None
+    m._send_count = 0
+    m._mic_dropped = 0
+    m._play_stop = threading.Event()
+    m._play_q = q.Queue()
+    m._play_thread = None
+    m._gate = nova_voice.VoiceGate(chunk_samples=1024, on_barge_in=lambda: None)
+
+    m.stop()
+
+    for name in ("_loop", "_mic_queue", "_input_text_queue", "_video_queue",
+                 "_session", "_thread"):
+        assert getattr(m, name) is None, f"{name} survived the session it belonged to"
+    assert states(m)[-1] == "closed"
