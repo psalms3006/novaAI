@@ -249,6 +249,47 @@ class EchoCanceller:
     #: it we re-search, because the device buffer has moved.
     LOCK_QUALITY = 0.30
 
+    #: Correlation that confirms the locked offset is really the echo path.
+    #:
+    #: Deliberately far above LOCK_QUALITY, and for a different job. 0.30 is
+    #: the bar for "keep trying to cancel at this offset", and it has to be
+    #: low or a moderately coupled room would never cancel at all. This is the
+    #: bar for "there is an echo path here", which grants the two-frame
+    #: barge-in and the leak-ratio test, and a wrong answer there is NOVA
+    #: stopping for her own voice.
+    #:
+    #: 0.30 cannot do that job, because the search is over ~9600 offsets and
+    #: the best of that many correlations of a signal as self-similar as
+    #: speech clears 0.30 by chance regularly. Measured on this machine, with
+    #: a driver that suppresses the echo so thoroughly there is nothing to
+    #: find: every interruption in a long-talk session was granted an echo
+    #: path, at correlations of -0.22, 0.17, -0.21 and -0.13 — spurious
+    #: matches re-locking the filter faster than the staleness counter could
+    #: retire it.
+    #:
+    #: Pure echo frames correlate at a median of 0.83 and double-talk frames
+    #: at 0.45-0.54, so 0.55 separates a path that is really there from both
+    #: the noise and the ambiguous case.
+    CONFIRM_CORR = 0.55
+
+    #: How much of the frame subtracting the reference has to actually
+    #: remove before we believe there is an echo path here.
+    #:
+    #: Correlation alone could not answer this. Raising the confirmation bar
+    #: to 0.55 cut the spurious locks down but did not end them — over
+    #: hundreds of frames the best of ~9600 offsets clears any fixed
+    #: correlation sometimes, and one lucky frame renews the lock. So the
+    #: confirming test is the thing the downstream branch actually assumes:
+    #: that cancelling *works*. A frame the reference genuinely explains gets
+    #: quieter when the reference is subtracted from it.
+    #:
+    #: 0.8 is about 2 dB — a deliberately low bar, because a weakly coupled
+    #: room is still a coupled room and this must not disqualify one. What it
+    #: does disqualify is the case measured here, where the filter's gain had
+    #: decayed to 0.06 and the "cancelled" residual was no smaller than the
+    #: microphone, or larger.
+    CONFIRM_CANCEL_RATIO = 0.8
+
     #: Frames of *audible playback* the lock may go unconfirmed before we stop
     #: claiming there is an echo path at all.
     #:
@@ -418,13 +459,17 @@ class EchoCanceller:
             return frame_rms(frame)
 
         self.last_ref_rms = float(np.sqrt(np.mean(seg.astype(np.float64) ** 2)))
-        self._pending = (corr, instant, locked)
         if gain is None:
             # Nothing learned yet. Using the instantaneous fit for this one
             # frame is the least-wrong option; accept() will make it stick.
             gain = instant
         residual = mic - gain * seg
-        return float(np.sqrt(np.mean(residual.astype(np.float64) ** 2)))
+        res_rms = float(np.sqrt(np.mean(residual.astype(np.float64) ** 2)))
+        # Carry what cancelling this frame achieved, so accept() can ask
+        # whether the echo path is real rather than only whether something
+        # correlated.
+        self._pending = (corr, instant, locked, frame_rms(frame), res_rms)
+        return res_rms
 
     def accept(self) -> None:
         """Fold the last measured frame into the echo model.
@@ -434,7 +479,10 @@ class EchoCanceller:
         pending = self._pending
         if pending is None:
             return
-        corr, instant, lag = pending
+        corr, instant, lag, mic_rms, res_rms = pending
+        # Did subtracting the reference make this frame quieter, and by enough
+        # to mean anything?
+        cancelled = mic_rms > 1.0 and res_rms <= mic_rms * self.CONFIRM_CANCEL_RATIO
         with self._lock:
             if self._gain is None:
                 self._gain = instant
@@ -444,13 +492,16 @@ class EchoCanceller:
                          else 0.0)
                 self._gain = (1.0 - alpha) * self._gain + alpha * instant
             if abs(corr) >= self.LOCK_QUALITY:
+                # Good enough to go on cancelling at this offset...
                 self._locked_lag = lag
+            if abs(corr) >= self.CONFIRM_CORR and cancelled:
+                # ...but the path is only real if cancelling it works.
                 self._unconfirmed = 0
             else:
                 # NOVA was audible on this frame and the reference still did
                 # not explain it. A few of those are ordinary; a run of them
-                # means whatever was locked onto is no longer the echo path,
-                # and going on claiming one is how she ends up judging her own
+                # means whatever is locked onto is not the echo path, and
+                # going on claiming one is how she ends up judging her own
                 # voice by a ratio that assumes it has been cancelled.
                 self._unconfirmed += 1
                 if self._unconfirmed > self.LOCK_STALE_FRAMES:

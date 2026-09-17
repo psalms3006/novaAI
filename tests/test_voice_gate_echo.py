@@ -433,7 +433,7 @@ class LockStalenessTests(unittest.TestCase):
         ec._unconfirmed = 0
         ec._gain = 0.2
         for _ in range(EchoCanceller.LOCK_STALE_FRAMES - 1):
-            ec._pending = (0.05, 0.2, 100)
+            ec._pending = (0.05, 0.2, 100, 1000.0, 990.0)   # nothing cancelled
             ec.accept()
         self.assertTrue(ec.converged, "gave up on the path far too readily")
 
@@ -441,13 +441,13 @@ class LockStalenessTests(unittest.TestCase):
         ec = EchoCanceller(frame=FRAME)
         ec._locked_lag, ec._gain = 100, 0.2
         for _ in range(EchoCanceller.LOCK_STALE_FRAMES - 1):
-            ec._pending = (0.05, 0.2, 100)
+            ec._pending = (0.05, 0.2, 100, 1000.0, 990.0)   # nothing cancelled
             ec.accept()
-        ec._pending = (0.9, 0.2, 100)        # one clean echo frame
+        ec._pending = (0.9, 0.2, 100, 1000.0, 200.0)   # one clean echo frame
         ec.accept()
         self.assertEqual(ec._unconfirmed, 0)
         for _ in range(EchoCanceller.LOCK_STALE_FRAMES - 1):
-            ec._pending = (0.05, 0.2, 100)
+            ec._pending = (0.05, 0.2, 100, 1000.0, 990.0)   # nothing cancelled
             ec.accept()
         self.assertTrue(ec.converged, "the renewal did not reset the count")
 
@@ -469,3 +469,66 @@ class LockStalenessTests(unittest.TestCase):
         ec.reset()
         self.assertEqual(ec._unconfirmed, 0)
         self.assertFalse(ec.converged)
+
+    def test_a_run_of_middling_correlations_does_not_keep_a_path_alive(self):
+        """The failure this threshold exists for.
+
+        The search runs over roughly 9600 offsets, and the best of that many
+        correlations of a signal as self-similar as speech clears 0.30 by
+        chance regularly. So a machine with no echo path at all was having its
+        lock renewed by spurious matches faster than staleness could retire
+        it: every interruption in a long-talk session was granted an echo
+        path, at correlations of -0.22, 0.17, -0.21 and -0.13.
+
+        Cancelling at that offset is still worth attempting. Claiming the path
+        is real — which buys the two-frame barge-in and the leak-ratio test —
+        is not.
+        """
+        ec = EchoCanceller(frame=FRAME)
+        ec._locked_lag, ec._gain, ec._unconfirmed = 100, 0.2, 0
+        for corr in ([0.33, -0.31, 0.32, -0.34]
+                     * (EchoCanceller.LOCK_STALE_FRAMES // 2)):
+            ec._pending = (corr, 0.2, 100, 1000.0, 900.0)
+            ec.accept()
+        self.assertFalse(ec.converged,
+                         "a lock kept alive by coincidence still grants the "
+                         "two-frame fast path")
+
+    def test_clean_echo_confirms_the_path(self):
+        """The other side of the same threshold: real echo must still qualify,
+        or NOVA needs a full second of speech to be interrupted on a machine
+        where cancellation works perfectly well."""
+        ec = EchoCanceller(frame=FRAME)
+        ec._locked_lag, ec._gain, ec._unconfirmed = 100, 0.2, 0
+        for _ in range(EchoCanceller.LOCK_STALE_FRAMES * 3):
+            ec._pending = (0.83, 0.2, 100, 1000.0, 300.0)   # the measured median for echo
+            ec.accept()
+        self.assertTrue(ec.converged)
+
+    def test_a_filter_that_removes_nothing_is_not_an_echo_path(self):
+        """Correlation alone could not settle this.
+
+        Raising the confirmation bar to 0.55 cut the spurious locks down but
+        did not end them: over hundreds of frames the best of ~9600 offsets
+        clears any fixed correlation sometimes, and one lucky frame renewed
+        the lock. So the confirming test is the property the downstream branch
+        actually assumes — that cancelling works. Measured here, the filter's
+        gain had decayed to 0.06 and the "cancelled" residual was no smaller
+        than the microphone.
+        """
+        ec = EchoCanceller(frame=FRAME)
+        ec._locked_lag, ec._gain, ec._unconfirmed = 100, 0.2, 0
+        for _ in range(EchoCanceller.LOCK_STALE_FRAMES + 4):
+            # Beautifully correlated, and subtracting it achieves nothing.
+            ec._pending = (0.95, 0.2, 100, 1000.0, 1000.0)
+            ec.accept()
+        self.assertFalse(ec.converged,
+                         "claiming an echo path the filter cannot cancel")
+
+    def test_cancellation_that_works_confirms_the_path(self):
+        ec = EchoCanceller(frame=FRAME)
+        ec._locked_lag, ec._gain, ec._unconfirmed = 100, 0.2, 0
+        for _ in range(EchoCanceller.LOCK_STALE_FRAMES * 3):
+            ec._pending = (0.83, 0.2, 100, 1000.0, 400.0)   # 8 dB removed
+            ec.accept()
+        self.assertTrue(ec.converged)
