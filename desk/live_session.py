@@ -404,6 +404,135 @@ def _voice_language() -> str:
     return os.getenv("NOVA_VOICE_LANGUAGE", "").strip() or "en-US"
 
 
+def _preferred_host_api() -> int | None:
+    """Index of the host API NOVA should open audio through, or None.
+
+    PortAudio lists the same speaker several times, once per Windows audio
+    API, and `sounddevice` defaults to whichever PortAudio calls first --
+    which on Windows is MME, the oldest and worst of them. Measured on this
+    machine, the same Realtek speaker:
+
+        MME              90 ms minimum latency
+        Windows WASAPI    3 ms
+
+    MME is a compatibility shim over the modern stack. It buffers coarsely,
+    which is heard as crackling, and it does not report a device disappearing
+    in any useful way -- when headphones were unplugged mid-sentence it
+    returned "there is no driver installed on your system", a message about
+    nothing that is actually true.
+
+    WASAPI is what Windows itself uses. Preferred where present; everything
+    falls back to PortAudio's own default otherwise, because a worse audio
+    API is still enormously better than no audio.
+    """
+    try:
+        import sounddevice as _sd
+        for i, api in enumerate(_sd.query_hostapis()):
+            if "wasapi" in str(api.get("name", "")).lower():
+                return i
+    except Exception:
+        pass
+    return None
+
+
+def _same_device_on(host_api: int, device_index: int | None, output: bool):
+    """The given device as exposed by `host_api`, matched by name.
+
+    Returns None when there is no equivalent, so the caller keeps whatever it
+    already had rather than opening something that is not the user's speaker.
+    """
+    if host_api is None:
+        return None
+    key = "max_output_channels" if output else "max_input_channels"
+    try:
+        import sounddevice as _sd
+        devices = _sd.query_devices()
+        if device_index is None:
+            device_index = _sd.default.device[1 if output else 0]
+        if device_index is None or device_index < 0:
+            return None
+        want = str(devices[device_index].get("name", "")).strip().lower()
+        if not want:
+            return None
+        for i, d in enumerate(devices):
+            if (d.get("hostapi") == host_api and d.get(key, 0) > 0
+                    and str(d.get("name", "")).strip().lower().startswith(want[:28])):
+                return i
+    except Exception:
+        pass
+    return None
+
+
+def _wasapi_settings(device):
+    """WASAPI options for `device`, or None if it is not a WASAPI device.
+
+    `auto_convert` is the whole reason this exists. WASAPI shared mode only
+    accepts the device's own mix format, and this machine's speaker runs at
+    48 kHz while Gemini Live returns 24 kHz — so opening it plainly fails with
+    "Invalid sample rate", which is exactly why audio had been coming out
+    through MME instead. The flag turns on the resampler Windows already has.
+
+    Measured on this machine, same speaker, writing Gemini-sized chunks:
+
+        MME                       504 ms buffer, worst write 92 ms
+        WASAPI + auto_convert     510 ms buffer, worst write 64 ms
+    """
+    try:
+        import sounddevice as _sd
+        api = _preferred_host_api()
+        if api is None or device is None:
+            return None
+        if _sd.query_devices(device)["hostapi"] != api:
+            return None
+        return _sd.WasapiSettings(auto_convert=True)
+    except Exception:
+        return None
+
+
+def _speaker_device():
+    """Which output device to play through, resolved fresh every time.
+
+    Fresh, because this is also the reconnect path: when a device disappears
+    the answer to "which speaker now" has changed, and a cached index is the
+    stale one that just died.
+    """
+    want = ""
+    try:
+        from desk import settings as _s
+        want = str(_s.get("speaker_device", "") or "").strip()
+    except Exception:
+        pass
+    want = want or os.getenv("NOVA_SPEAKER_DEVICE", "").strip()
+    chosen = None
+    if want:
+        if want.isdigit():
+            chosen = int(want)
+        else:
+            try:
+                import sounddevice as _sd
+                for i, d in enumerate(_sd.query_devices()):
+                    if (d.get("max_output_channels", 0) > 0
+                            and want.lower() in str(d.get("name", "")).lower()):
+                        chosen = i
+                        break
+            except Exception as e:
+                _log("[LIVE] could not resolve speaker_device %r: %s", want, e)
+    upgraded = _same_device_on(_preferred_host_api(), chosen, output=True)
+    return upgraded if upgraded is not None else chosen
+
+
+def _device_label(device, output: bool) -> str:
+    if device is None:
+        return "system default"
+    try:
+        import sounddevice as _sd
+        d = _sd.query_devices(device)
+        api = _sd.query_hostapis(d["hostapi"])["name"]
+        return f"{d['name']} via {api}"
+    except Exception:
+        return str(device)
+
+
 def _mic_device():
     """Which input device to listen on, or None for the system default.
 
@@ -436,6 +565,13 @@ def _mic_device():
         _log("[LIVE] could not resolve mic_device %r: %s", want, e)
     _log("[LIVE] mic_device %r matched nothing; using the system default", want)
     return None
+
+
+def _mic_device_resolved():
+    """_mic_device, moved onto the better host API where one exists."""
+    chosen = _mic_device()
+    upgraded = _same_device_on(_preferred_host_api(), chosen, output=False)
+    return upgraded if upgraded is not None else chosen
 
 
 def _mic_device_name(device) -> str:
@@ -571,6 +707,8 @@ class LiveManager:
         self._stream: Any = None
         self._stream_lock = threading.Lock()
         self._playing_until = 0.0
+        #: Consecutive failed writes that forced the device to be reopened.
+        self._speaker_reopens = 0
         # Bumped whenever playback is cut. The pre-roll lives inside the
         # speaker thread, so draining _play_q alone would leave held audio to
         # play after an interruption -- exactly the "speaks a fragment of the
@@ -809,6 +947,42 @@ class LiveManager:
 
     # ── playback (Core-owned) ─────────────────────────────────────────────
 
+    def _open_output_stream(self):
+        """Open the speaker on whatever device is current, and say which.
+
+        Tries the better host API first and falls back to PortAudio's own
+        default. The fallback is not decoration: a worse audio API is still
+        enormously better than no audio, and this runs on the reconnect path
+        where the device landscape has just changed underfoot.
+        """
+        attempts = []
+        device = _speaker_device()
+        if device is not None:
+            attempts.append((device, _wasapi_settings(device)))
+        attempts.append((None, None))           # PortAudio's default, as before
+
+        last = None
+        for dev, extra in attempts:
+            try:
+                stream = sd.RawOutputStream(
+                    samplerate=nova_voice.RECEIVE_RATE,
+                    channels=nova_voice.CHANNELS,
+                    dtype="int16",
+                    blocksize=0,
+                    latency=OUTPUT_LATENCY_S,
+                    device=dev,
+                    extra_settings=extra,
+                )
+                stream.start()
+                _log("[LIVE] speaker open on %s (%.0f ms buffer)",
+                     _device_label(dev, True), (stream.latency or 0) * 1000)
+                return stream
+            except Exception as e:
+                last = e
+                _log("[LIVE] could not open speaker on %s: %s",
+                     _device_label(dev, True), e)
+        raise last if last else RuntimeError("no output device")
+
     def _start_playback(self) -> None:
         """Open the speaker, then start draining the queue into it.
 
@@ -832,6 +1006,7 @@ class LiveManager:
                  "stopping it before opening the device")
             self._stop_playback()
         self._play_stop.clear()
+        self._speaker_reopens = 0
         try:
             # A deliberately deep output buffer. This is the cracking.
             #
@@ -851,14 +1026,7 @@ class LiveManager:
             # the user cannot perceive at the start of a turn — and barge-in
             # discards the buffer outright with abort(), so a deeper buffer
             # costs nothing when she is interrupted.
-            stream = sd.RawOutputStream(
-                samplerate=nova_voice.RECEIVE_RATE,
-                channels=nova_voice.CHANNELS,
-                dtype="int16",
-                blocksize=0,
-                latency=OUTPUT_LATENCY_S,
-            )
-            stream.start()
+            stream = self._open_output_stream()
             self._stream = stream
         except Exception as e:
             _log("[LIVE] speaker open failed: %s", e)
@@ -887,6 +1055,12 @@ class LiveManager:
             need = int(nova_voice.RECEIVE_RATE * PREROLL_MS / 1000) * 2
             primed = False
             generation = self._play_generation
+            # `stream` is rebound when a lost device is reopened, and both
+            # this function and emit() below have to see the new one. Without
+            # the declaration the assignment makes it a local of _worker and
+            # every earlier read of it — including the one inside emit —
+            # becomes an unbound local.
+            nonlocal stream
 
             def emit(chunk: bytes) -> None:
                 # Tell the gate what the room is about to hear, at the moment
@@ -922,12 +1096,21 @@ class LiveManager:
                         # short: play what there is rather than waiting for a
                         # cushion that will never fill.
                         if preroll and not primed:
+                            drained_ok = True
                             for held in preroll:
                                 try:
                                     emit(held)
-                                except Exception:
+                                except Exception as e:
+                                    # Same device-loss handling as the main
+                                    # write path: this branch plays out a
+                                    # short turn, and a device that died
+                                    # during it is no less dead.
+                                    drained_ok = self._reopen_output(stream, e)
                                     break
-                            preroll.clear(); preroll_bytes = 0; primed = True
+                            preroll.clear(); preroll_bytes = 0
+                            primed = drained_ok
+                            if not drained_ok:
+                                break
                         # Queue drained, the model finished its turn, and the
                         # sound device has actually played it all out. Only
                         # then has NOVA stopped talking.
@@ -968,7 +1151,26 @@ class LiveManager:
                         else:
                             emit(chunk)
                     except Exception as e:
-                        _log("[LIVE] speaker write failed: %s", e)
+                        # The device went away. Reopen it; do not keep
+                        # writing to a corpse.
+                        #
+                        # Unplugging headphones mid-sentence destroys the
+                        # stream, and every write after that failed with
+                        # "there is no driver installed on your system" --
+                        # logged, ignored, and retried forever. NOVA was
+                        # silent from that moment until the app was
+                        # restarted, including for typed messages, because
+                        # the audio for those went to the same dead device.
+                        #
+                        # Worse, `speaking` stays set while audio is still
+                        # arriving, and `speaking` mutes the microphone. So a
+                        # speaker that died also stopped her hearing anything
+                        # -- which is exactly how it was reported: "I removed
+                        # the headphones and then nothing at all."
+                        if not self._reopen_output(stream, e):
+                            break
+                        stream = self._stream
+                        preroll.clear(); preroll_bytes = 0; primed = False
             finally:
                 self._speaker_alive = False
                 self._gate.set_speaking(False)
@@ -984,6 +1186,59 @@ class LiveManager:
         self._play_thread = threading.Thread(target=_worker, name="nova-speaker",
                                              daemon=True)
         self._play_thread.start()
+        return True
+
+    #: Consecutive device reopens before NOVA stops trying.
+    #:
+    #: A device that has genuinely gone (the only sound card removed) must not
+    #: spin forever; a device that is merely changing (headphones out, Bluetooth
+    #: connecting, Windows switching default) needs more than one attempt,
+    #: because the new default is not always ready the instant the old one dies.
+    MAX_SPEAKER_REOPENS = 5
+
+    def _reopen_output(self, dead, err: Exception) -> bool:
+        """Swap a dead output stream for a live one. False if we give up."""
+        self._speaker_reopens += 1
+        _log("[LIVE] speaker write failed (%s); reopening (attempt %d/%d)",
+             err, self._speaker_reopens, self.MAX_SPEAKER_REOPENS)
+        with self._stream_lock:
+            try:
+                dead.abort(); dead.close()
+            except Exception:
+                pass
+            self._stream = None
+        self._playing_until = 0.0
+        # Whatever was mid-flight belonged to a device that no longer exists.
+        # Let the mic back in immediately rather than after the watchdog:
+        # `speaking` mutes it, and a broken speaker must never make NOVA deaf.
+        self._gate.set_speaking(False, interrupted=True)
+        nova_voice.drain(self._play_q)
+
+        if self._speaker_reopens > self.MAX_SPEAKER_REOPENS:
+            _log("[LIVE] giving up on the speaker after %d attempts",
+                 self._speaker_reopens)
+            self._speaker_alive = False
+            self._publish(LiveEvent(
+                "error", error="speaker_lost",
+                message=("NOVA lost your audio output device and could not "
+                         "reopen it. Check your speakers or headphones, then "
+                         "restart voice.")))
+            self._publish(LiveEvent("state", state="error",
+                                    error="speaker_lost", fatal="audio"))
+            return False
+
+        # Windows needs a moment to settle on a new default after a device
+        # is removed; asking immediately reliably returns the old one.
+        time.sleep(0.4)
+        try:
+            self._stream = self._open_output_stream()
+        except Exception as e2:
+            _log("[LIVE] could not reopen the speaker: %s", e2)
+            self._speaker_alive = False
+            return False
+        self._speaker_alive = True
+        self._publish(LiveEvent("speaker_changed",
+                                device=_device_label(_speaker_device(), True)))
         return True
 
     def _playback_drained(self) -> bool:
@@ -1233,17 +1488,44 @@ class LiveManager:
             except RuntimeError:
                 pass            # loop shutting down
 
+        # None is a *device*, not a failure — it means "the system default",
+        # and it is the fallback that matters most. An earlier version used it
+        # as the "nothing opened" sentinel, so a successful fallback open was
+        # read as a failure and the first attempt's error was raised over the
+        # top of a working microphone.
+        got = False
+        last_err = None
+        attempts = []
+        _resolved = _mic_device_resolved()
+        if _resolved is not None:
+            attempts.append((_resolved, _wasapi_settings(_resolved)))
+        attempts.append((_mic_device(), None))      # what it used to do
+        opened = None
         try:
-            device = _mic_device()
-            self._mic_stream = sd.InputStream(
-                samplerate=MIC_RATE, channels=1, dtype="int16",
-                blocksize=MIC_BLOCK, callback=_cb, device=device,
-            )
-            self._mic_stream.start()
+            for dev, extra in attempts:
+                try:
+                    self._mic_stream = sd.InputStream(
+                        samplerate=MIC_RATE, channels=1, dtype="int16",
+                        blocksize=MIC_BLOCK, callback=_cb, device=dev,
+                        extra_settings=extra,
+                    )
+                    self._mic_stream.start()
+                    opened, got = dev, True
+                    break
+                except Exception as e:
+                    last_err = e
+                    # Not a fault worth alarming about on its own: WASAPI
+                    # input is refused outright by some drivers (this one
+                    # answers with a WDM-KS ioctl error), and the next
+                    # attempt is the one that has always worked.
+                    _log("[LIVE] mic not available on %s: %s",
+                         _device_label(dev, False), e)
+            if not got:
+                raise last_err if last_err else RuntimeError("no input device")
             self._mic_active = True
             self._mic_dropped = 0
             _log("[LIVE] mic opened (%s, 16 kHz mono, %d-frame blocks, "
-                 "%.1fs queue)", _mic_device_name(device), MIC_BLOCK,
+                 "%.1fs queue)", _device_label(opened, False), MIC_BLOCK,
                  MIC_QUEUE_FRAMES * MIC_BLOCK / MIC_RATE)
         except Exception as e:
             # Same reasoning as above: a device that is missing, busy or
