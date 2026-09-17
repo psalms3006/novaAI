@@ -354,3 +354,118 @@ class MuteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class LockStalenessTests(unittest.TestCase):
+    """A lock has to keep being true, not merely have been true once.
+
+    `converged` gates the whole detector: claiming an echo path drops the
+    evidence a barge-in needs from sixteen frames to two, and switches the
+    test to a leak ratio that only means anything if the cancellation is
+    real. So a lock that has stopped tracking is worse than no lock at all —
+    it is the conservative policy switched off for nothing.
+
+    Observed in a live conversation on a machine whose microphone driver does
+    its own echo suppression, leaving nothing coherent to align to: the
+    canceller caught one spurious correlation early on, then reported an echo
+    path for the rest of the session at correlations of 0.10-0.14 with a
+    residual *larger* than the reference. Three of five interruptions in that
+    conversation were NOVA stopping for her own voice.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        nova, rate = _read(NOVA_WAV)
+        cls.nova24, cls.rate = nova, rate
+        cls.nova16 = _to_16k(nova, rate)
+
+    def _play(self, ec, room, frames, start=0, seed=11):
+        """Play NOVA through `room` (or through nowhere) for `frames` frames.
+
+        The fixture is a few seconds long and these tests need more speech
+        than that, so it repeats. NOVA talking for longer than one recording
+        is the ordinary case, not a contrivance.
+        """
+        rng = np.random.default_rng(seed)
+        avail = len(self.nova16) // FRAME - 1
+        for n in range(start, start + frames):
+            i = n % avail
+            lo = i * FRAME * self.rate // 16000
+            hi = (i + 1) * FRAME * self.rate // 16000
+            ec.reference(self.nova24[lo:hi].tobytes(), self.rate)
+            mic = rng.normal(0, 40, FRAME)
+            if room is not None:
+                mic += room.echo_of(self.nova16, (i + 1) * FRAME, FRAME)
+            frame = np.clip(mic, -32768, 32767).astype(np.int16)
+            ec.residual_rms(frame)
+            ec.accept()
+        return ec
+
+    def test_a_real_echo_path_keeps_its_lock(self):
+        """The case that must not regress: a coupled room stays coupled."""
+        ec = self._play(EchoCanceller(frame=FRAME), Room(0.25), 200)
+        self.assertTrue(ec.converged,
+                        "a genuinely echoing room lost its lock, so NOVA now "
+                        "needs a full second of speech to be interrupted")
+
+    def test_a_path_that_stops_explaining_the_microphone_is_given_up(self):
+        """The observed failure, reproduced: lock on a real echo, then take
+        the echo away and keep playing.
+
+        That is what a driver enabling its own echo suppression mid-session
+        looks like from here, and what this machine looks like from the
+        start — audible playback, nothing coherent coming back. The lock has
+        to be surrendered, or barge-in stays on the two-frame fast path and
+        NOVA stops for her own voice.
+        """
+        ec = self._play(EchoCanceller(frame=FRAME), Room(0.25), 60)
+        self.assertTrue(ec.converged, "never locked, so the test proves nothing")
+
+        self._play(ec, None, EchoCanceller.LOCK_STALE_FRAMES + 40, start=60)
+        self.assertFalse(ec.converged,
+                         "still claiming an echo path after the echo stopped")
+
+    def test_a_lock_is_not_dropped_at_the_first_bad_frame(self):
+        """Real rooms have frames the filter cannot explain. A handful of them
+        is ordinary; only a sustained run means the path is gone."""
+        ec = EchoCanceller(frame=FRAME)
+        ec._locked_lag = 100          # pretend a lock was made
+        ec._unconfirmed = 0
+        ec._gain = 0.2
+        for _ in range(EchoCanceller.LOCK_STALE_FRAMES - 1):
+            ec._pending = (0.05, 0.2, 100)
+            ec.accept()
+        self.assertTrue(ec.converged, "gave up on the path far too readily")
+
+    def test_a_good_frame_renews_the_lock(self):
+        ec = EchoCanceller(frame=FRAME)
+        ec._locked_lag, ec._gain = 100, 0.2
+        for _ in range(EchoCanceller.LOCK_STALE_FRAMES - 1):
+            ec._pending = (0.05, 0.2, 100)
+            ec.accept()
+        ec._pending = (0.9, 0.2, 100)        # one clean echo frame
+        ec.accept()
+        self.assertEqual(ec._unconfirmed, 0)
+        for _ in range(EchoCanceller.LOCK_STALE_FRAMES - 1):
+            ec._pending = (0.05, 0.2, 100)
+            ec.accept()
+        self.assertTrue(ec.converged, "the renewal did not reset the count")
+
+    def test_silence_never_costs_a_lock(self):
+        """A silent reference says nothing about the echo path. Counting the
+        pauses in NOVA's own speech against it would unlock her mid-sentence."""
+        ec = EchoCanceller(frame=FRAME)
+        ec._locked_lag, ec._gain, ec._unconfirmed = 100, 0.2, 0
+        for _ in range(EchoCanceller.LOCK_STALE_FRAMES * 4):
+            ec._pending = None            # nothing was playing: accept() no-ops
+            ec.accept()
+        self.assertTrue(ec.converged)
+
+    def test_a_reset_forgets_the_staleness_too(self):
+        """Sessions must start with no opinion about the room, in either
+        direction."""
+        ec = EchoCanceller(frame=FRAME)
+        ec._locked_lag, ec._gain, ec._unconfirmed = 100, 0.2, 999
+        ec.reset()
+        self.assertEqual(ec._unconfirmed, 0)
+        self.assertFalse(ec.converged)

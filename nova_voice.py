@@ -249,6 +249,33 @@ class EchoCanceller:
     #: it we re-search, because the device buffer has moved.
     LOCK_QUALITY = 0.30
 
+    #: Frames of *audible playback* the lock may go unconfirmed before we stop
+    #: claiming there is an echo path at all.
+    #:
+    #: A lock used to be permanent: one frame correlating at 0.30 set the lag,
+    #: and `converged` answered True for the rest of the session however badly
+    #: the filter tracked afterwards. That is not a small inaccuracy, because
+    #: everything downstream branches on it — claiming a path drops the
+    #: evidence required for a barge-in from sixteen frames to two, and
+    #: switches the test to a leak ratio that only means anything if the
+    #: cancellation is real.
+    #:
+    #: Measured on this machine, whose microphone driver does its own echo
+    #: suppression and leaves nothing coherent to lock onto: the canceller
+    #: caught one spurious correlation early in the session and then reported
+    #: an echo path for the rest of it at correlations of 0.10-0.14 and a
+    #: residual *larger* than the reference — a filter adding energy rather
+    #: than removing it. Three of five interruptions in one conversation were
+    #: NOVA stopping for her own voice, each on the two-frame fast path.
+    #:
+    #: Only frames where NOVA was actually audible count, because a silent
+    #: reference says nothing about the path. Thirty-two of them is about two
+    #: seconds of continuous speech — far longer than a real echo path ever
+    #: goes unconfirmed, since pure echo frames correlate at a median of 0.83,
+    #: and short enough that a machine which cannot cancel falls back to the
+    #: conservative policy within one sentence.
+    LOCK_STALE_FRAMES = 32
+
     #: How fast the coupling estimate follows the instantaneous fit, chosen by
     #: how well the reference explains the frame.
     #:
@@ -278,6 +305,8 @@ class EchoCanceller:
         self._lock = threading.Lock()
         self._ref = np.zeros(0, dtype=np.float32)
         self._locked_lag: int | None = None
+        #: Frames of audible playback since the lag was last confirmed.
+        self._unconfirmed = 0
         self._gain: float | None = None
         self._pending: tuple | None = None
         self._last_ref_at = 0.0
@@ -309,6 +338,7 @@ class EchoCanceller:
         with self._lock:
             self._ref = np.zeros(0, dtype=np.float32)
             self._locked_lag = None
+            self._unconfirmed = 0
             self._gain = None
             self._pending = None
             self._last_ref_at = 0.0
@@ -415,14 +445,28 @@ class EchoCanceller:
                 self._gain = (1.0 - alpha) * self._gain + alpha * instant
             if abs(corr) >= self.LOCK_QUALITY:
                 self._locked_lag = lag
+                self._unconfirmed = 0
+            else:
+                # NOVA was audible on this frame and the reference still did
+                # not explain it. A few of those are ordinary; a run of them
+                # means whatever was locked onto is no longer the echo path,
+                # and going on claiming one is how she ends up judging her own
+                # voice by a ratio that assumes it has been cancelled.
+                self._unconfirmed += 1
+                if self._unconfirmed > self.LOCK_STALE_FRAMES:
+                    self._locked_lag = None
         self._pending = None
 
     @property
     def converged(self) -> bool:
-        """Has the echo path been learned well enough to judge a frame by?
+        """Is there an echo path right now that a frame can be judged by?
 
-        Until this is true a loud frame proves nothing: the filter is not yet
-        cancelling, so NOVA's own voice is still sitting in the residual.
+        Not "was one ever found". Until this is true a loud frame proves
+        nothing — the filter is not cancelling, so NOVA's own voice is still
+        sitting in the residual — and that is equally true of a lock that has
+        stopped tracking as of one that never happened. Losing it puts NOVA
+        back on the conservative no-echo policy, which is the right place to
+        be on a machine where cancellation does not work.
         """
         with self._lock:
             return self._gain is not None and self._locked_lag is not None
@@ -462,7 +506,12 @@ class EchoCanceller:
             lag = self._locked_lag
         return {"echo_lag_ms": round(lag / self._rate * 1000, 1) if lag is not None else None,
                 "echo_corr": round(self.last_corr, 3),
-                "echo_gain": round(self.gain, 3)}
+                "echo_gain": round(self.gain, 3),
+                # How loud NOVA's own playback was for this frame. Without it
+                # the rest of these numbers cannot answer the one question
+                # that matters about an interruption — whether the sound that
+                # caused it was the user or NOVA herself.
+                "ref_rms": round(self.last_ref_rms, 1)}
 
 
 class VoiceGate:
@@ -542,6 +591,16 @@ class VoiceGate:
         self.last_leak_ratio = 0.0
         self.last_echo_path = False
         self.last_was_silence = False
+        #: What the detector was looking at on the frame it decided someone
+        #: was talking over NOVA, captured at the decision itself.
+        #:
+        #: Reading the gate's state afterwards does not answer this. By the
+        #: time a barge-in has been published, `set_speaking(False)` has
+        #: cleared the floors it was measured against, and the playback
+        #: thread — a different thread — may already have set speaking back
+        #: to True for the next chunk of a turn that has not stopped yet. A
+        #: snapshot taken then describes neither the decision nor the moment.
+        self.last_trigger: dict = {}
 
     # ── state ────────────────────────────────────────────────────────────
 
@@ -816,6 +875,22 @@ class VoiceGate:
             triggered = self._speech_runs >= needed
             if triggered:
                 self._speech_runs = 0
+                self.last_trigger = {
+                    # The deciding number. Playback loud here means the sound
+                    # that stopped NOVA was most likely NOVA; playback silent
+                    # means it came from the room.
+                    "ref_rms": round(self.echo.last_ref_rms, 1),
+                    "residual": round(residual, 1),
+                    "smoothed": round(smoothed, 1),
+                    "leak_ratio": round(ratio, 3) if has_echo else None,
+                    "leak_floor": round(floor, 3),
+                    "noise_floor": round(noise, 1),
+                    "echo_path": has_echo,
+                    "echo_gain": round(self.echo.gain, 3),
+                    "echo_corr": round(self.echo.last_corr, 3),
+                    "frames_speaking": frames,
+                    "frames_required": needed,
+                }
         return triggered
 
     def snapshot(self) -> dict:

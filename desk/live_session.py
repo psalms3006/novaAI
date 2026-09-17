@@ -1031,7 +1031,16 @@ class LiveManager:
              "the sound device", dropped, discarded_ms)
         self._publish(LiveEvent("playback_cancelled", queued_chunks=dropped,
                                 device_ms=discarded_ms))
-        self._publish(LiveEvent("interrupted", reason="barge_in"))
+        # Every interruption says what it was measured on.
+        #
+        # A barge-in and a false barge-in are the same event from outside —
+        # NOVA stops talking — and telling them apart afterwards is the
+        # difference between tuning the detector and guessing at it. The
+        # deciding number is ref_rms: playback loud at the moment of the cut
+        # means the sound was most likely NOVA's own, and playback silent
+        # means it was the room or the user.
+        self._publish(LiveEvent("interrupted", reason="barge_in",
+                                **self._gate.last_trigger))
         self._publish(LiveEvent("state", state="listening"))
 
     def _abort_playback(self) -> int:
