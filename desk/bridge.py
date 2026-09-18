@@ -1135,7 +1135,8 @@ def api_live_ws(ws):
                                              "screen_share", "screen_frame",
                                              "playback_complete",
                                              "vision_capture", "vision_captured",
-                                             "vision_sent", "vision_failed"):
+                                             "vision_sent", "vision_failed",
+                                             "vision_refused"):
                     # Forwarded so the ambient bar and the telemetry panel can
                     # follow the conversation without opening their own voice
                     # socket. One runtime, one event stream.
