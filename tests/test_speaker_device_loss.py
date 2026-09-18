@@ -185,3 +185,30 @@ def test_wasapi_input_failure_falls_back_rather_than_giving_up():
     assert "_mic_device()" in src, "there is no fallback attempt at all"
     assert src.index("_mic_device_resolved()") < src.index("attempts.append((_mic_device()"), (
         "the fallback is tried before the preferred device")
+
+
+# ── telling "we starved it" from "the device mangled it" ─────────────────────
+
+def test_starvation_is_counted_and_reported():
+    """"It crackles" has two halves and they need different fixes.
+
+    If the queue empties while the model is still sending, NOVA is starving
+    the device and the gap is hers. If this stays at zero and the user still
+    hears breakup, the audio left here intact and the fault is downstream —
+    the device, its driver, or a Bluetooth link. Without the number there is
+    no way to tell those apart except by guessing.
+    """
+    import inspect
+    src = inspect.getsource(ls.LiveManager._start_playback)
+    assert "self._starved" in src
+
+    status_src = inspect.getsource(ls.LiveManager.status)
+    assert "speaker_starved" in status_src
+
+
+def test_a_finished_turn_is_not_counted_as_starvation():
+    """The queue emptying at the end of a reply is the reply ending."""
+    import inspect
+    src = inspect.getsource(ls.LiveManager._start_playback)
+    guard = src.split("self._starved += 1")[0]
+    assert "not self._turn_done_flag" in guard.split("except queue.Empty:")[-1]

@@ -709,6 +709,10 @@ class LiveManager:
         self._playing_until = 0.0
         #: Consecutive failed writes that forced the device to be reopened.
         self._speaker_reopens = 0
+        #: Times the speaker ran dry while a turn was still in progress. The
+        #: audible half of this is crackling, and a zero here means the gap
+        #: was not introduced by NOVA.
+        self._starved = 0
         # Bumped whenever playback is cut. The pre-roll lives inside the
         # speaker thread, so draining _play_q alone would leave held audio to
         # play after an interruption -- exactly the "speaks a fragment of the
@@ -734,6 +738,8 @@ class LiveManager:
         #: When that started, so a flag left behind by a turn that never
         #: completed cannot lock the fast path out for the whole session.
         self._vision_busy_at = 0.0
+        #: When NOVA last looked at anything, for the repeat-call cooldown.
+        self._vision_last_at = 0.0
 
     # ── public API ────────────────────────────────────────────────────────
 
@@ -909,6 +915,10 @@ class LiveManager:
             # working microphone unless these are visible, and it is exactly
             # the shape of "she talks but cannot hear me".
             "mic": self._gate_stats(),
+            # Zero means NOVA handed the device a continuous stream. Anything
+            # else is her starving it, and is the half of "it crackles" that
+            # is hers to fix.
+            "speaker_starved": int(getattr(self, "_starved", 0)),
             "screen": self._screen.status(),
             "error": self._last_error,
         }
@@ -1007,6 +1017,7 @@ class LiveManager:
             self._stop_playback()
         self._play_stop.clear()
         self._speaker_reopens = 0
+        self._starved = 0
         try:
             # A deliberately deep output buffer. This is the cracking.
             #
@@ -1088,6 +1099,22 @@ class LiveManager:
                     try:
                         chunk = self._play_q.get(timeout=0.2)
                     except queue.Empty:
+                        # Ran out of audio while the model was still sending.
+                        #
+                        # This is the software half of "it crackles", and it is
+                        # worth separating from the other half. If the queue is
+                        # empty before the turn is finished, the device is
+                        # being starved by us — the network, or a stall on this
+                        # thread — and the gap is audible. If this counter
+                        # stays at zero and the user still hears breakup, the
+                        # audio left here intact and the fault is downstream:
+                        # the device, its driver, or a Bluetooth link.
+                        if primed and not self._turn_done_flag:
+                            self._starved += 1
+                            if self._starved in (1, 10, 50, 200):
+                                _log("[LIVE] speaker starved mid-turn "
+                                     "(%d time(s)) — audio is arriving slower "
+                                     "than it plays", self._starved)
                         if self._play_generation != generation:
                             generation = self._play_generation
                             preroll.clear(); preroll_bytes = 0; primed = False
@@ -1755,6 +1782,7 @@ class LiveManager:
                     # anything again until she is restarted.
                     self._vision_busy = False
                     self._vision_busy_at = 0.0
+                    self._vision_last_at = 0.0
                     self._gate.reset()
 
                     # Consumers before producers.
@@ -2242,8 +2270,31 @@ class LiveManager:
     #: conversation blocked behind it — which is the whole failure this
     #: routing exists to avoid. It was also the common case, because "read
     #: my screen" is how people ask.
-    _VISION_NEEDS_CORE = ("save", "detect_faces", "save_reference",
-                          "identify_user")
+    _VISION_NEEDS_CORE = ("save", "save_reference", "identify_user")
+
+    #: ...and these, but only when there is a face to look for.
+    #:
+    #: detect_faces used to send every call to Core unconditionally, and the
+    #: model sets it freely: "what is on my screen?" arrived with
+    #: detect_faces=True and went to a 10.7 s REST round trip to count faces
+    #: on a desktop. Counting faces in a screenshot is not a question anyone
+    #: asked. It is a camera operation, and only there is it worth the wait.
+    _VISION_CAMERA_ONLY = ("detect_faces",)
+
+    #: Shortest gap between two captures NOVA will honour.
+    #:
+    #: The model does not ask once. Observed in one session: twenty-plus
+    #: `vision` calls back to back, frequently two in a single tool_call
+    #: block, each Core-routed one costing 10.7 s — minutes of a conversation
+    #: spent photographing an unchanged screen. It had already been given an
+    #: answer and asked again anyway.
+    #:
+    #: Four seconds is the reference implementation's figure and it is a good
+    #: one: longer than any turn in which a second look could be meaningful,
+    #: short enough that a genuine follow-up ("now look again") is not
+    #: refused. Within it the model is told it already has the image, which
+    #: is both true and the thing that stops it asking a third time.
+    VISION_COOLDOWN_S = 4.0
 
     #: A capture that never reached the model must not lock the fast path out
     #: for the rest of the session. If the acknowledging turn never completes
@@ -2253,6 +2304,33 @@ class LiveManager:
 
     #: Where a frame can come from without leaving the conversation.
     _VISION_SOURCES = ("screen", "camera")
+
+    def _vision_too_soon(self, fc: Any) -> Any:
+        """Refuse a repeat look, or None to allow it.
+
+        Applied before routing, because the storm is not about which path a
+        call takes — it is about there being twenty of them. A refusal that
+        returns instantly is worth far more to the conversation than a
+        correct answer that arrives after four more captures.
+
+        The refusal says the image is already there, because it is: the model
+        was sent one seconds ago and is asking again rather than answering
+        from it.
+        """
+        now = time.monotonic()
+        since = now - self._vision_last_at
+        if self._vision_last_at and since < self.VISION_COOLDOWN_S:
+            _log("[LIVE] vision refused: asked again %.1fs after the last look",
+                 since)
+            self._publish(LiveEvent("vision_refused", since_s=round(since, 1)))
+            return gtypes.FunctionResponse(
+                id=fc.id, name=fc.name,
+                response={"output": (
+                    "You have already been sent an image of this, moments ago. "
+                    "Do NOT call vision again — answer the user's question from "
+                    "the image you already have.")})
+        self._vision_last_at = now
+        return None
 
     def _vision_in_session(self, args: dict) -> bool:
         """Can this 'vision' call be answered by showing the model a picture?
@@ -2267,6 +2345,9 @@ class LiveManager:
             why = f"angle={angle!r} is not something we can capture"
         elif any(args.get(k) for k in self._VISION_NEEDS_CORE):
             why = "needs " + ", ".join(k for k in self._VISION_NEEDS_CORE
+                                       if args.get(k))
+        elif angle == "camera" and any(args.get(k) for k in self._VISION_CAMERA_ONLY):
+            why = "needs " + ", ".join(k for k in self._VISION_CAMERA_ONLY
                                        if args.get(k))
         elif self._vision_busy:
             if time.monotonic() - self._vision_busy_at > self.VISION_BUSY_MAX_S:
@@ -2361,8 +2442,12 @@ class LiveManager:
         """
         name = fc.name
         args = dict(fc.args or {})
-        if name == "vision" and self._vision_in_session(args):
-            return await self._look(fc, args)
+        if name == "vision":
+            refusal = self._vision_too_soon(fc)
+            if refusal is not None:
+                return refusal
+            if self._vision_in_session(args):
+                return await self._look(fc, args)
         t0 = time.time()
         budget = VISION_TIMEOUT_S if name == "vision" else TOOL_TIMEOUT_S
         try:
