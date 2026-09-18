@@ -417,3 +417,68 @@ def test_the_acknowledgement_names_what_it_is_looking_through():
     finally:
         del ls.LiveManager._capture_for
     assert "camera" in resp.response["output"].lower()
+
+
+# ── the storm ────────────────────────────────────────────────────────────────
+
+class _FC:
+    def __init__(self, i="c1", **kw):
+        self.id = i
+        self.name = "vision"
+        self.args = kw
+
+
+def storm_session():
+    m = session()
+    m._vision_last_at = 0.0
+    return m
+
+
+def test_a_second_look_within_the_cooldown_is_refused_instantly():
+    """Twenty-plus vision calls back to back, each Core-routed one costing
+    10.7s, is minutes of conversation spent photographing an unchanged
+    screen. A refusal that returns at once is worth more than a correct
+    answer four captures later."""
+    m = storm_session()
+    assert m._vision_too_soon(_FC()) is None          # the first look is fine
+    refusal = m._vision_too_soon(_FC("c2"))
+    assert refusal is not None
+    assert "do not call vision again" in refusal.response["output"].lower()
+
+
+def test_the_refusal_says_the_image_is_already_there():
+    """Because it is. The model was sent one seconds ago and is asking again
+    instead of answering from it."""
+    m = storm_session()
+    m._vision_too_soon(_FC())
+    said = m._vision_too_soon(_FC("c2")).response["output"].lower()
+    assert "already been sent" in said
+
+
+def test_a_genuine_follow_up_after_the_cooldown_is_allowed():
+    m = storm_session()
+    m._vision_too_soon(_FC())
+    m._vision_last_at = time.monotonic() - ls.LiveManager.VISION_COOLDOWN_S - 0.1
+    assert m._vision_too_soon(_FC("c2")) is None
+
+
+def test_the_cooldown_applies_whichever_path_the_call_would_take():
+    """The storm is not about which path a call takes. It is about there
+    being twenty of them."""
+    import inspect
+    src = inspect.getsource(ls.LiveManager._run_tool)
+    assert src.index("_vision_too_soon") < src.index("_vision_in_session")
+
+
+def test_counting_faces_on_a_screenshot_does_not_go_to_core():
+    """detect_faces sent every call to Core, and the model sets it freely:
+    "what is on my screen?" arrived with detect_faces=True and bought a 10.7s
+    REST round trip to count faces on a desktop."""
+    assert session()._vision_in_session(
+        {"angle": "screen", "detect_faces": True, "question": "what is on my screen?"})
+
+
+def test_counting_faces_on_the_camera_still_goes_to_core():
+    """There it is the actual question, and Core runs the local model."""
+    assert not session()._vision_in_session(
+        {"angle": "camera", "detect_faces": True, "question": "how many people?"})

@@ -43,6 +43,13 @@ def quiet(n=CHUNK, amp=5):
 
 
 def gate(**kw):
+    """The full duplex policy — echo cancellation and automatic barge-in.
+
+    Asked for explicitly, because it is no longer the default: NOVA ships the
+    simple half-duplex policy while the basics are being made solid. This file
+    is the full policy's contract, so it pins the full policy.
+    """
+    kw.setdefault("simple", False)
     return VoiceGate(chunk_samples=CHUNK, **kw)
 
 
@@ -366,14 +373,14 @@ def test_terminal_playback_also_feeds_the_echo_canceller():
 # ── the two endings ──────────────────────────────────────────────────────────
 
 def test_an_interruption_does_not_arm_the_cooldown():
-    g = VoiceGate(chunk_samples=CHUNK)
+    g = VoiceGate(chunk_samples=CHUNK, simple=False)
     g.set_speaking(True)
     g.set_speaking(False, interrupted=True)
     assert g._last_speak_end == 0.0, "an interruption armed the cooldown"
 
 
 def test_a_natural_finish_arms_the_cooldown():
-    g = VoiceGate(chunk_samples=CHUNK)
+    g = VoiceGate(chunk_samples=CHUNK, simple=False)
     g.set_speaking(True)
     g.set_speaking(False)
     assert g._last_speak_end > 0.0, "a natural finish did not arm the cooldown"
@@ -405,7 +412,7 @@ def _talk_over(coupling, room_rms, with_user, seed=3):
     idx = (np.arange(int(len(nova24) * 16000 / rate)) * rate / 16000).astype(np.int64)
     nova16 = nova24[idx[idx < len(nova24)]]
 
-    g = VoiceGate(chunk_samples=CHUNK)
+    g = VoiceGate(chunk_samples=CHUNK, simple=False)
     g.set_speaking(True)
     fired = []
     g._on_barge_in = lambda: fired.append(1)

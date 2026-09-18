@@ -110,9 +110,14 @@ try:
     HAS_FAISS = True
 except ImportError:
     HAS_FAISS = False
-    # Not a degradation any more: memory_extra falls back to an exact numpy
-    # inner-product index, which is equivalent at a personal fact store's scale.
-    print("ℹ️  FAISS not installed — using the built-in numpy memory index.")
+    # Not a degradation, and the wording matters: this line reads as a
+    # missing dependency and was reported as one. FAISS is an approximate
+    # index for corpora far larger than a personal fact store; memory_extra
+    # falls back to an *exact* numpy inner-product search, which at ten or
+    # ten thousand facts is both equivalent and faster than the round trip
+    # FAISS would add. Nothing is missing and nothing is slower.
+    print("ℹ️  Memory index: numpy (exact). FAISS is optional and not needed "
+          "at this scale.")
 
 # SentenceTransformer imported lazily in _load_embedder_async (saves ~90s startup)
 HAS_SENTENCE_TRANSFORMERS = True   # will be set False if import fails at load time
@@ -2236,30 +2241,57 @@ def main() -> None:
 
         # Auto-detect and start Ollama if needed
         _local_runtime = LocalRuntimeManager(auto_start=True, auto_stop=True)
-        _local_runtime.detect()
         _have_cloud = bool(HAS_GEMINI and GEMINI_API_KEY)
-        if _local_runtime.state.name == "NOT_INSTALLED":
-            print("  Ollama............not installed (local AI unavailable)")
-        elif _have_cloud:
-            # Detected, deliberately not started. Ollama holds a model in
-            # memory for a fallback that mostly never comes, and on an 8 GB
-            # machine that is about a gigabyte taken from the machine NOVA is
-            # supposed to be helping with — enough, measured here, to run it
-            # out of memory entirely. OllamaProvider starts it the first time
-            # the fallback is actually wanted.
-            print("  Ollama............installed (starts if the cloud fails)")
+        if _have_cloud:
+            # Find out about Ollama in the background.
+            #
+            # detect() probes a service that, when there is a cloud key, NOVA
+            # has deliberately decided not to start — see below. Measured on
+            # this machine it costs 4.1 s, and it was spending them before the
+            # microphone was opened. Nothing in the startup path needs the
+            # answer: OllamaProvider starts the runtime itself the first time a
+            # fallback actually wants it. So the only thing those seconds
+            # bought was a line of text, printed four seconds before NOVA could
+            # hear anyone.
+            #
+            # Ollama holds a model in memory for a fallback that mostly never
+            # comes, and on an 8 GB machine that is about a gigabyte taken from
+            # the machine NOVA is supposed to be helping with — enough,
+            # measured here, to run it out of memory entirely.
+            print("  Ollama............checking in the background")
+
+            def _detect_ollama_later(rt=_local_runtime):
+                try:
+                    rt.detect()
+                    log.info("[RUNTIME] Ollama: %s (starts if the cloud fails)",
+                             rt.state.name)
+                except Exception as e:
+                    log.warning("[RUNTIME] Ollama detection failed: %s", e)
+
+            threading.Thread(target=_detect_ollama_later, name="nova-ollama-detect",
+                             daemon=True).start()
         else:
-            # No cloud key, so the local model *is* the brain. Warm it now
-            # rather than making the user wait through a cold start on their
-            # first question.
-            _local_runtime.ensure_running()
+            # No cloud key, so the local model *is* the brain. Find it and warm
+            # it now rather than making the user wait through a cold start on
+            # their first question — here the wait buys something.
+            _local_runtime.detect()
+            if _local_runtime.state.name == "NOT_INSTALLED":
+                print("  Ollama............not installed (local AI unavailable)")
+            else:
+                _local_runtime.ensure_running()
         atexit.register(_local_runtime.stop)
 
         # Store runtime as module attribute for status endpoint
         import nova as _nova_module
         _nova_module._local_runtime = _local_runtime
 
-        _ollama_model = get_model_manager().current_model
+        # The configured name, not the verified one, whenever the cloud can
+        # answer. Verifying means asking Ollama what it has installed, which
+        # is another 4.1 s probe of a service NOVA has decided not to start.
+        # OllamaProvider re-resolves when a fallback actually runs.
+        _mm = get_model_manager()
+        _ollama_model = (_mm.configured_model if (HAS_GEMINI and GEMINI_API_KEY)
+                         else _mm.current_model)
         _ollama_provider = OllamaProvider(model=_ollama_model)
         # Hand the provider the runtime so it can start Ollama the first time
         # a fallback actually needs it. Without this the deferred start above
@@ -2282,8 +2314,10 @@ def main() -> None:
         )
         _nova_router.set_online_preferred(not FORCE_OFFLINE)
         _t["IntelligenceRouter"] = time.time() - _ir0
-        _ollama_status = "ready" if _ollama_provider.is_running() else "not running"
-        print(f"  Router............{_t['IntelligenceRouter']:.2f}s  (ollama: {_ollama_status})")
+        # Deliberately not asking the provider whether Ollama is running: that
+        # is another probe of the same service, on the same startup path, for
+        # another line of text.
+        print(f"  Router............{_t['IntelligenceRouter']:.2f}s")
     except Exception as _router_error:
         _nova_router = None
         _connectivity = None
@@ -2397,7 +2431,17 @@ def main() -> None:
     print(f"  ⚡ NOVA startup complete in {_t_total:.2f}s")
     print(f"{'─'*44}")
 
-    nova = NOVALive(meta=meta)
+    # One voice session, whichever surface is in front of it.
+    #
+    # This used to be NOVALive, a second realtime implementation that only the
+    # terminal ran. It drifted from the one the desktop uses and kept the
+    # older behaviour -- no batching of microphone frames, so fifteen
+    # WebSocket messages a second and a send queue that could not keep up.
+    # Measured from a real session: 971 of 4000 microphone blocks thrown away
+    # before they were ever transmitted. Audio that is never sent cannot be
+    # understood, which is why the terminal was the worst place to talk to her.
+    from terminal_voice import TerminalVoice
+    nova = TerminalVoice(meta=meta)
 
     # Give planner + proactive agent a reference to NOVA's speak function
     nova_state._planner.set_speak(nova.speak)

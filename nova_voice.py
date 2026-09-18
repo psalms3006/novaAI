@@ -180,6 +180,35 @@ NO_ECHO_BARGE_IN_CHUNKS = 16
 #: decaying tail is not mistaken for the user starting a turn.
 SPEAK_COOLDOWN_S = 0.25
 
+
+def simple_voice_default() -> bool:
+    """Is NOVA running the plain half-duplex voice policy?
+
+    True by default, deliberately.
+
+    Everything the full policy adds — echo cancellation, automatic barge-in,
+    a learned room floor — sits inside the PortAudio input callback, and that
+    callback has a hard real-time budget. The correlation search alone scans
+    ~9600 offsets per frame. On this hardware the operating system was
+    dropping microphone blocks before NOVA ever saw them ("input overflow"),
+    and a quarter of what survived was discarded because the send queue could
+    not keep up behind it. Audio that is never transmitted cannot be
+    understood, which is why "NOVA cannot hear me" and "NOVA crackles" were
+    the same bug.
+
+    So the default is the simple thing that works: while NOVA speaks the
+    microphone is muted, and the rest of the time every frame goes straight
+    out untouched. That is what the shipped reference implementation does,
+    and it costs an interruption button instead of interrupting by voice.
+
+    Set NOVA_VOICE_FULL_DUPLEX=1 to get the full policy back. It is not
+    deleted and its tests still run against it; it is waiting for the basics
+    to be solid underneath it.
+    """
+    import os
+    flag = os.getenv("NOVA_VOICE_FULL_DUPLEX", "").strip().lower()
+    return flag not in ("1", "true", "yes", "on")
+
 SEND_RATE = 16000           # mic -> model
 RECEIVE_RATE = 24000        # model -> speaker
 CHANNELS = 1
@@ -591,7 +620,11 @@ class VoiceGate:
         barge_in_chunks: int = BARGE_IN_CHUNKS,
         cooldown_s: float = SPEAK_COOLDOWN_S,
         rate: int = SEND_RATE,
+        simple: Optional[bool] = None,
     ):
+        #: Half-duplex, with none of the per-frame analysis. See
+        #: :func:`simple_voice_default` for why this is the default.
+        self.simple = simple_voice_default() if simple is None else bool(simple)
         self._silence = bytes(chunk_samples * 2)      # int16 = 2 bytes/sample
         self._on_barge_in = on_barge_in
         self._floor = barge_in_floor
@@ -720,7 +753,14 @@ class VoiceGate:
             self._muted = bool(value)
 
     def reference(self, pcm: bytes, rate: int = RECEIVE_RATE) -> None:
-        """Tell the gate what was just handed to the speaker."""
+        """Tell the gate what was just handed to the speaker.
+
+        A no-op under the simple policy: nothing reads the buffer, and filling
+        it would mean resampling every chunk of NOVA's own speech on the
+        playback thread for the benefit of a canceller that is switched off.
+        """
+        if self.simple:
+            return
         self.echo.reference(pcm, rate)
 
     def reset(self) -> None:
@@ -744,6 +784,8 @@ class VoiceGate:
         written from the microphone callback and meant to be read there.
         """
         self._note_room(frame)
+        if self.simple:
+            return self._process_simple(frame)
         with self._lock:
             if self._muted:
                 # Explicit user mute: still send silence so the session stays
@@ -780,6 +822,26 @@ class VoiceGate:
         self.frames_muted += 1
         self.last_was_silence = True
         return self._silence
+
+    def _process_simple(self, frame: np.ndarray) -> bytes:
+        """Half-duplex: transmit unless NOVA is talking.
+
+        No correlation search, no residual, no learned floors — nothing that
+        costs measurable time inside a real-time audio callback. The cooldown
+        stays, because the speaker's tail is still decaying into the room for
+        a moment after she stops, and that tail transcribes as the user
+        speaking.
+        """
+        with self._lock:
+            if self._muted or self._speaking or (
+                    self._last_speak_end > 0.0
+                    and (time.time() - self._last_speak_end) < self._cooldown_s):
+                self.frames_muted += 1
+                self.last_was_silence = True
+                return self._silence
+        self.frames_sent += 1
+        self.last_was_silence = False
+        return frame.tobytes()
 
     def _note_room(self, frame: np.ndarray) -> None:
         """Record whether this frame sounds like an empty room.

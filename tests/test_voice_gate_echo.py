@@ -129,7 +129,7 @@ class EchoRejectionTests(unittest.TestCase):
         """
         for coupling in (0.05, 0.10, 0.15, 0.25, 0.40, 0.60):
             with self.subTest(coupling=coupling):
-                gate = VoiceGate(chunk_samples=FRAME)
+                gate = VoiceGate(chunk_samples=FRAME, simple=False)
                 at = self._run(gate, coupling)
                 self.assertIsNone(
                     at, f"NOVA interrupted herself {(at or 0) * FRAME_MS:.0f} ms "
@@ -163,7 +163,7 @@ class EchoRejectionTests(unittest.TestCase):
     def test_real_speech_interrupts(self):
         for coupling in (0.10, 0.15, 0.25, 0.40):
             with self.subTest(coupling=coupling):
-                gate = VoiceGate(chunk_samples=FRAME)
+                gate = VoiceGate(chunk_samples=FRAME, simple=False)
                 at = self._run(gate, coupling, user=self.user, user_at=1.0)
                 self.assertIsNotNone(
                     at, f"real speech did not interrupt at {coupling:.0%} "
@@ -175,7 +175,7 @@ class EchoRejectionTests(unittest.TestCase):
 
     def test_barge_in_reopens_the_microphone_immediately(self):
         """No cooldown after an interruption, or the user's words are eaten."""
-        gate = VoiceGate(chunk_samples=FRAME)
+        gate = VoiceGate(chunk_samples=FRAME, simple=False)
         at = self._run(gate, 0.15, user=self.user, user_at=1.0)
         self.assertIsNotNone(at)
         self.assertFalse(gate.speaking)
@@ -187,19 +187,19 @@ class EchoRejectionTests(unittest.TestCase):
 
     def test_silence_is_transmitted_never_withheld(self):
         """A gap in the stream is worse than silence: never return None."""
-        gate = VoiceGate(chunk_samples=FRAME)
+        gate = VoiceGate(chunk_samples=FRAME, simple=False)
         gate.set_speaking(True)
         out = gate.process(np.zeros(FRAME, dtype=np.int16))
         self.assertEqual(out, bytes(FRAME * 2))
 
     def test_listening_frames_pass_through_unchanged(self):
-        gate = VoiceGate(chunk_samples=FRAME)
+        gate = VoiceGate(chunk_samples=FRAME, simple=False)
         frame = (np.random.default_rng(0).normal(0, 3000, FRAME)).astype(np.int16)
         self.assertEqual(gate.process(frame), frame.tobytes())
 
     def test_transmitted_audio_is_never_the_cancelled_signal(self):
         """The AEC informs the decision only; the model hears the real mic."""
-        gate = VoiceGate(chunk_samples=FRAME)
+        gate = VoiceGate(chunk_samples=FRAME, simple=False)
         gate.reference(self.nova24[:4096].tobytes(), self.nova_rate)
         frame = (np.random.default_rng(0).normal(0, 3000, FRAME)).astype(np.int16)
         self.assertEqual(gate.process(frame), frame.tobytes())
@@ -336,7 +336,7 @@ class EchoCancellerTests(unittest.TestCase):
 class MuteTests(unittest.TestCase):
     def test_user_mute_sends_silence_and_never_barges_in(self):
         fired = []
-        gate = VoiceGate(chunk_samples=FRAME, on_barge_in=lambda: fired.append(1))
+        gate = VoiceGate(chunk_samples=FRAME, simple=False, on_barge_in=lambda: fired.append(1))
         gate.set_muted(True)
         gate.set_speaking(True)
         loud = (np.random.default_rng(0).normal(0, 9000, FRAME)).astype(np.int16)
@@ -345,7 +345,7 @@ class MuteTests(unittest.TestCase):
         self.assertEqual(fired, [])
 
     def test_cooldown_suppresses_the_speaker_tail(self):
-        gate = VoiceGate(chunk_samples=FRAME)
+        gate = VoiceGate(chunk_samples=FRAME, simple=False)
         gate.set_speaking(True)
         gate.set_speaking(False)                      # natural finish
         tail = (np.random.default_rng(0).normal(0, 2000, FRAME)).astype(np.int16)

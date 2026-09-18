@@ -162,7 +162,7 @@ class BargeInOnHeadphonesTests(unittest.TestCase):
     def _run(self, speech_amp=0.0, seconds=12.0, seed=7):
         rng = np.random.default_rng(seed)
         fired = []
-        gate = nv.VoiceGate(chunk_samples=1024, on_barge_in=lambda: fired.append(1))
+        gate = nv.VoiceGate(chunk_samples=1024, simple=False, on_barge_in=lambda: fired.append(1))
         gate.set_speaking(True)
         ref = (rng.normal(0, 2400, 1024)).astype(np.int16)
         # Room tone with occasional spikes, the shape measured on a real desk:
