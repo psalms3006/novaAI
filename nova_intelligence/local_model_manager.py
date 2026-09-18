@@ -207,6 +207,19 @@ class LocalModelManager:
     def current_model(self) -> str:
         return self._get_provider().model
 
+    @property
+    def configured_model(self) -> str:
+        """The model NOVA is set to use, without checking it is installed.
+
+        `current_model` asks Ollama what it actually has, which is the right
+        answer and costs a round trip to a service that may not be running —
+        measured at 4.1 s on this machine, spent during startup, before the
+        microphone was open. When the cloud is available Ollama is only ever
+        a fallback and is deliberately left stopped, so that check belongs at
+        the moment the fallback is first wanted, not at launch.
+        """
+        return self._configured_model()
+
     def get_status(self) -> dict:
         """Full status of local model infrastructure."""
         provider = self._get_provider()
