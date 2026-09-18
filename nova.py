@@ -1853,8 +1853,14 @@ def get_local_ip() -> str:
 #  NOVA LIVE — Gemini 2.5 Flash Native Audio
 # ══════════════════════════════════════════════════════════════════════════════
 
+# NOVALive is deliberately not imported.
+#
+# It is the second realtime implementation, and nothing may reach it: two
+# implementations of the same thing drift, and this pair did badly enough that
+# the terminal was unusable while the desktop was fine. The chat helpers below
+# are still wanted; the realtime loop is not. Importing the name at all would
+# leave a working way to start a second microphone.
 from live_extra import (
-    NOVALive,
     _call_gemini_chat,
     _trim_history,
 )

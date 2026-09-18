@@ -73,3 +73,23 @@ def test_only_the_session_module_opens_audio_now():
     if live:
         imported = live.group(1)
         assert "NOVALive" not in imported.split("#")[0] or "NOVALive(meta" not in nova
+
+
+def test_nothing_can_reach_the_second_realtime_implementation():
+    """Not merely unused — unreachable.
+
+    An import left in place is a working way to start a second microphone,
+    and the whole failure was that two implementations of one thing drifted
+    apart. live_extra keeps its Gemini chat helpers; its realtime loop must
+    have no route into it.
+    """
+    src = (ROOT / "nova.py").read_text(encoding="utf-8")
+    code = "\n".join(line for line in src.splitlines()
+                     if not line.lstrip().startswith("#"))
+    assert "NOVALive" not in code, "nova.py can still construct the old session"
+
+
+def test_the_chat_helpers_are_still_imported():
+    """The point is to retire one loop, not to break the module that holds it."""
+    src = (ROOT / "nova.py").read_text(encoding="utf-8")
+    assert "_call_gemini_chat" in src and "_trim_history" in src

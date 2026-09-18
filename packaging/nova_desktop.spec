@@ -31,6 +31,11 @@ hidden = [
     "nova_tls", "truststore", "truststore._api", "truststore._windows",
     # one shared voice model + Core-owned proactive speech
     "nova_voice", "nova_core_voice", "nova_heartbeat",
+    # The console surface over that same voice session. Imported inside a
+    # function in nova.py (so the desktop never pays for it), which means
+    # static analysis cannot see it and the packaged app would fail the
+    # moment anything reached the terminal path.
+    "terminal_voice",
     # account identity, cross-platform secret storage and telemetry. keyring
     # resolves its backend at runtime, so the platform backends have to be
     # named explicitly or the packaged app silently falls back to the file
