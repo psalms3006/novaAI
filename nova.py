@@ -982,11 +982,17 @@ TOOL_DECLARATIONS = [
             "document, report, letter, summary, spreadsheet or slide deck. "
             "You write the content; this turns it into an actual file on "
             "disk. Do not paste document content into the conversation and "
-            "call it done -- if the user asked for a file, make the file."),
+            "call it done -- if the user asked for a file, make the file. "
+            "LENGTH: if the user asks for a number of pages, write enough "
+            "words to fill them -- roughly 500 words per page at 11-12pt, or "
+            "about 400 at 14pt. A page is not a paragraph. Count what you "
+            "have written before calling this: asking for two pages and "
+            "receiving one is the single most common way this tool "
+            "disappoints."),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "content": {"type": "STRING", "description": "The full body text. Markdown headings (#) and bullets (-) become real headings and bullets. For csv/xlsx, supply CSV rows."},
+                "content": {"type": "STRING", "description": "The full body text, at the length the user asked for. Markdown headings (#) and bullets (-) become real headings and bullets. For csv/xlsx, supply CSV rows."},
                 "title": {"type": "STRING", "description": "Document title, also used for the filename when no path is given"},
                 "format": {"type": "STRING", "description": "txt | md | docx | pdf | csv | xlsx | pptx (default pdf)"},
                 "path": {"type": "STRING", "description": "Where to save: a folder ('documents', 'desktop', 'downloads') or a full file path. Defaults to the user's Documents folder."}

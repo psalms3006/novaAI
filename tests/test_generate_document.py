@@ -170,3 +170,23 @@ class RegistrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ── asking for two pages and getting one ─────────────────────────────────────
+
+def test_the_tool_tells_the_model_how_long_a_page_is():
+    """Reported: "I asked for two pages, it gave me one."
+
+    The tool takes `content` and nothing else about size, so the model has no
+    way to turn "two pages" into a target — it cannot see the rendered output
+    and has no words-per-page figure to aim at. Guessing produces one page
+    every time. The description now carries the conversion.
+    """
+    import re
+    from pathlib import Path
+
+    nova = (Path(__file__).resolve().parent.parent / "nova.py").read_text(encoding="utf-8")
+    block = nova.split('"name": "generate_document"', 1)[1].split('"name":', 1)[0]
+    assert "LENGTH" in block, "nothing tells the model how to size a document"
+    assert re.search(r"\b\d{3}\s+words per page", block), (
+        "no words-per-page figure, so a page count is still unactionable")
