@@ -78,6 +78,10 @@ models/
 # Audio
 # =========================
 *.wav
+# ...except the speaker fixtures. Four two-second clips, 250 KB, and
+# without them the only end-to-end check on the numpy Kaldi front end
+# cannot run -- it would skip, and a skip reads as a pass.
+!tests/fixtures/voices/*.wav
 *.mp3
 *.flac
 
