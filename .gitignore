@@ -82,6 +82,7 @@ models/
 # without them the only end-to-end check on the numpy Kaldi front end
 # cannot run -- it would skip, and a skip reads as a pass.
 !tests/fixtures/voices/*.wav
+!tests/fixtures/voice/*.wav
 *.mp3
 *.flac
 

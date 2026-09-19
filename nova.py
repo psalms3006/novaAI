@@ -1018,14 +1018,25 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "self_editor",
-        "description": "Read, edit, or patch NOVA's own source code (nova.py). Use when user asks NOVA to fix herself, update a feature, or modify her behavior. Actions: read (view current code), patch (replace a specific block), restart (relaunch).",
+        "description": (
+            "Read NOVA's own source, and propose changes to it. A proposal is "
+            "rehearsed in an isolated copy with the full test suite before "
+            "anything is applied, and only the owner can apply it. Actions: "
+            "read (view a file), propose (suggest an edit and rehearse it), "
+            "apply (owner only, by attempt id), rollback (undo by attempt id), "
+            "history (recent attempts). Never claims a change was made when it "
+            "was only proposed."),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action": {"type": "STRING", "description": "read | patch | restart | list_backups | restore_backup"},
-                "old_code": {"type": "STRING", "description": "Exact code block to replace (for patch action)"},
-                "new_code": {"type": "STRING", "description": "New code block to insert (for patch action)"},
-                "backup": {"type": "STRING", "description": "Backup filename to restore (for restore_backup)"}
+                "action": {"type": "STRING", "description": "read | propose | apply | rollback | history | restart"},
+                "path": {"type": "STRING", "description": "Repository-relative file, e.g. 'desk/live_session.py'. Defaults to nova.py."},
+                "problem": {"type": "STRING", "description": "What is wrong, in one sentence (for propose)"},
+                "rationale": {"type": "STRING", "description": "Why this change fixes it (for propose)"},
+                "risk": {"type": "STRING", "description": "low | medium | high (for propose)"},
+                "old_code": {"type": "STRING", "description": "Exact block to replace (for propose)"},
+                "new_code": {"type": "STRING", "description": "Replacement block (for propose)"},
+                "attempt_id": {"type": "STRING", "description": "Which proposal (for apply and rollback)"}
             },
             "required": ["action"]
         }
@@ -1153,71 +1164,103 @@ from planner_extra import NOVAPlanner, _execute_planner
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _execute_self_editor(args: dict) -> str:
+    """NOVA reading and changing her own source, under supervision.
+
+    What used to be here wrote the model's replacement text straight into the
+    running nova.py, saved a .bak beside it, and said "restart NOVA to apply
+    changes". Nothing was tested, nothing was isolated, nothing checked which
+    file was being edited, and the undo depended on somebody working out
+    which of the accumulated .bak files was the right one. Two are still in
+    the repository root from previous attempts.
+
+    A change now goes: propose, rehearse in a clean checkout of the last
+    commit with the whole suite run against it, apply only on the owner's
+    word, verify, and roll back automatically if that verification fails.
+    The safeguards -- permissions, identity, this machinery, and the tests
+    that hold them honest -- can be read and proposed against but not applied
+    without explicit approval, because a change able to rewrite the rules
+    about changes is not a change to wave through.
+    """
+    from nova_self.improve import Edit, Proposal, SelfImprover
+    from nova_self.protected import is_protected
+    from nova_identity.session import current_speaker
+
     action = args.get("action", "read")
-    script = NOVA_SCRIPT_PATH
+    improver = SelfImprover()
 
     if action == "read":
-        try:
-            code = script.read_text(encoding="utf-8")
-            preview = code[:8000]
-            total = len(code.splitlines())
-            return (
-                f"[nova.py — {total} lines, showing first 8000 chars]\n\n{preview}"
-                + ("\n...[truncated]" if len(code) > 8000 else "")
-            )
-        except Exception as e:
-            return f"Could not read nova.py: {e}"
+        return improver.read(args.get("path") or "nova.py")
 
-    elif action == "patch":
-        old_code = args.get("old_code", "")
-        new_code = args.get("new_code", "")
-        if not old_code:
-            return "patch requires 'old_code' — the exact block to replace."
-        if not new_code:
-            return "patch requires 'new_code' — the replacement block."
-        try:
-            code = script.read_text(encoding="utf-8")
-            if old_code not in code:
-                return "Patch FAILED: old_code block not found in nova.py. Use the 'read' action to check exact current code."
-            backup_name = f"nova.py.bak.{int(time.time())}"
-            backup_path = script.parent / backup_name
-            backup_path.write_text(code, encoding="utf-8")
-            updated = code.replace(old_code, new_code, 1)
-            script.write_text(updated, encoding="utf-8")
-            return f"Patched successfully. Backup saved as {backup_name}. Restart NOVA to apply changes: say 'restart nova'."
-        except Exception as e:
-            return f"Patch failed: {e}"
+    if action in ("propose", "patch"):
+        # "patch" is the old name. Kept so an existing habit does not fail,
+        # but it now proposes rather than writes: the rehearsal is the point.
+        path = args.get("path") or "nova.py"
+        old, new_code = args.get("old_code", ""), args.get("new_code", "")
+        if not old or not new_code:
+            return ("A proposal needs 'old_code' (the exact block to replace) "
+                    "and 'new_code' (the replacement).")
+        proposal = Proposal(
+            problem=args.get("problem") or "unspecified",
+            rationale=args.get("rationale", ""),
+            risk=args.get("risk", "medium"),
+            edits=[Edit(path, old, new_code)])
+        out = improver.rehearse(proposal)
+        lines = [f"[{out.attempt_id}] {out.message}"]
+        if out.tests_passed is not None:
+            lines.append(f"tests: {out.tests_passed} passed, "
+                         f"{out.tests_failed} failed")
+        if out.protected:
+            lines.append("touches protected files: " + ", ".join(out.protected))
+        if not out.ok and out.output:
+            lines.append(out.output[-800:])
+        if out.ok:
+            lines.append("Nothing has been changed yet. To go ahead, the "
+                         "owner applies it by id.")
+        return "\n".join(lines)
 
-    elif action == "restart":
-        print("[NOVA] 🔄 Restarting as instructed...")
+    if action == "apply":
+        attempt_id = args.get("attempt_id", "")
+        if not attempt_id:
+            return "Which proposal? Give the attempt id from the rehearsal."
+        row = improver.journal.latest(attempt_id)
+        if row is None:
+            return f"No proposal called {attempt_id}."
+        if row.get("tests_ok") is not True:
+            return (f"{attempt_id} has not passed a rehearsal, so it is not "
+                    f"applied.")
+        edits = args.get("edits")
+        if not edits:
+            return ("Applying needs the same edits that were rehearsed. "
+                    "Re-send them with the attempt id.")
+        proposal = Proposal(
+            problem=row.get("problem", ""), attempt_id=attempt_id,
+            edits=[Edit(e["path"], e["old"], e["new"]) for e in edits])
+        out = improver.apply(proposal, approved_by=current_speaker())
+        return f"[{out.attempt_id}] {out.message}" + (
+            f" ({out.rollback_status})" if out.rollback_status else "")
+
+    if action == "rollback":
+        out = improver.rollback(args.get("attempt_id", ""))
+        return out.message
+
+    if action in ("history", "list_backups"):
+        rows = improver.journal.summary(limit=10)
+        if not rows:
+            return "Nothing has been proposed yet."
+        return "\n".join(
+            f"{r['attempt_id']}  {r['status']:18} {r['problem'][:60]}"
+            for r in rows)
+
+    if action == "restart":
+        print("[NOVA] Restarting as instructed...")
         try:
             os.execv(sys.executable, [sys.executable] + sys.argv)
         except Exception as e:
             return f"Restart failed: {e}"
 
-    elif action == "list_backups":
-        backups = sorted(script.parent.glob("nova.py.bak.*"))
-        if not backups:
-            return "No backups found."
-        lines = [
-            f"{b.name} — {datetime.fromtimestamp(b.stat().st_mtime).strftime('%b %d %H:%M')}"
-            for b in backups
-        ]
-        return "Available backups:\n" + "\n".join(lines)
-
-    elif action == "restore_backup":
-        backup_name = args.get("backup", "")
-        backup_path = script.parent / backup_name
-        if not backup_path.exists():
-            return f"Backup not found: {backup_name}"
-        try:
-            code = backup_path.read_text(encoding="utf-8")
-            emergency = f"nova.py.bak.pre_restore.{int(time.time())}"
-            (script.parent / emergency).write_text(script.read_text(encoding="utf-8"), encoding="utf-8")
-            script.write_text(code, encoding="utf-8")
-            return f"Restored from {backup_name}. Previous version saved as {emergency}. Restart NOVA to apply."
-        except Exception as e:
-            return f"Restore failed: {e}"
+    if action == "restore_backup":
+        return ("Backups were replaced by snapshots taken per change. Use "
+                "'rollback' with the attempt id, or 'history' to find it.")
 
     return f"Unknown self_editor action: {action}"
 
