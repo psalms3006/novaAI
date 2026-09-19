@@ -87,6 +87,18 @@ class TerminalVoice:
         except Exception as e:
             print(f"[NOVA] could not send that: {e}")
 
+    def interrupt(self, *, notify_model: bool = True) -> None:
+        """Cut NOVA off mid-sentence.
+
+        `notify_model=False` when the user's own words are about to follow:
+        those stop the model by themselves, and telling it twice makes NOVA
+        acknowledge the interruption before answering the question.
+        """
+        if not self._mgr.speaking:
+            return
+        self._mgr.barge_in(notify_model=notify_model)
+        print("   … stopped", flush=True)
+
     def _flush_pending(self) -> None:
         with self._pending_lock:
             waiting, self._pending = self._pending, []
@@ -138,10 +150,23 @@ class TerminalVoice:
                 return                      # stdin closed
             text = line.strip()
             if not text:
+                # A bare Enter is the quickest thing a hand can do, so it is
+                # the one bound to "stop talking". It costs nothing when she
+                # is already silent.
+                self.interrupt()
                 continue
             if text.lower() in ("quit", "exit", "goodbye nova"):
                 self._stop.set()
                 return
+            if text.lower() in ("stop", "shh", "shush", "wait"):
+                self.interrupt()
+                continue
+            # Anything typed while she is mid-sentence is an interruption as
+            # well as a message. Waiting for her to finish before the question
+            # is even accepted is the thing that makes an assistant feel like
+            # a form rather than a conversation.
+            if self._mgr.speaking:
+                self.interrupt(notify_model=False)
             self._send(text)
 
     async def _pump(self) -> str:
@@ -176,7 +201,7 @@ class TerminalVoice:
                     self._flush_pending()
                     self._offline_since = 0.0
                     print("[NOVA] ✅ Connected — speak, or type and press enter.")
-                    print("[NOVA]    Ctrl-C to stop.\n")
+                    print("[NOVA]    Enter on its own cuts her off. Ctrl-C quits.\n")
                     if data.get("mic") is False:
                         print("[NOVA] ⚠️  No microphone — typing still works.")
                     if data.get("speaker") is False:

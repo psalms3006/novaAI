@@ -20,6 +20,7 @@ from __future__ import annotations
 import inspect
 import queue as q
 import threading
+import time
 
 import numpy as np
 
@@ -38,6 +39,8 @@ def session():
     m._speaker_alive = True
     m._last_audio_at = 0.0
     m._play_generation = 0
+    m._suppress_until = 0.0
+    m._suppressed_tail = 0
     m._trace = None
     m._turn_done_flag = False
     m._turn_count = 0
@@ -91,15 +94,13 @@ def test_barge_in_on_the_tail_does_not_deafen_the_next_turn():
     assert m._play_q.qsize() > before, "NOVA went deaf: turn 2 audio was dropped"
 
 
-def test_audio_resumes_immediately_after_an_interruption():
-    """There is deliberately no suppression latch any more.
+def test_the_rest_of_an_interrupted_turn_is_discarded():
+    """Dropping the queue is not stopping, because the model has not stopped.
 
-    There used to be one: after a barge-in the rest of that turn was
-    discarded, because the detector was firing on NOVA's own echo and playback
-    had to be kept from re-triggering it. Its failure mode was NOVA going
-    silent for the remainder of the session while the model went on replying.
-    The echo is cancelled now, so an interruption means the user really spoke,
-    the model is told, and it stops on its own.
+    Measured against Gemini Live: after the cut it went on sending for 2.52 s,
+    and every chunk was played, so NOVA finished two and a half seconds of a
+    sentence the user had already stopped. The tail belongs to the turn that
+    was cut and goes the same way the queue did.
     """
     m = session()
     m._enqueue_audio(CHUNK)
@@ -108,7 +109,37 @@ def test_audio_resumes_immediately_after_an_interruption():
 
     for _ in range(5):
         m._enqueue_audio(CHUNK)
-    assert m._play_q.qsize() == 5, "NOVA stayed mute after being interrupted"
+    assert m._play_q.qsize() == 0, "NOVA talked on through the interruption"
+
+
+def test_she_is_audible_again_the_moment_the_model_confirms():
+    """The window is closed by the cut being acknowledged, not by the clock.
+    Whatever arrives after that is her answer to the interruption."""
+    m = session()
+    m._enqueue_audio(CHUNK)
+    m._barge_in()
+    m._end_suppression("model confirmed the cut")   # what the receiver calls
+
+    m._enqueue_audio(CHUNK)
+    assert m._play_q.qsize() == 1, "NOVA stayed mute after the cut was over"
+
+
+def test_the_window_expires_even_if_the_model_never_confirms():
+    """The previous attempt at this latched until confirmation and nothing
+    else. When a confirmation went missing NOVA was silent for the rest of the
+    session while the model went on replying. A window that expires cannot do
+    that, whatever else goes wrong.
+    """
+    assert 0 < ls.BARGE_IN_SUPPRESS_S <= 5.0
+
+    m = session()
+    m._enqueue_audio(CHUNK)
+    m._barge_in()
+    m._suppress_until = time.monotonic() - 0.001    # the window, now past
+
+    m._enqueue_audio(CHUNK)
+    assert m._play_q.qsize() == 1, "NOVA never spoke again"
+    assert not m._suppress_until, "the expired window was left armed"
 
 
 def test_ten_consecutive_turns_stay_audible():

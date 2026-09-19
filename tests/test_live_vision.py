@@ -275,6 +275,8 @@ def test_the_end_of_the_acknowledgement_is_what_sends_the_frame():
     m._audio_bytes_out = 0
     m._trace = None
     m._play_generation = 0
+    m._suppress_until = 0.0
+    m._suppressed_tail = 0
 
     asyncio.run(m._look(FakeFC(), {"question": "read this"}))
     s = TurnSession()

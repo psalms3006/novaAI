@@ -317,6 +317,11 @@ function handleLiveEvent(ev) {
       }
       // NOVA Core owns the voice state; this surface only reflects it.
       if (window.novaSetVoiceLabel) window.novaSetVoiceLabel(ev.state);
+      // Every state other than "speaking" means she is not making a sound,
+      // so there is nothing for an interrupt to stop. Cleared here rather
+      // than in each branch below: a state this surface does not recognise
+      // must not leave a stale "she is talking" behind.
+      state.speaking = (ev.state === "speaking");
       if (ev.state === "ready") {
         state.offlineNoticed = false;
         // The backend has the session, the speaker and the microphone all
@@ -333,6 +338,7 @@ function handleLiveEvent(ev) {
       } else if (ev.state === "speaking") {
         setOrb("speaking");
         state.listening = true;      // mic stays hot while NOVA talks (barge-in)
+        state.speaking = true;
       } else if (ev.state === "connecting") {
         setOrb("thinking");
       } else if (ev.state === "offline") {
@@ -529,6 +535,29 @@ function playAudioChunk(b64) {
   } catch (e) { /* noop */ }
 }
 
+/* Stop NOVA talking, because the user said so.
+
+   The shipped voice policy is half-duplex — the microphone is muted for
+   exactly as long as she is speaking — so she cannot hear herself be
+   interrupted. The surface has to do it, and being unable to cut an
+   assistant off mid-sentence is the difference between a conversation and a
+   recital.
+
+   `notifyModel` is false when the user's own words are about to follow:
+   those stop the model by themselves, and telling it twice makes NOVA
+   acknowledge the interruption before answering the question. Harmless when
+   she is already silent, so no caller has to check first. */
+async function novaInterrupt(notifyModel) {
+  state.speaking = false;
+  try {
+    await api_json("/api/live/interrupt", {
+      method: "POST",
+      body: JSON.stringify({ notify_model: notifyModel !== false }),
+    });
+  } catch (e) { /* the worst case is she finishes her sentence */ }
+}
+window.novaInterrupt = novaInterrupt;
+
 /* ── Chat (text input) ─────────────────────────────── */
 async function sendText(text, imagePath) {
   if (!text || !text.trim()) return;
@@ -541,6 +570,10 @@ async function sendText(text, imagePath) {
   // transcript comes back on the event bus, so the same turn lands on every
   // surface — which is what typing while talking should do.
   if (state.voiceMode || state.liveWs) {
+    // Typing while she is mid-sentence is an interruption as well as a
+    // message. Waiting for her to finish before the question is even
+    // accepted is what makes an assistant feel like a form.
+    if (state.speaking) await novaInterrupt(false);
     try {
       const j = await api_json("/api/live/text", {
         method: "POST", body: JSON.stringify({ message: msg }),
@@ -1124,6 +1157,13 @@ if (closePanelBtn) closePanelBtn.addEventListener("click", () => {
 const orbCanvas = $("orb-canvas");
 if (orbCanvas) {
   orbCanvas.addEventListener("click", () => {
+    // While she is talking the orb is a stop button, not a hang-up. Clicking
+    // it is what a hand reaches for to cut her off, and ending the whole
+    // session instead was losing the conversation over a wish for quiet.
+    if (state.speaking) {
+      novaInterrupt(true);
+      return;
+    }
     if (state.listening) {
       liveDisconnect();
       setOrb("idle");
@@ -1136,6 +1176,17 @@ if (orbCanvas) {
     }
   });
 }
+
+// Escape cuts her off, from anywhere in the window — including from inside
+// the command box, where a hand already is. Bound on the window rather than
+// the input so it works when nothing is focused, which is the usual case
+// while listening to an answer.
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && state.speaking) {
+    e.preventDefault();
+    novaInterrupt(true);
+  }
+});
 
 // Command bar submit
 const commandInput = $("input");
@@ -1173,7 +1224,7 @@ const VOICE_LABEL = {
   connected: "Listening — just talk",
   streaming: "Listening — just talk",
   listening: "Listening — just talk",
-  speaking: "NOVA is speaking",
+  speaking: "NOVA is speaking — Esc to stop her",
   thinking: "Thinking…",
   muted: "Microphone muted",
   error: "Voice unavailable",

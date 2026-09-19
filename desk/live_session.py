@@ -46,6 +46,35 @@ except Exception:
 LIVE_MODEL_DEFAULT = "models/gemini-3.1-flash-live-preview"
 MIC_RATE = 16000
 
+#: What the model is told when the user cuts NOVA off with nothing to follow
+#: it — a keystroke, a button, "stop". Dropping the audio only silences the
+#: speaker; the model is still generating, and without this the next thing
+#: NOVA says is the middle of the answer nobody wanted to hear the end of.
+#: Phrased as a stage direction rather than a question so there is nothing
+#: here for her to answer out loud.
+INTERRUPT_NOTICE = ("[SYSTEM: The user pressed stop. Abandon the previous "
+                    "answer completely. Do not finish it, do not summarise "
+                    "it, do not acknowledge this. Say nothing at all and wait "
+                    "silently for what they say next.]")
+
+#: How long audio belonging to an interrupted turn may still arrive.
+#:
+#: Dropping the play queue and aborting the sound device silences NOVA
+#: instantly, and for a while that looked like the whole job. It is not.
+#: Measured against Gemini Live from this machine: after the cut the model
+#: went on sending for 2.52 s — 25 more chunks — because the interruption has
+#: to cross the network and the audio already generated is in flight behind
+#: it. Every one of those chunks was played, so NOVA finished two and a half
+#: seconds of a sentence the user had already stopped, while every surface
+#: said "listening".
+#:
+#: So the tail is discarded too. This value is only the safety net: the window
+#: normally closes the moment the server confirms the cut, which is sooner.
+#: It exists because the previous attempt at this latched until confirmation
+#: and nothing else — and when a confirmation went missing, NOVA was silent
+#: for the rest of the session. A window that expires cannot do that.
+BARGE_IN_SUPPRESS_S = 3.0
+
 #: Mic block size. 1024 frames at 16 kHz is 64 ms — the same granularity the
 #: reference implementation uses, and small enough that a barge-in is noticed
 #: promptly without waking the callback so often that it costs measurable CPU.
@@ -769,6 +798,12 @@ class LiveManager:
         # play after an interruption -- exactly the "speaks a fragment of the
         # old response" behaviour barge-in exists to prevent.
         self._play_generation = 0
+        #: Monotonic deadline until which incoming audio is the tail of a turn
+        #: that has been interrupted, and is thrown away. Zero when not
+        #: interrupting. Cleared early by the model confirming the cut.
+        self._suppress_until = 0.0
+        #: Chunks discarded that way, for the log.
+        self._suppressed_tail = 0
         self._trace: VoiceTrace | None = None
         self._auth_rejected = False
         self._offline = False
@@ -1373,17 +1408,34 @@ class LiveManager:
         self._speaker_alive = False
 
     def _enqueue_audio(self, audio: bytes) -> None:
-        """Play a chunk and tell the surfaces how loud it is.
+        """Play a chunk and tell the surfaces how loud it is — unless the turn
+        it belongs to has been interrupted, in which case throw it away.
 
-        There is deliberately no post-interruption suppression here. There
-        used to be: an epoch latch that discarded every chunk of a turn once
-        it had been interrupted. It existed because the barge-in detector was
-        firing on NOVA's own echo, so playback had to be kept from resuming
-        and re-triggering it — and when the latch failed to clear, NOVA went
-        silent for the rest of the session while the model went on replying.
-        With echo cancellation the premise is gone: an interruption now means
-        the user really spoke, the model is told, and it stops on its own.
+        That discarding has a history worth knowing. It used to be an epoch
+        latch that dropped every chunk of a turn once it had been cut,
+        because the barge-in detector was firing on NOVA's own echo and
+        playback had to be kept from resuming and re-triggering it. When the
+        latch failed to clear, NOVA went silent for the rest of the session
+        while the model went on replying, so it was removed.
+
+        It is back because removing it was measured to be wrong: after a cut
+        the model goes on sending for up to 2.5 s, and all of it was played.
+        What is different is that the window closes. The model confirming the
+        cut ends it — about a tenth of a second, measured — and a deadline
+        ends it even if no confirmation ever comes, which is the failure the
+        old latch could not survive.
         """
+        if self._suppress_until:
+            if time.monotonic() < self._suppress_until:
+                # The turn was cut; this is the rest of it, still arriving.
+                self._suppressed_tail += 1
+                return
+            # The safety net, not the usual exit. The model never confirmed
+            # the cut, so stop assuming it is about to and let her be heard —
+            # a stuck window is how NOVA went silent for a whole session.
+            _log("[LIVE] interruption window expired unconfirmed after %d "
+                 "discarded chunks", self._suppressed_tail)
+            self._suppress_until = 0.0
         if not self._speaker_alive:
             # No playback thread: never mute the mic on its behalf, or NOVA
             # would be permanently deaf on a machine with no working speaker.
@@ -1428,6 +1480,15 @@ class LiveManager:
         # already done half the work.
         # interrupted=True: the user is mid-sentence, so the speaker-tail
         # cooldown must not swallow the next quarter second of it.
+        # Everything the model sends from here until it acknowledges the cut
+        # belongs to the sentence being stopped — unless it has already said
+        # the turn was over, in which case nothing more of it is coming and
+        # the next audio is the next answer. Swallowing the opening of that is
+        # the deafness this window exists to avoid, so ask before clearing the
+        # flag below.
+        if not self._turn_done_flag:
+            self._suppress_until = time.monotonic() + BARGE_IN_SUPPRESS_S
+            self._suppressed_tail = 0
         self._gate.set_speaking(False, interrupted=True)
         self._turn_done_flag = False
         self._play_generation += 1        # discard anything held in the pre-roll
@@ -1448,6 +1509,20 @@ class LiveManager:
         self._publish(LiveEvent("interrupted", reason="barge_in",
                                 **self._gate.last_trigger))
         self._publish(LiveEvent("state", state="listening"))
+
+    def _end_suppression(self, why: str) -> None:
+        """Stop discarding the tail of an interrupted turn.
+
+        Called when the model says the turn is over, by either route. Silent
+        when no interruption is in progress, which is nearly always.
+        """
+        if not self._suppress_until:
+            return
+        self._suppress_until = 0.0
+        if self._suppressed_tail:
+            _log("[LIVE] interruption: discarded %d chunks of the cut turn "
+                 "(%s)", self._suppressed_tail, why)
+        self._suppressed_tail = 0
 
     def _abort_playback(self) -> int:
         """Throw away audio the sound device has already accepted.
@@ -1485,6 +1560,38 @@ class LiveManager:
     @property
     def muted(self) -> bool:
         return self._gate.muted
+
+    @property
+    def speaking(self) -> bool:
+        """Is NOVA producing sound right now?
+
+        Asked by surfaces deciding whether an interrupt would do anything.
+        """
+        return bool(self._gate.speaking)
+
+    def barge_in(self, *, notify_model: bool = True) -> dict:
+        """Stop talking, because the user asked — by key, button or voice.
+
+        The same path the automatic detector uses, so a deliberate
+        interruption and a detected one leave NOVA in identical states. There
+        is no second way to stop her, which is the point: two ways to cancel
+        speech is two sets of edge cases.
+
+        Two halves, and both matter. Dropping the audio already produced is
+        what makes the room go quiet; telling the model is what stops it
+        generating the rest of a reply nobody is listening to any more.
+
+        `notify_model=False` is for the caller that is about to send the
+        user's own words: those interrupt the model by themselves, and a
+        synthetic notice as well would have NOVA answer twice — an
+        acknowledgement of the interruption, then the real answer.
+        """
+        if not self._gate.speaking:
+            return {"ok": True, "message": "not speaking"}
+        self._barge_in()
+        if notify_model:
+            self._post_to_loop(self._input_text_queue, INTERRUPT_NOTICE)
+        return {"ok": True, "message": "interrupted"}
 
     @property
     def owns_microphone(self) -> bool:
@@ -1833,6 +1940,25 @@ class LiveManager:
                     if self._trace:
                         self._trace.mark("connected", seconds=round(dt, 2))
 
+                    # Per-turn state from the last session, cleared before
+                    # this one can be misled by it.
+                    #
+                    # `_turn_done_flag` is set when the model says a turn is
+                    # over and cleared when playback of that turn drains. A
+                    # session stopped between those two — which is what
+                    # closing NOVA mid-sentence is — leaves it set, and it was
+                    # never reset on connect, so the *next* session began
+                    # believing a turn it had not started had already
+                    # finished. Measured: on a second session an interruption
+                    # played 21 chunks of the sentence it was supposed to
+                    # stop, because the tail window is not armed for a turn
+                    # the model has already finished.
+                    #
+                    # A reconnect is a new turn by definition, so nothing from
+                    # before it can be the tail of an interrupted one either.
+                    self._turn_done_flag = False
+                    self._suppress_until = 0.0
+                    self._suppressed_tail = 0
                     # Queues belong to this loop and must exist before the
                     # microphone callback can post to them.
                     self._mic_queue = asyncio.Queue(maxsize=MIC_QUEUE_FRAMES)
@@ -2222,12 +2348,17 @@ class LiveManager:
                         # answer the user has already moved on from.
                         self._play_generation += 1
                         nova_voice.drain(self._play_q)
+                        # Nothing after this belongs to the interrupted turn,
+                        # so stop discarding — the next audio is her answer to
+                        # whatever the user interrupted her to say.
+                        self._end_suppression("model confirmed the cut")
                         self._publish(LiveEvent("interrupted"))
                         self._turn_count += 1
 
                     if sc.turn_complete:
                         self._turn_done_flag = True
                         self._turn_count += 1
+                        self._end_suppression("turn ended")
                         self._publish(LiveEvent("turn_complete", turn_count=self._turn_count))
 
                         # The turn that just ended was NOVA saying she would
@@ -2626,13 +2757,26 @@ class LiveManager:
                 await asyncio.sleep(1.0)
 
     async def _text_sender(self, session: Any) -> None:
+        """Send text into the conversation, always as a completed turn.
+
+        `turn_complete=False` was tried for the interruption notice, to stop
+        her answering "okay" the moment she was asked for silence. It is the
+        wrong tool: content sent that way does not cancel the generation in
+        progress, so the model carried on producing the very answer that had
+        just been stopped. Measured — the local window suppressed the first
+        three seconds and then 45 chunks of the old answer played out of it.
+
+        A completed turn is what cancels generation, and it does so in about
+        two tenths of a second. That is the whole point of telling her.
+        """
         while True:
             try:
                 text = await self._input_text_queue.get()
                 if text is None:
                     break
                 await session.send_client_content(
-                    turns={"role": "user", "parts": [{"text": text}]}, turn_complete=True
+                    turns={"role": "user", "parts": [{"text": text}]},
+                    turn_complete=True,
                 )
             except asyncio.CancelledError:
                 break

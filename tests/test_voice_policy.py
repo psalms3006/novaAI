@@ -307,14 +307,20 @@ def _manager():
     return m
 
 
-def test_audio_keeps_playing_after_an_interruption():
+def test_the_next_turn_plays_after_an_interruption():
     """Regression, and the opposite of the bug this file used to assert.
 
     There was a latch here that discarded every remaining chunk of an
     interrupted turn. It existed to stop playback resuming into a detector
-    that was firing on NOVA's own echo — and when it failed to clear, NOVA
+    that was firing on NOVA’s own echo — and when it failed to clear, NOVA
     went silent for the rest of the session while the model went on replying.
-    With the echo cancelled the latch is gone, and the next turn must play.
+
+    The tail of a cut turn is discarded again, because measurement against a
+    real session showed the model goes on sending for over two seconds after
+    a barge-in and every chunk of it was played. The difference is that the
+    discarding now ends: the model confirming the cut closes the window, and
+    a deadline closes it even if no confirmation ever arrives. Whatever the
+    model says next has to be audible.
     """
     m = _manager()
     m._enqueue_audio(b"\x00\x01" * 100)
@@ -322,6 +328,9 @@ def test_audio_keeps_playing_after_an_interruption():
 
     m._barge_in()
     assert m._play_q.qsize() == 0, "queued audio must be dropped on barge-in"
+
+    # What the receiver does when the model acknowledges the cut.
+    m._end_suppression("model confirmed the cut")
 
     m._enqueue_audio(b"\x00\x01" * 100)
     assert m._gate.speaking is True, "NOVA stayed mute after being interrupted"

@@ -994,6 +994,29 @@ def api_live_mute():
     return jsonify(mgr.set_muted(not mgr.muted))
 
 
+@app.post("/api/live/interrupt")
+@require_token
+def api_live_interrupt():
+    """Stop NOVA talking, because the user said so.
+
+    Being unable to cut an assistant off mid-sentence is the difference
+    between a conversation and a recital, and the microphone cannot do it
+    here: the shipped voice policy is half-duplex, so NOVA is deaf for
+    exactly as long as she is the one speaking. That leaves the surfaces to
+    provide the interruption, and this is the one path they all use — the
+    same one the automatic detector uses, so a deliberate interruption and a
+    detected one leave NOVA in identical states.
+
+    Harmless when she is already silent; the caller does not have to know.
+    """
+    mgr = desk_live.get_live_manager()
+    data = request.get_json(silent=True) or {}
+    # The caller that is about to send the user's words asks us not to tell
+    # the model, because those words will. See LiveManager.barge_in.
+    notify = bool(data.get("notify_model", True))
+    return jsonify(mgr.barge_in(notify_model=notify))
+
+
 @app.post("/api/live/text")
 @require_token
 def api_live_text():
