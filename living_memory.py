@@ -75,6 +75,15 @@ _TYPE_KEYWORDS: Dict[str, List[str]] = {
 }
 _FALLBACK_TYPE = "fact"
 
+#: Who a record with no subject is about.
+#:
+#: Every record written before memory knew about people is one of these. They
+#: were all written on a single-user machine about its owner, so attributing
+#: them to the owner is not a guess -- it is what they already meant. The
+#: alternative, leaving them unattributed, would hide them from the one person
+#: they describe the moment retrieval started filtering by subject.
+DEFAULT_SUBJECT = "owner"
+
 # ── transient observations ────────────────────────────────────────────────────
 #
 # What is on the screen right now is not a fact about the user. NOVA stored
@@ -264,8 +273,17 @@ class LivingMemory:
 
     def remember(self, text: str, source: str = "explicit",
                  project: str = "", confirmed: bool = True,
-                 importance: Optional[float] = None) -> Dict[str, Any]:
-        """Explicit command — highest priority, confirmed, strongly stored."""
+                 importance: Optional[float] = None,
+                 subject_id: str = DEFAULT_SUBJECT,
+                 author_id: str = "") -> Dict[str, Any]:
+        """Explicit command — highest priority, confirmed, strongly stored.
+
+        `subject_id` is who the fact is *about*; `author_id` is who said it.
+        They are usually the same person and occasionally are not, and the
+        difference is the whole reason both exist: "Chizi prefers tea" said by
+        Samuel is a fact about Chizi on Samuel's authority, and filing it
+        under either name alone loses half of what is known.
+        """
         text = (text or "").strip()
         if not text:
             raise ValueError("nothing to remember")
@@ -278,12 +296,17 @@ class LivingMemory:
         return self._upsert(text, type="fact", source=source, confirmed=confirmed,
                             project=project or self._project_of(text),
                             importance=(importance if importance is not None else 0.9),
-                            explicit=True)
+                            explicit=True, subject_id=subject_id,
+                            author_id=author_id)
 
     def _upsert(self, text: str, type: str, source: str, confirmed: bool,
-                project: str, importance: float, explicit: bool) -> Dict[str, Any]:
+                project: str, importance: float, explicit: bool,
+                subject_id: str = DEFAULT_SUBJECT,
+                author_id: str = "") -> Dict[str, Any]:
+        subject_id = (subject_id or DEFAULT_SUBJECT).strip() or DEFAULT_SUBJECT
         with self._lock:
-            existing = self._find_exact(text) or self._find_same_claim(text)
+            existing = (self._find_exact(text, subject_id)
+                        or self._find_same_claim(text, subject_id))
             if existing:
                 existing["updated"] = time.time()
                 existing["access_count"] = existing.get("access_count", 0)
@@ -300,14 +323,14 @@ class LivingMemory:
                 # answer beside it was never looked at. Found on the real
                 # store, where "the company is OMNIEL" left "the company is
                 # Omnia" standing next to it.
-                clash = self._detect_conflict(text, project)
+                clash = self._detect_conflict(text, project, subject_id)
                 if clash is not None and clash is not existing:
                     self._supersede(clash, text)
                     self._metrics["superseded"] += 1
                 self._save()
                 return existing
 
-            conflict = self._detect_conflict(text, project)
+            conflict = self._detect_conflict(text, project, subject_id)
             if conflict is not None and (explicit or importance >= conflict.get("importance", 0)):
                 # supersede the old conflicting fact (version it) — self-edit
                 self._supersede(conflict, text)
@@ -317,6 +340,9 @@ class LivingMemory:
                 "id": f"mem_{uuid.uuid4().hex[:12]}",
                 "text": text[:2000],
                 "type": type,
+                #: Who this is about, and who said it.
+                "subject_id": subject_id,
+                "author_id": author_id or subject_id,
                 "importance": round(max(0.0, min(1.0, importance)), 3),
                 "confidence": 1.0 if confirmed else 0.6,
                 "source": source,
@@ -349,13 +375,22 @@ class LivingMemory:
         except Exception:
             pass
 
-    def _find_exact(self, text: str) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def subject_of(record: Dict[str, Any]) -> str:
+        """Who a record is about, including records written before subjects
+        existed."""
+        return (record.get("subject_id") or DEFAULT_SUBJECT)
+
+    def _find_exact(self, text: str,
+                    subject_id: str = DEFAULT_SUBJECT) -> Optional[Dict[str, Any]]:
         for r in self._records:
-            if r.get("text") == text and not r.get("superseded_by"):
+            if (r.get("text") == text and not r.get("superseded_by")
+                    and self.subject_of(r) == subject_id):
                 return r
         return None
 
-    def _find_same_claim(self, text: str) -> Optional[Dict[str, Any]]:
+    def _find_same_claim(self, text: str,
+                         subject_id: str = DEFAULT_SUBJECT) -> Optional[Dict[str, Any]]:
         """A live record asserting the very same thing, worded differently.
 
         "…is OMNIEL" and "…is OMNIEL." are one fact, and storing them twice
@@ -368,11 +403,14 @@ class LivingMemory:
         for r in self._records:
             if r.get("superseded_by"):
                 continue
+            if self.subject_of(r) != subject_id:
+                continue
             if _claim(r.get("text", "")) == claim:
                 return r
         return None
 
-    def _detect_conflict(self, text: str, project: str) -> Optional[Dict[str, Any]]:
+    def _detect_conflict(self, text: str, project: str,
+                         subject_id: str = DEFAULT_SUBJECT) -> Optional[Dict[str, Any]]:
         """Find a live record that the new fact contradicts.
 
         Heuristic: when the new statement is a correction, contradictions are
@@ -390,6 +428,12 @@ class LivingMemory:
             subject, value = claim
             for r in self._records:
                 if r.get("superseded_by"):
+                    continue
+                # Two people are allowed to disagree. "Samuel's favourite
+                # colour is blue" does not contradict "Chizi's favourite
+                # colour is green", and superseding across subjects would
+                # mean the last person to speak overwrote everyone else.
+                if self.subject_of(r) != subject_id:
                     continue
                 if project and r.get("project") and project != r.get("project"):
                     continue
@@ -416,6 +460,8 @@ class LivingMemory:
         best_overlap: Optional[int] = None
         for r in self._records:
             if r.get("superseded_by"):
+                continue
+            if self.subject_of(r) != subject_id:
                 continue
             if project and r.get("project") and project != r.get("project"):
                 continue
@@ -483,7 +529,23 @@ class LivingMemory:
     # ── hybrid retrieval ─────────────────────────────────────────────────────
     def search(self, query: str, top_k: Optional[int] = None,
                project: Optional[str] = None,
-               types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+               types: Optional[List[str]] = None,
+               reader_id: Optional[str] = None,
+               can_read_others: bool = True) -> List[Dict[str, Any]]:
+        """Find relevant records.
+
+        `reader_id` is who is asking. With `can_read_others=False` the search
+        is confined to what is known about that one person, which is what a
+        guest gets: "what do you know about Samuel" should not be a way to
+        read the owner's memory out of a machine by standing next to it.
+
+        The default is unrestricted, because every existing caller is NOVA
+        working on the owner's behalf and silently narrowing those would be a
+        quiet loss of memory rather than a security improvement.
+        """
+        visible = None
+        if reader_id is not None and not can_read_others:
+            visible = {reader_id}
         with self._lock:
             self._metrics["retrieval_count"] += 1
             k = top_k or self.top_k
@@ -499,6 +561,8 @@ class LivingMemory:
             now = time.time()
             for r in self._records:
                 if r.get("superseded_by") or r.get("decay", {}).get("active"):
+                    continue
+                if visible is not None and self.subject_of(r) not in visible:
                     continue
                 if project and r.get("project") and project.lower() not in r["project"].lower():
                     continue
