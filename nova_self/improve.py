@@ -54,7 +54,12 @@ TEST_TIMEOUT_S = 900
 #: one with her dependencies installed, and whatever "python" happens to mean
 #: on PATH generally is not. It reported "No module named pytest" and that
 #: read as a failing change rather than as a broken harness.
-DEFAULT_TEST_COMMAND = (sys.executable, "-m", "pytest", "tests", "-q")
+#:
+#: And no -q here. pytest.ini already sets it in addopts, so passing it again
+#: made -qq, which suppresses the summary line -- leaving a rehearsal that
+#: said "None passed, None failed" about a run where everything passed. A
+#: rehearsal that cannot say what happened is not evidence of anything.
+DEFAULT_TEST_COMMAND = (sys.executable, "-m", "pytest", "tests")
 
 
 def repo_root() -> Path:
@@ -269,7 +274,12 @@ class SelfImprover:
                                capture_output=True, text=True,
                                timeout=TEST_TIMEOUT_S)
             out = (r.stdout or "") + (r.stderr or "")
-            passed, failed = _parse_pytest(out[-3000:])
+            # The whole output, not the tail. stderr is appended after stdout,
+            # and pytest's "N passed" line lives in stdout -- so a run with a
+            # long warnings block pushed the counts out of the window and the
+            # rehearsal reported "None passed, None failed" on a change that
+            # had in fact passed everything.
+            passed, failed = _parse_pytest(out)
             return r.returncode == 0, passed, failed, out
         except subprocess.TimeoutExpired:
             return False, None, None, (

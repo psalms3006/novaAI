@@ -80,7 +80,7 @@ def improver(repo, tmp_path):
     return SelfImprover(
         root=repo,
         journal=Journal(path=tmp_path / "journal.jsonl"),
-        test_command=(sys.executable, "-m", "pytest", "tests", "-q"))
+        test_command=(sys.executable, "-m", "pytest", "tests"))
 
 
 def owner_id():
@@ -184,6 +184,38 @@ def test_an_ambiguous_edit_is_refused(improver, repo):
 def test_a_missing_file_is_refused(improver):
     out = improver.rehearse(Proposal("x", [Edit("nope.py", "a", "b")]))
     assert not out.ok and "no such file" in out.message
+
+
+def test_the_test_counts_survive_a_noisy_run():
+    """stderr is appended after stdout and pytest's "N passed" line is in
+    stdout, so reading only the tail of a run with a long warnings block
+    reported "None passed, None failed" on a change that had passed
+    everything. A rehearsal that cannot say what happened is not evidence.
+    """
+    from nova_self.improve import _parse_pytest
+    noisy = ("1108 passed, 2 warnings in 187.65s\n"
+             + "warning: something verbose\n" * 500)
+    assert _parse_pytest(noisy) == (1108, 0)
+    assert _parse_pytest("3 failed, 1105 passed in 190s") == (1105, 3)
+    assert _parse_pytest("no summary here") == (None, None)
+
+
+def test_the_test_command_does_not_silence_its_own_result():
+    """pytest.ini already sets -q in addopts. Passing it again makes -qq,
+    which suppresses the summary line, and the rehearsal then reported
+    "None passed, None failed" about a run in which everything passed.
+    A rehearsal that cannot say what happened is not evidence.
+    """
+    from nova_self.improve import DEFAULT_TEST_COMMAND
+    assert "-q" not in DEFAULT_TEST_COMMAND
+
+
+def test_a_rehearsal_reports_how_many_tests_ran(improver):
+    """The counts are the evidence, so their absence is a failure of the
+    harness and has to be visible as one."""
+    out = improver.rehearse(Proposal("double is unclear", [GOOD]))
+    assert out.tests_passed == 2, out.output[-500:]
+    assert out.tests_failed == 0
 
 
 # ── who may apply ────────────────────────────────────────────────────────────
