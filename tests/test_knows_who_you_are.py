@@ -32,9 +32,21 @@ def test_memory_loads_in_the_desktops_import_order():
     assert meta, "memory came back empty; NOVA starts the session knowing nothing"
 
 
-def test_the_memory_context_is_not_empty():
-    ctx = ls._build_memory_context(ls._load_meta())
-    assert ctx.strip(), "no background memory reaches the model"
+def test_what_memory_holds_reaches_the_model():
+    """Seeded here rather than read from whatever the machine happens to hold.
+
+    This used to assert only that the context was non-empty, which passed
+    because the developer's own memory file had things in it. Once the suite
+    was given its own data directory -- it had been writing test fixtures into
+    that file -- there was nothing to read and the test failed, having never
+    really tested the plumbing it was named for. So it puts a fact in and
+    checks that the fact comes out.
+    """
+    meta = dict(ls._load_meta())
+    meta["user_name"] = "Samuel Chibuzor Asagwara"
+    ctx = ls._build_memory_context(meta)
+    assert "Samuel Chibuzor Asagwara" in ctx, (
+        "memory was loaded but nothing in it reaches the model")
 
 
 def test_the_cycle_is_broken_deliberately_and_says_so():

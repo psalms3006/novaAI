@@ -11,8 +11,19 @@ own throwaway values afterwards.
 from __future__ import annotations
 
 import os
+import tempfile
 
 import pytest
+
+#: Where the suite is allowed to keep NOVA's user data.
+#:
+#: A dev run stores it in the working directory, and for pytest that is the
+#: repository, so the suite was writing test fixtures into the developer's own
+#: living_memory.json and memory index. Set before any NOVA module is
+#: imported, because nova.py resolves the directory at import time.
+_DATA_SANDBOX = tempfile.mkdtemp(prefix="nova-test-data-")
+os.environ["NOVA_DATA_DIR"] = _DATA_SANDBOX
+
 
 _PRODUCTION_KEYS = (
     "DATABASE_URL",

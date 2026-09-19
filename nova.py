@@ -305,7 +305,23 @@ OFFLINE_TIMEOUTS       = _cfg("offline",    "timeouts",       {"tinyllama": 15})
 
 # File paths — frozen (installed) builds keep user data in %APPDATA%\NOVA so
 # the install directory stays clean for upgrades/uninstall; dev runs use CWD.
-if getattr(sys, "frozen", False) and os.getenv("APPDATA"):
+#: Set NOVA_DATA_DIR to put the user data somewhere else entirely.
+#:
+#: Added because a dev run keeps its data in the working directory, and the
+#: working directory for `pytest` is the repository. The suite was therefore
+#: writing into the developer's own living_memory.json -- a tracked file --
+#: and the fixtures piled up in it: "imaginary pet: Quantum", "number
+#: associated with test: 7319", four competing answers about which English
+#: the user prefers. That file is what NOVA reads in development, so the
+#: tests were teaching her things nobody had said.
+_env_data_dir = os.getenv("NOVA_DATA_DIR", "").strip()
+if _env_data_dir:
+    _DATA_DIR = Path(_env_data_dir)
+    try:
+        _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        _DATA_DIR = Path(".")
+elif getattr(sys, "frozen", False) and os.getenv("APPDATA"):
     _DATA_DIR = Path(os.getenv("APPDATA")) / "NOVA"
     try:
         _DATA_DIR.mkdir(parents=True, exist_ok=True)

@@ -75,6 +75,28 @@ _TYPE_KEYWORDS: Dict[str, List[str]] = {
 }
 _FALLBACK_TYPE = "fact"
 
+# ── transient observations ────────────────────────────────────────────────────
+#
+# What is on the screen right now is not a fact about the user. NOVA stored
+# this, explicitly, confirmed, at confidence 1.0:
+#
+#     "User opened setup screen, NOVA Cloud, own API key, or work offline
+#      prompt is visible"
+#
+# It was true for about four seconds. It is now a permanent, confident belief
+# about someone, sitting alongside their name and date of birth and competing
+# with them in retrieval. Screen awareness makes this failure easy to reach:
+# the model sees a window, decides it has learned something, and writes it
+# down for ever.
+_TRANSIENT_PATTERNS = [
+    re.compile(r"\bis (?:currently )?(?:visible|displayed|shown|showing|open)\b", re.I),
+    re.compile(r"\b(?:on|in) (?:the )?(?:screen|display)\b", re.I),
+    re.compile(r"\bscreen (?:shows|displays|currently)\b", re.I),
+    re.compile(r"\b(?:dialog|prompt|window|popup|modal|tab) is\b", re.I),
+    re.compile(r"\b(?:right now|at the moment|just now|at present)\b", re.I),
+    re.compile(r"\buser (?:opened|clicked|is viewing|is looking at)\b", re.I),
+]
+
 # keywords that raise importance
 _HIGH_IMPORTANCE = ["remember", "important", "confirmed", "decided", "preferred",
                     "never", "always", "my name", "must", "critical", "final"]
@@ -89,6 +111,63 @@ _CLUSTER_WORDS = {
     "supabase", "sqlite", "postgres", "mysql", "mongodb", "postgresql",
     "fast", "slow", "large", "small", "new", "old",
 }
+
+
+# ── claims: "<subject> is <value>" ────────────────────────────────────────────
+#
+# Contradiction detection used to require a correction word — "actually", "no
+# longer", "now". That is how a person phrases a correction when they know
+# they are correcting something, and it is not how they usually speak. Stating
+# the same thing differently is far more common, and it was never caught:
+#
+#     "Project NOVA team's company name is OMNIEL"
+#     "Project NOVA team's company name is Omnia."
+#
+# Both were stored, both confirmed, both at confidence 1.0, and retrieval then
+# returned whichever was closest to the question. Two confident answers to one
+# question is worse than none, because nothing downstream can tell that the
+# memory is in disagreement with itself.
+#
+# So a copula sentence is read as a claim: this subject has this value. Two
+# claims about the same subject with different values contradict, whatever
+# words they are dressed in.
+_COPULA_RE = re.compile(
+    r"^(?P<subject>.{3,120}?)\s+(?:is|are|was|were)\s+(?P<value>.+)$", re.I)
+
+#: Dropped from the subject before comparing, so "my full name" and "the full
+#: name" are recognised as the same subject.
+_SUBJECT_STOP = {"the", "a", "an", "of", "my", "our", "your", "their", "its",
+                 "his", "her",
+                 # the orphan left by stripping the apostrophe out of a
+                 # possessive, so "user's full name" and "users full name"
+                 # are one subject rather than two.
+                 "s"}
+
+
+def _claim(text: str) -> Optional[tuple]:
+    """Read "<subject> is <value>" as (subject_key, value), or None.
+
+    None for most sentences, which is the point: this is deliberately narrow.
+    A copula asserts that a subject *has* a value, so a second value for the
+    same subject is a correction. Verbs like "likes" or "uses" do not work
+    that way — "I like coffee" and "I like tea" are both true — so only the
+    copula is read this way.
+
+    Subjects of fewer than two content words are rejected. "It is broken" and
+    "NOVA is slow" carry nothing specific enough to match on, and matching
+    them would supersede unrelated facts about the same single noun.
+    """
+    m = _COPULA_RE.match((text or "").strip().rstrip("."))
+    if not m:
+        return None
+    subject = re.sub(r"[^a-z0-9 ]+", " ", m.group("subject").lower())
+    words = tuple(w for w in subject.split() if w not in _SUBJECT_STOP)
+    if len(words) < 2:
+        return None
+    value = " ".join(re.sub(r"[^a-z0-9 ]+", " ", m.group("value").lower()).split())
+    if not value:
+        return None
+    return (words, value)
 
 
 class LivingMemory:
@@ -166,6 +245,16 @@ class LivingMemory:
     def is_sensitive(text: str) -> bool:
         return any(p.search(text) for p in _SECRET_PATTERNS)
 
+    @staticmethod
+    def is_transient(text: str) -> bool:
+        """Is this a passing observation rather than something durable?
+
+        Refused rather than stored quietly at low confidence, because the
+        caller is usually the model deciding it has learned something, and a
+        refusal with a reason is what stops it deciding that again.
+        """
+        return any(p.search(text) for p in _TRANSIENT_PATTERNS)
+
     # ── record ops ───────────────────────────────────────────────────────────
     def _project_of(self, text: str) -> str:
         for p in ("ORIN", "KIWI", "VYREN", "ARVO", "NOVA", "OMNIEL", "KIWI2"):
@@ -182,6 +271,10 @@ class LivingMemory:
             raise ValueError("nothing to remember")
         if self.is_sensitive(text):
             raise ValueError("refusing to store what looks like a secret (key/password)")
+        if self.is_transient(text):
+            raise ValueError(
+                "that describes what is happening right now, not something "
+                "durable about the user — not storing it as a permanent fact")
         return self._upsert(text, type="fact", source=source, confirmed=confirmed,
                             project=project or self._project_of(text),
                             importance=(importance if importance is not None else 0.9),
@@ -190,7 +283,7 @@ class LivingMemory:
     def _upsert(self, text: str, type: str, source: str, confirmed: bool,
                 project: str, importance: float, explicit: bool) -> Dict[str, Any]:
         with self._lock:
-            existing = self._find_exact(text)
+            existing = self._find_exact(text) or self._find_same_claim(text)
             if existing:
                 existing["updated"] = time.time()
                 existing["access_count"] = existing.get("access_count", 0)
@@ -199,6 +292,18 @@ class LivingMemory:
                     existing["importance"] = round(importance, 3)
                 existing["type"] = existing.get("type") or type
                 self._metrics["updated"] += 1
+                # Saying something NOVA already believes is still a correction
+                # of anything that disagrees with it. Returning here without
+                # checking is how a store that already held two answers to one
+                # question kept holding them: the correct answer was present,
+                # so restating it matched and changed nothing, and the wrong
+                # answer beside it was never looked at. Found on the real
+                # store, where "the company is OMNIEL" left "the company is
+                # Omnia" standing next to it.
+                clash = self._detect_conflict(text, project)
+                if clash is not None and clash is not existing:
+                    self._supersede(clash, text)
+                    self._metrics["superseded"] += 1
                 self._save()
                 return existing
 
@@ -250,6 +355,23 @@ class LivingMemory:
                 return r
         return None
 
+    def _find_same_claim(self, text: str) -> Optional[Dict[str, Any]]:
+        """A live record asserting the very same thing, worded differently.
+
+        "…is OMNIEL" and "…is OMNIEL." are one fact, and storing them twice
+        is how a store of five memories ends up with two of them saying the
+        same thing. Exact-text matching cannot see it; the claim can.
+        """
+        claim = _claim(text)
+        if claim is None:
+            return None
+        for r in self._records:
+            if r.get("superseded_by"):
+                continue
+            if _claim(r.get("text", "")) == claim:
+                return r
+        return None
+
     def _detect_conflict(self, text: str, project: str) -> Optional[Dict[str, Any]]:
         """Find a live record that the new fact contradicts.
 
@@ -260,6 +382,21 @@ class LivingMemory:
         from the polarity/attribute cluster). Candidates that already agree on a
         value dimension are treated as consistent and never superseded.
         """
+        # Same subject, different value: a contradiction whatever words it
+        # comes in. Checked before the correction-word path below because it
+        # needs no announcement from the speaker, and people do not announce.
+        claim = _claim(text)
+        if claim is not None:
+            subject, value = claim
+            for r in self._records:
+                if r.get("superseded_by"):
+                    continue
+                if project and r.get("project") and project != r.get("project"):
+                    continue
+                other = _claim(r.get("text", ""))
+                if other is not None and other[0] == subject and other[1] != value:
+                    return r
+
         low = text.lower()
         is_correction = any(k in low for k in
                             ("no longer", "isn't", "is not", "not anymore",
