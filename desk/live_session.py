@@ -657,6 +657,39 @@ def _identity_block() -> str:
     someone their name for the fifth time is not a small flaw in an assistant
     meant to know them.
     """
+    owner = None
+    try:
+        from nova_identity.people import PeopleRegistry
+        owner = PeopleRegistry().owner()
+    except Exception:
+        owner = None
+
+    if owner is not None and owner.names():
+        # The registry knows the difference between a name and a form of
+        # address, which the settings pair below cannot express. "Sir" is
+        # what NOVA calls him; "Samuel Chibuzor Asagwara" is what belongs
+        # in a box marked full name, and a model told only "the user is
+        # Sir" will happily write that into one.
+        name = owner.legal_name or owner.names()[0]
+        lines = [f"You are talking to {name}."]
+        other = [a for a in owner.aliases if a.lower() != name.lower()]
+        if other:
+            lines.append(f"{name} also goes by {', '.join(other)}. "
+                         "They are all the same person.")
+        if owner.preferred_address:
+            lines.append(
+                f"Address them as {owner.preferred_address!r} when "
+                f"speaking to them. That is a form of address, not their "
+                f"name: if anything asks for their name, it is {name}.")
+        if owner.role:
+            lines.append(f"{name} is {owner.role}.")
+        lines.append(
+            f"You already know who {name} is. Do not ask their name, and "
+            "do not ask them to introduce themselves.")
+        return "[WHO YOU ARE TALKING TO]\n" + "\n".join(lines)
+
+    # No registry yet: the settings pair this replaced, unchanged, so an
+    # installation where nobody has enrolled behaves exactly as before.
     try:
         from desk import settings as _s
         name = str(_s.get("user_name", "") or "").strip()
