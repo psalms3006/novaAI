@@ -597,19 +597,70 @@ def _resolve(name: str, default: Any = None) -> Any:
         return default
 
 
+def _import_memory():
+    """`memory_extra`, imported in an order that actually works.
+
+    memory_extra imports nova, and nova imports memory_extra. Importing
+    memory_extra *first* therefore fails with a partially-initialised module,
+    and the failure was being swallowed into an empty dict — which is not
+    "memory is unavailable", it is NOVA with amnesia. Every session that took
+    this path began not knowing the user's name, having been told it many
+    times, and asked again.
+
+    The terminal never hit it because nova.py is its entry point, so nova was
+    always fully imported first. The desktop is the other way round, which is
+    a large part of why the two surfaces did not behave alike.
+
+    Importing nova first breaks the cycle the same way the terminal does.
+    """
+    import nova            # noqa: F401  — resolves the cycle; do not remove
+    import memory_extra
+    return memory_extra
+
+
+def _identity_block() -> str:
+    """Who NOVA is talking to, stated rather than retrieved.
+
+    This is deliberately not part of the semantic memory context below.
+    Memory holds what NOVA has learned; this holds what she was told, and the
+    difference matters: a name recalled by similarity search competes with
+    four other remembered names and loses about as often as it wins. Asking
+    someone their name for the fifth time is not a small flaw in an assistant
+    meant to know them.
+    """
+    try:
+        from desk import settings as _s
+        name = str(_s.get("user_name", "") or "").strip()
+        role = str(_s.get("user_role", "") or "").strip()
+    except Exception:
+        return ""
+    if not name or name.lower() in _PLACEHOLDER_NAMES:
+        return ""
+    lines = [f"You are talking to {name}."]
+    if role:
+        lines.append(f"{name} is {role}.")
+    lines.append(
+        f"You already know who {name} is. Do not ask their name, and do not "
+        "ask them to introduce themselves.")
+    return "[WHO YOU ARE TALKING TO]\n" + "\n".join(lines)
+
+
 def _load_meta() -> dict:
     try:
-        from memory_extra import load_memory
-        return load_memory()
-    except Exception:
+        return _import_memory().load_memory()
+    except Exception as e:
+        # Loudly. Amnesia that announces itself is a bug report; amnesia that
+        # does not is NOVA seeming not to know someone she has known for weeks.
+        _log("[LIVE] could not load memory, so NOVA starts this session "
+             "knowing nothing about the user: %s", e)
         return {}
 
 
 def _build_memory_context(meta: dict) -> str:
     try:
-        from memory_extra import build_memory_context
-        return build_memory_context(meta)
-    except Exception:
+        return _import_memory().build_memory_context(meta)
+    except Exception as e:
+        _log("[LIVE] memory context unavailable: %s", e)
         try:
             from live_extra import build_memory_context
             return build_memory_context(meta)
@@ -1109,12 +1160,22 @@ class LiveManager:
                         # stays at zero and the user still hears breakup, the
                         # audio left here intact and the fault is downstream:
                         # the device, its driver, or a Bluetooth link.
-                        if primed and not self._turn_done_flag:
+                        # An empty queue is not yet a gap. The device still
+                        # holds up to half a second of audio, and refilling it
+                        # inside that window is inaudible — which is what the
+                        # cushion is for. Only once the device has drained too
+                        # is there actual silence in the room.
+                        #
+                        # Counting the queue alone reported starvation on
+                        # every ordinary network wobble and would have sent us
+                        # looking for a fault that nobody could hear.
+                        if (primed and not self._turn_done_flag
+                                and self._playback_drained()):
                             self._starved += 1
                             if self._starved in (1, 10, 50, 200):
-                                _log("[LIVE] speaker starved mid-turn "
-                                     "(%d time(s)) — audio is arriving slower "
-                                     "than it plays", self._starved)
+                                _log("[LIVE] speaker ran dry mid-turn "
+                                     "(%d time(s)) — audio arrived slower than "
+                                     "it plays and the device emptied", self._starved)
                         if self._play_generation != generation:
                             generation = self._play_generation
                             preroll.clear(); preroll_bytes = 0; primed = False
@@ -1684,6 +1745,11 @@ class LiveManager:
         meta = _load_meta()
         mem_ctx = _build_memory_context(meta)
         sys_prompt = _resolve("NOVA_SYSTEM_PROMPT", "")
+        identity = _identity_block()
+        if identity:
+            # Before background memory, because it outranks it: memory is what
+            # NOVA has picked up, this is what she has been told.
+            sys_prompt += f"\n\n{identity}"
         if mem_ctx:
             sys_prompt += f"\n\n[BACKGROUND MEMORY]\n{mem_ctx}"
         tool_decls = _resolve("TOOL_DECLARATIONS", [])

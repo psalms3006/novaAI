@@ -29,6 +29,17 @@ _DEFAULTS = {
     # ── identity ───────────────────────────────────────────────
     "user_name": "User",            # neutral default; user may change it
     "user_name_pronunciation": "",  # how to say it, when spelling does not say
+    # Who this person is to NOVA, in their own words: "the person who built
+    # me", "my colleague", whatever fits. Free text, and it reaches the model
+    # verbatim.
+    #
+    # It exists because semantic recall could not answer it. Memory had
+    # accumulated five different answers to "what is the user called" -- a
+    # full name, two nicknames, two corrections -- and retrieval returned
+    # whichever was closest to the question, so NOVA was inconsistent about a
+    # person she had been introduced to many times, and kept asking again.
+    # Identity is not a fact to search for; it is a fact to be told.
+    "user_role": "",
     "mic_device": "",               # input device name or index; blank = system default
     "voice_language": "en-US",      # BCP-47 hint for speech recognition
     "user_system_prompt": "",       # user's custom NOVA instructions (reaches inference)
