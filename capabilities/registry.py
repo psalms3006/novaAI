@@ -183,11 +183,11 @@ class CapabilityRegistry:
             return str(spec.handler(args, ctx))
 
         if spec is None:
+            if self.fallback_fn is not None:
+                return str(self.fallback_fn(name, args, ctx.meta or {}))
             dynamic = resolve_dynamic_handler(name)
             if dynamic is not None:
                 return str(dynamic(args, ctx))
-            if self.fallback_fn is not None:
-                return str(self.fallback_fn(name, args, ctx.meta or {}))
             raise CapabilityNotFoundError(
                 f"Unknown capability '{name}'. Available: {', '.join(self.names()) or '(none)'}."
             )
@@ -197,11 +197,27 @@ class CapabilityRegistry:
                 f"Capability '{name}' is not available on platform '{ctx.platform or self.platform}'."
             )
 
+        # The configured dispatcher comes first, and the dynamic `actions/`
+        # adapter is only the last resort.
+        #
+        # It used to be the other way round. The adapter imports
+        # `actions/<tool>.py` and calls its `execute()` directly, while the
+        # authorisation check and the confirmation prompt live in the
+        # dispatcher (`nova._execute_tool_sync`). So on the typed-chat
+        # surface, every tool that happened to have an `actions/` module --
+        # `file_controller` and `computer_settings` among them, both
+        # consequential -- reached the action without anyone being asked.
+        # The voice surface, which calls the dispatcher directly, refused the
+        # same call correctly.
+        #
+        # Nothing is lost by the reordering: the dispatcher's own final branch
+        # does the same `importlib.import_module(f"actions.{tool}")` and adds
+        # the audit line the adapter never wrote.
+        if self.fallback_fn is not None:
+            return str(self.fallback_fn(name, args, ctx.meta or {}))
         dynamic = resolve_dynamic_handler(name)
         if dynamic is not None:
             return str(dynamic(args, ctx))
-        if self.fallback_fn is not None:
-            return str(self.fallback_fn(name, args, ctx.meta or {}))
 
         raise CapabilityNotFoundError(
             f"Capability '{name}' has no handler and no fallback dispatcher is configured."
