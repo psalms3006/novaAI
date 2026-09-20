@@ -406,6 +406,62 @@ class LiveEvent:
         return d
 
 
+class MicLevelThrottle:
+    """Decides which microphone amplitudes are worth sending to the surface.
+
+    The level is read inside the real-time audio callback, roughly fifty
+    times a second. Publishing all of it would spend the socket on frames no
+    one can see the difference between, and the callback has a deadline.
+
+    Two exceptions to the fixed rate, both about honesty rather than volume:
+
+    * The *onset* of speech goes immediately. Waiting up to 80 ms for the next
+      tick is visible -- the orb reacts after the user has started talking,
+      which reads as lag in the assistant rather than in the animation.
+    * Silence is sent until it has settled and then stops. A quiet room does
+      not need restating twenty times a second; but the first few frames of
+      quiet do, or the orb stays lit after the user stops.
+    """
+
+    #: A jump this large counts as an onset and bypasses the rate limit.
+    ONSET_DELTA = 0.12
+    #: How many consecutive near-zero readings to send before going silent.
+    SETTLE_SENDS = 2
+    #: Below this, a reading counts as "nothing happening".
+    QUIET_LEVEL = 0.01
+
+    def __init__(self, hz: float = 12.0) -> None:
+        self._interval = 1.0 / max(1.0, hz)
+        self._last_sent_at = 0.0
+        self._last_level = 0.0
+        self._quiet_sends = 0
+        self._now = time.time          # seam: tests drive this
+
+    def should_send(self, level: float) -> bool:
+        now = self._now()
+        previous = self._last_level
+        self._last_level = level
+
+        if level < self.QUIET_LEVEL:
+            if self._quiet_sends >= self.SETTLE_SENDS:
+                return False
+            self._quiet_sends += 1
+            self._last_sent_at = now
+            return True
+
+        self._quiet_sends = 0
+
+        if level - previous >= self.ONSET_DELTA:
+            self._last_sent_at = now
+            return True
+
+        if (now - self._last_sent_at) >= self._interval:
+            self._last_sent_at = now
+            return True
+
+        return False
+
+
 def _log(msg: str, *a: Any) -> None:
     try:
         import nova as _nova
@@ -808,6 +864,8 @@ class LiveManager:
         self._last_audio_at = 0.0
         self._t_mic_ready = 0.0
         self._mic_dropped = 0
+        #: Rate-limits microphone amplitude on its way to the orb.
+        self._mic_level_throttle = MicLevelThrottle()
         self._send_total = 0.0
         self._send_count = 0
         self._send_worst = 0.0
@@ -1669,6 +1727,21 @@ class LiveManager:
             # mute-while-speaking, echo cancellation, barge-in detection.
             try:
                 frame = self._gate.process(np.asarray(indata).reshape(-1))
+                # The gate has just measured this frame against the room floor
+                # in order to decide what to transmit. Pass the same number to
+                # the surface so the orb can show that someone is talking --
+                # it was previously driven only by NOVA's *outgoing* audio, so
+                # it sat still during the one moment it most needed to look
+                # like it was listening. Throttled: this is a real-time
+                # callback and the socket does not need fifty updates a
+                # second.
+                level = self._gate.last_level
+                if self._mic_level_throttle.should_send(level):
+                    self._publish(LiveEvent(
+                        "mic_level",
+                        level=round(level, 4),
+                        hearing=not self._gate.last_was_quiet,
+                    ))
                 # Two kinds of nothing: the gate muting NOVA's own voice, and
                 # a room with no one talking in it. Both are zeroes as far as
                 # the model is concerned, and neither is worth 32 KB/s of a

@@ -653,6 +653,11 @@ class VoiceGate:
         self._last_loud_at = 0.0
         #: True when this frame is room tone rather than anyone talking.
         self.last_was_quiet = False
+        #: Amplitude of the most recent mic frame, 0..1. Read by the desktop
+        #: surface so the orb can react to the user's voice; the orb used to
+        #: be driven only by NOVA's *outgoing* audio, so it sat still during
+        #: the one moment it most needed to look like it was listening.
+        self.last_level = 0.0
         #: Frames of NOVA's own speech to observe before a barge-in is
         #: believable. The echo path is unknown at the start of every turn,
         #: and 4 frames is ~256 ms — long enough for the filter to lock on,
@@ -861,6 +866,11 @@ class VoiceGate:
         mid-sentence, and the gap before "...actually, no" all still arrive.
         """
         level = frame_rms(frame)
+        # Normalised for anyone drawing it. The gate measures this on every
+        # frame anyway to decide what is worth transmitting; the orb needs the
+        # same number to show that someone is talking, and computing it twice
+        # -- or opening a second microphone to get it -- would be absurd.
+        self.last_level = min(1.0, level / 32768.0)
         if self._room_floor <= 0.0:
             self._room_floor = level
         loud = level > max(self._room_floor * QUIET_FLOOR_MARGIN, QUIET_FLOOR_MIN)

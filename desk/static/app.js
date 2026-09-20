@@ -389,6 +389,19 @@ function handleLiveEvent(ev) {
       window.__novaAudioLevel = ev.level || 0;
       if (orb && orb.setAmplitude) orb.setAmplitude(ev.level || 0);
       break;
+    case "mic_level":
+      // The user's own voice. audio_level above is NOVA's outgoing audio, so
+      // before this arrived the orb pulsed only when NOVA spoke and sat still
+      // while the user did.
+      //
+      // `hearing` is the gate's judgement against a floor learned from this
+      // room, not a fixed threshold, so a fan or a laptop under load does not
+      // make the orb look like it is listening to someone.
+      if (orb && orb.setAmplitude) orb.setAmplitude(ev.level || 0);
+      if (state.listening && !state.speaking) {
+        setOrb(ev.hearing ? "hearing" : "listening");
+      }
+      break;
     case "user_transcript":
       addTranscript(ev.text, "user");
       convoAppend("user", ev.text);
@@ -679,6 +692,7 @@ function setOrb(st) {
     const labels = {
       idle: "Ready",
       listening: "Listening...",
+      hearing: "Listening...",   // same words; the orb carries the difference
       thinking: "Thinking...",
       speaking: "Speaking...",
       executing: "Working...",

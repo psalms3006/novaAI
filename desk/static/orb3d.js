@@ -33,6 +33,12 @@ const STATES = {
   error:       { hue: 0.02, amp: 0.11, freq: 1.20, speed: 0.30, rim: 0.90, spin: 0.030, glow: 0.62, chaos: 0.65 },
   offline:     { hue: 0.58, amp: 0.05, freq: 0.80, speed: 0.06, rim: 0.50, spin: 0.012, glow: 0.25, chaos: 0.04 },
 };
+// Someone is actually talking, as opposed to the microphone merely being
+// open. Brighter and more responsive than `listening`, and deliberately a
+// distinct entry rather than an alias: "the mic is on" and "I can hear you"
+// are different things to tell a person, and the orb is the only place NOVA
+// says either of them without words.
+STATES.hearing = { hue: 0.46, amp: 0.30, freq: 1.45, speed: 0.55, rim: 1.20, spin: 0.085, glow: 0.92, chaos: 0.26 };
 STATES.executing = STATES.working;
 STATES.connecting = STATES.thinking;
 STATES.awaiting_input = STATES.listening;
