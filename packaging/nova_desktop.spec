@@ -39,7 +39,15 @@ def _build_stamp():
         except Exception:
             return default
 
-    dirty = _git("status", "--porcelain", default="?")
+    # Not _git(): a clean tree prints nothing, and an empty result is the
+    # answer here rather than a failure to be defaulted away.
+    try:
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=ROOT,
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+    except Exception:
+        dirty = "?"
     stamp = {
         "commit": _git("rev-parse", "HEAD"),
         "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
