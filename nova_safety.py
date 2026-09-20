@@ -132,6 +132,7 @@ def safety_gate(
     args: dict,
     get_confirmation: Callable[[], str],
     speak_fn: Optional[Callable[[str], None]] = None,
+    trust: Optional[object] = None,
 ) -> Optional[str]:
     """
     Returns:
@@ -141,10 +142,47 @@ def safety_gate(
     get_confirmation must return the user's text response (blocking call).
     Each consequential action asks independently — no blanket pre-approval.
     """
+    action = args.get("action", "")
+
+    # Whose instruction is this, really?
+    #
+    # The caller usually does not say, so look it up. A turn that read a web
+    # page or a document is marked untrusted for its remainder, and that is
+    # the case this gate exists for.
+    if trust is None:
+        try:
+            from nova_core import trust as _trust_ctx
+            trust = _trust_ctx.current_trust()
+        except Exception:
+            trust = None
+
+    tainted = trust is not None and str(getattr(trust, "value", trust)) != "user"
+
+    if tainted:
+        # Under taint the permission engine decides, for every tool — not
+        # just the seven named below.
+        #
+        # It already returns CONFIRM for computer_control, open_app,
+        # app_control and computer_settings at UNTRUSTED trust, and that
+        # verdict used to be thrown away twice: this function returned None
+        # immediately for anything absent from CONSEQUENTIAL_TOOLS, and when
+        # it did ask the engine it asked without `trust=`, so the answer came
+        # back for Trust.USER — an ALLOW that overrode the CONFIRM the caller
+        # had obtained under taint. Synthetic keystrokes are indistinguishable
+        # from the user typing, so that was the widest way in.
+        try:
+            from nova_core import permissions as _perm
+            decision = _perm.check_tool("nova", tool_name, trust=trust, args=args)
+            if decision.effect is _perm.Effect.ALLOW:
+                return None
+            if decision.effect is _perm.Effect.DENY:
+                return f"Refused: {decision.reason}."
+            return _ask_permission(tool_name, args, get_confirmation, speak_fn)
+        except ImportError:
+            pass   # engine unreachable — fall through to the static list
+
     if tool_name not in CONSEQUENTIAL_TOOLS:
         return None  # unrestricted — go ahead
-
-    action = args.get("action", "")
 
     # Ask the permission engine, which is the one place that decides this.
     #
@@ -168,14 +206,33 @@ def safety_gate(
     if action in safe_for_this_tool:
         return None  # read-only variant — go ahead
 
-    description = CONSEQUENTIAL_TOOLS[tool_name]
-    what = _describe_action(tool_name, args)
+    return _ask_permission(tool_name, args, get_confirmation, speak_fn)
 
-    prompt = (
-        f"I'm about to {description}. "
-        f"Specifically: {what}. "
-        f"Should I proceed? (yes/no)"
-    )
+
+def _ask_permission(
+    tool_name: str,
+    args: dict,
+    get_confirmation: Callable[[], str],
+    speak_fn: Optional[Callable[[str], None]] = None,
+) -> Optional[str]:
+    """Put the question to the user. None to proceed, a string to refuse."""
+    # Tools reached under taint are not in the consequential map, so the
+    # description has to degrade to something still readable aloud.
+    what = _describe_action(tool_name, args)
+    description = CONSEQUENTIAL_TOOLS.get(tool_name)
+
+    if description:
+        prompt = (
+            f"I'm about to {description}. "
+            f"Specifically: {what}. "
+            f"Should I proceed? (yes/no)"
+        )
+    else:
+        # Reached under taint, where the tool has no standing description.
+        # "I'm about to use computer_control. Specifically: type ..." says the
+        # same thing twice and names an internal tool; just say what happens.
+        description = what
+        prompt = f"I'm about to {what}. Should I proceed? (yes/no)"
 
     if speak_fn:
         try:
@@ -208,6 +265,24 @@ def safety_gate(
 def _describe_action(tool_name: str, args: dict) -> str:
     """Human-readable summary of what the tool will do."""
     action = args.get("action", "")
+    # The tools reachable under taint. This question is read aloud, so it has
+    # to name what will happen rather than dumping a tool name and a JSON
+    # blob at someone who is being asked to approve it.
+    if tool_name in ("computer_control", "computer_settings", "app_control"):
+        if action in ("type", "type_text", "write"):
+            text = (args.get("text") or args.get("value") or "")[:60]
+            return f"type {text!r} into whatever window is in front"
+        if action in ("hotkey", "press"):
+            keys = args.get("keys") or args.get("key") or "?"
+            return f"press {keys}"
+        if action in ("click", "doubleClick", "rightClick"):
+            return "click where the mouse is pointing"
+        if action:
+            return f"{action.replace('_', ' ')} on this computer"
+    if tool_name == "open_app":
+        return f"open {args.get('app_name') or args.get('app') or 'an application'}"
+    if tool_name == "close_app":
+        return f"close {args.get('app_name') or args.get('app') or 'an application'}"
     if tool_name == "self_editor":
         if action == "patch":
             old = (args.get("old_code") or "")[:60]
