@@ -13,6 +13,52 @@ from PyInstaller.utils.hooks import collect_submodules  # kept for future use if
 block_cipher = None
 ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 
+
+def _build_stamp():
+    """Record which commit this bundle was cut from.
+
+    The previous build matched no commit at all: its copy of
+    desk/static/app.js hashed to something that appears in no revision,
+    because it was built from a dirty working tree. "What is in the EXE" then
+    has no answer, and a packaged smoke test can pass against code that was
+    never committed.
+
+    Written into the bundle so the question is always answerable from the
+    artifact itself, and so a test can compare it against HEAD.
+    """
+    import json
+    import subprocess
+    import time
+
+    def _git(*args, default="unknown"):
+        try:
+            out = subprocess.run(
+                ["git", *args], cwd=ROOT, capture_output=True, text=True, timeout=15,
+            )
+            return out.stdout.strip() or default
+        except Exception:
+            return default
+
+    dirty = _git("status", "--porcelain", default="?")
+    stamp = {
+        "commit": _git("rev-parse", "HEAD"),
+        "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
+        "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "clean_tree": dirty == "",
+        "dirty_files": [ln[3:] for ln in dirty.splitlines()[:20]] if dirty else [],
+    }
+    path = os.path.join(ROOT, "build", "BUILDINFO.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stamp, handle, indent=2)
+    if not stamp["clean_tree"]:
+        print("WARNING: building from a dirty tree; this bundle will not "
+              "correspond to any commit.")
+    return path
+
+
+_buildinfo = _build_stamp()
+
 # Auto-detect Python shared library
 _python_dll = os.path.join(os.path.dirname(sys.executable), "python311.dll")
 if not os.path.exists(_python_dll):
@@ -121,7 +167,12 @@ hidden = [
 # and the memory.* layers were simply absent from the build and the tools
 # reported themselves as missing at runtime.
 for _pkg in ("actions", "capabilities", "core", "orchestrator", "memory",
-             "trust", "integrations", "tools", "agent"):
+             "trust", "integrations", "tools", "agent",
+             # Both are reached only by function-local imports (nova.py's
+             # identity lookup, desk/live_session.py's speaker check), and
+             # both were absent from the last build: a PYZ table-of-contents
+             # dump listed 36 nova_* modules and neither of these.
+             "nova_identity", "nova_self"):
     try:
         hidden += [m for m in collect_submodules(_pkg)
                    if not m.endswith(("._init_", ".__main__", "._smoke_test"))]
@@ -147,6 +198,8 @@ a = Analysis(
     binaries=_binaries,    datas=[
         # the SPA + vendored js/css
         (os.path.join(ROOT, "desk", "static"), "desk/static"),
+        # which commit this bundle came from — see _build_stamp above
+        (_buildinfo, "."),
         # NOTE: nova_embedder is deliberately NOT bundled. Loading it needs
         # sentence-transformers, which needs torch + transformers — all three
         # are excluded below to keep the installer near 200 MB rather than
@@ -177,7 +230,13 @@ a = Analysis(
         "torch", "torchvision", "torchaudio",       # not required by faster-whisper
         "matplotlib", "IPython", "pytest", "tkinter",
         "PyQt5", "PySide2", "PySide6",
-        "scipy", "sklearn", "transformers", "tensorflow", "onnxruntime",
+        # onnxruntime is NOT excluded: it is listed in `hidden` above, for the
+        # documented reason that it runs the real embedding model in the
+        # packaged app. Naming it here as well quietly won -- excludes beat
+        # hidden imports -- so the EXE shipped with semantic search degraded
+        # to keyword matching, which is exactly what the hidden import was
+        # added to prevent.
+        "scipy", "sklearn", "transformers", "tensorflow",
         "av", "librosa", "soundfile", "numba",
         "playwright",
         "uvicorn", "starlette", "gunicorn",
