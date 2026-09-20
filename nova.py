@@ -1090,18 +1090,18 @@ TOOL_DECLARATIONS = [
             "required": ["action"]
         }
     },
-        {
-        "name": "wake_detector",
-        "description": "Controls the NOVA wake word detector (nova_wake.py). Use when user says 'start listening', 'stop listening', 'disable wake word', 'enable wake word', 'is the wake detector running', or 'put NOVA to sleep'.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action": {"type": "STRING", "description": "start | stop | status | restart | install | uninstall | test"},
-                "confirm": {"type": "BOOLEAN", "description": "User confirmation for destructive actions like stop"}
-            },
-            "required": ["action"]
-        }
-    },
+    # wake_detector is NOT declared. It failed three ways at once: it declared
+    # no capabilities, so the permission engine denied it at every trust level;
+    # it looked for nova_wake.py on disk, which a frozen build does not ship;
+    # and the model was told to reach for it whenever the user said "stop
+    # listening", so that request always failed. Offering a capability that
+    # cannot succeed is worse than not offering it -- the user asks, NOVA
+    # refuses, and nothing explains that it was impossible from the start.
+    #
+    # The microphone can still be stopped: /api/live/mute -> LiveManager
+    # .set_muted(). Making that a model tool is a separate decision, because
+    # NOVA cannot hear "unmute" once she has muted herself, so only the UI
+    # could undo it.
     # ── Extra tools from nova_patch.py ──────────────────────────────
     *EXTRA_TOOL_DECLARATIONS,
 
