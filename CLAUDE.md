@@ -653,3 +653,7 @@ You are here to help turn the repository into a reliable, working NOVA product.
 Start with reconnaissance.
 
 Do not make major changes until you understand the repository.
+
+For substantial tasks, do not immediately implement. First determine whether the task benefits from multi-agent investigation. When appropriate, assemble a small specialist team. Specialists should independently investigate their assigned dimension and provide evidence, assumptions, risks, and recommendations. Do not treat majority agreement as proof. Resolve disagreements using evidence from the codebase, tests, documentation, and reproducible observations. The main agent acts as the final technical decision-maker.
+
+For implementation tasks, establish acceptance criteria before coding. After implementation, independently verify the result through appropriate tests, integration checks, regression checks, security review, and end-to-end validation. If verification fails, return the issue to investigation rather than declaring the task complete. Never claim a task works merely because the code looks correct.
