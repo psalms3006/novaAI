@@ -126,9 +126,24 @@ def test_every_top_level_nova_package_reaches_the_bundle():
     # Top-level modules too, not only packages. nova_paths and nova_proactive
     # are single files that the app imports at startup; checking directories
     # alone would have declared a bundle healthy while it was missing them.
+    #
+    # Four are deliberately absent and must not be reported as faults:
+    #
+    #   nova_desktop_app  is the entry script. PyInstaller compiles it into
+    #                     the bootstrap rather than the PYZ, so it is never
+    #                     listed there however healthy the build.
+    #   nova_wake         runs as a separate *process*, launched by path
+    #                     (`NOVA_DIR / "nova_wake.py"`). Bundling it as a
+    #                     module would not make that work, because the caller
+    #                     looks for a .py file on disk.
+    #   nova_ui           is imported only by nova_wake.
+    #   nova_patches      is reached through execute_extra_tool, which finds
+    #                     no execute_extra_tool in it, so the hook always
+    #                     returns None.
+    not_bundled = {"nova_desktop_app", "nova_wake", "nova_ui", "nova_patches"}
     modules = sorted(
         p.stem for p in REPO.glob("nova_*.py")
-        if p.is_file() and not p.stem.endswith("_test")
+        if p.is_file() and p.stem not in not_bundled
     )
 
     expected = packages + modules

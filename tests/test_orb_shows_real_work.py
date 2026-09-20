@@ -37,13 +37,30 @@ def _manager(tmp_path, executor=None, **kw):
     )
 
 
-def _drain(manager, task, timeout=10.0):
+def _drain(manager, task, timeout=10.0, settle=None):
+    """Run the manager until the task finishes.
+
+    `settle` is the activity list, when the caller cares about it. The task's
+    status reaches its terminal value inside _run_task and the activity
+    release fires afterwards in the worker's finally, so waiting on the status
+    alone leaves a window where the work is done and the signal has not
+    landed. That window is invisible in isolation and opens under the load of
+    the full suite.
+    """
     terminal = {"COMPLETED", "FAILED", "CANCELLED", "PARTIALLY_COMPLETED",
                 "UNVERIFIED"}
+
+    def _done():
+        if task.status not in terminal:
+            return False
+        if settle is None:
+            return True
+        return bool(settle) and settle[-1] is False
+
     manager.start()
     try:
         deadline = time.time() + timeout
-        while time.time() < deadline and task.status not in terminal:
+        while time.time() < deadline and not _done():
             time.sleep(0.02)
     finally:
         manager.stop()
@@ -61,7 +78,7 @@ def test_the_task_manager_reports_when_it_starts_and_stops_working(tmp_path):
 
     task = manager.submit("Research something",
                           [{"tool": "web_search", "args": {"query": "x"}}])
-    _drain(manager, task)
+    _drain(manager, task, settle=seen)
 
     assert seen, "the task ran and reported nothing"
     assert seen[0] is True, f"first signal should be 'busy': {seen}"
@@ -74,16 +91,24 @@ def test_the_activity_signal_settles_after_the_last_task(tmp_path):
     manager = _manager(tmp_path)
     manager.set_on_activity(lambda busy: seen.append(busy))
 
-    first = manager.submit("One", [{"tool": "web_search", "args": {"query": "a"}}])
+    manager.submit("One", [{"tool": "web_search", "args": {"query": "a"}}])
     second = manager.submit("Two", [{"tool": "web_search", "args": {"query": "b"}}])
     manager.start()
     try:
+        # Wait for the *signal*, not the task status.
+        #
+        # The status reaches COMPLETED inside _run_task, and the release fires
+        # afterwards in the worker's finally. Waiting on the status therefore
+        # has a window where the task is done and the signal has not landed —
+        # which passed in isolation and failed under the load of the full
+        # suite, the least useful kind of red.
         deadline = time.time() + 10
-        while time.time() < deadline and second.status in ("QUEUED", "RUNNING"):
+        while time.time() < deadline and not (seen and seen[-1] is False):
             time.sleep(0.02)
     finally:
         manager.stop()
 
+    assert second.status == "COMPLETED", second.reason_for_stop
     assert seen[-1] is False, f"ended busy: {seen}"
 
 
@@ -109,7 +134,7 @@ def test_a_task_that_fails_still_releases_the_orb(tmp_path):
 
     task = manager.submit("Doomed",
                           [{"tool": "web_search", "args": {"query": "x"}}])
-    _drain(manager, task)
+    _drain(manager, task, settle=seen)
 
     assert task.status == "FAILED"
     assert seen[-1] is False, f"a failed task left the orb showing work: {seen}"
