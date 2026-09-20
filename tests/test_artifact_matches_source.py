@@ -116,12 +116,22 @@ def test_every_top_level_nova_package_reaches_the_bundle():
 
     listed = toc.read_text(encoding="utf-8", errors="replace")
 
-    expected = sorted(
+    packages = sorted(
         p.name for p in REPO.iterdir()
         if p.is_dir() and p.name.startswith("nova_")
         and (p / "__init__.py").exists()
         and p.name not in {"nova_cloud", "nova_embedder"}   # server-side / model data
     )
+
+    # Top-level modules too, not only packages. nova_paths and nova_proactive
+    # are single files that the app imports at startup; checking directories
+    # alone would have declared a bundle healthy while it was missing them.
+    modules = sorted(
+        p.stem for p in REPO.glob("nova_*.py")
+        if p.is_file() and not p.stem.endswith("_test")
+    )
+
+    expected = packages + modules
     missing = [name for name in expected if name not in listed]
 
     assert missing == [], (
