@@ -65,6 +65,20 @@ def _build_stamp():
     return path
 
 
+def _gmail_discovery():
+    """The single discovery document the Gmail connector needs, if present."""
+    try:
+        import googleapiclient
+        from pathlib import Path as _P
+        doc = (_P(googleapiclient.__file__).parent / "discovery_cache"
+               / "documents" / "gmail.v1.json")
+        if doc.exists():
+            return [(str(doc), "googleapiclient/discovery_cache/documents")]
+    except Exception:
+        pass
+    return []
+
+
 _buildinfo = _build_stamp()
 
 # Auto-detect Python shared library
@@ -105,6 +119,18 @@ hidden = [
     "nova_core.rag.embeddings", "nova_core.rag.store",
     "nova_core.rag.library", "nova_core.rag.api",
     "onnxruntime", "tokenizers",
+    # Gmail, read-only. googleapiclient resolves services dynamically, so
+    # none of this is visible to a static scan.
+    "googleapiclient", "googleapiclient.discovery",
+    "googleapiclient.discovery_cache",
+    "googleapiclient.discovery_cache.base",
+    "google_auth_oauthlib", "google_auth_oauthlib.flow",
+    "google.oauth2", "google.oauth2.credentials", "google.auth",
+    "google.auth.transport.requests",
+    # Single-file modules reached by function-local imports in nova.py.
+    "nova_paths", "nova_proactive", "nova_scheduler", "nova_activity",
+    "integrations", "integrations.accounts", "integrations.gmail",
+    "integrations.email_importance",
     "pypdf", "docx", "openpyxl", "pptx",
     "keyring", "keyring.backends", "keyring.backends.Windows",
     "keyring.backends.macOS", "keyring.backends.SecretService",
@@ -208,6 +234,12 @@ a = Analysis(
         (os.path.join(ROOT, "desk", "static"), "desk/static"),
         # which commit this bundle came from — see _build_stamp above
         (_buildinfo, "."),
+        # Gmail's discovery document only. googleapiclient ships 580 of these
+        # totalling 93 MB; bundling the lot to reach one 0.2 MB file would
+        # put a Google API catalogue in the installer. Without it build()
+        # falls back to fetching over HTTP, which works but needs the network
+        # at the moment of the first call.
+        *_gmail_discovery(),
         # NOTE: nova_embedder is deliberately NOT bundled. Loading it needs
         # sentence-transformers, which needs torch + transformers — all three
         # are excluded below to keep the installer near 200 MB rather than
