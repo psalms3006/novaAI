@@ -47,17 +47,20 @@ from typing import Callable, Dict, List, Optional, Tuple
 # inside the install directory.
 
 def _runtime_data_dir() -> Path:
-    import os
-    import sys
-    if getattr(sys, "frozen", False):
-        base = os.getenv("APPDATA")
-        d = Path(base) / "NOVA" if base else Path.home() / ".nova"
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            return Path(".")
-        return d
-    return Path(".")
+    """The one data directory, not a third copy of the rule.
+
+    This carried its own frozen/dev logic and ignored NOVA_DATA_DIR, so the
+    suite's sandbox did not contain it: running the tests wrote confirmation
+    records into the developer's real audit log. That was found by reading a
+    user's audit trail after an incident and seeing test fixtures in it --
+    computer_control({"action": "click", "x": 10, "y": 10}) -- interleaved
+    with the real events being investigated.
+    """
+    try:
+        import nova_paths
+        return nova_paths.data_dir()
+    except Exception:
+        return Path(".")
 
 
 # ── Config (can be overridden by nova_config.toml) ───────────────────────────

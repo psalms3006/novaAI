@@ -57,11 +57,27 @@ def test_audit_ndjson_moves_to_app_data_when_frozen(monkeypatch):
     assert p.name == "nova_audit.ndjson"
 
 
-def test_safety_runtime_dir_is_cwd_in_development():
-    assert nova_safety._runtime_data_dir() == Path(".")
+def test_safety_runtime_dir_follows_the_one_data_directory_rule():
+    """nova_safety used to carry its own copy of the frozen/dev rule.
+
+    Because it ignored NOVA_DATA_DIR, the suite's sandbox did not contain it
+    and running the tests wrote confirmation records into the developer's real
+    audit log. That was found by reading a user's audit trail after an
+    incident and finding test fixtures interleaved with the events under
+    investigation.
+    """
+    import nova_paths
+
+    assert nova_safety._runtime_data_dir() == nova_paths.data_dir()
 
 
 def test_safety_runtime_dir_moves_to_app_data_when_frozen(monkeypatch):
+    """The guarantee that still matters: never the install directory.
+
+    NOVA_DATA_DIR is cleared because the suite sets it and it deliberately
+    wins over the frozen default.
+    """
+    monkeypatch.delenv("NOVA_DATA_DIR", raising=False)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     d = nova_safety._runtime_data_dir()
     assert d.is_absolute()
@@ -77,6 +93,7 @@ def test_safety_files_are_not_bare_relative_names_when_frozen(monkeypatch):
 
 
 def test_frozen_path_falls_back_when_appdata_is_missing(monkeypatch):
+    monkeypatch.delenv("NOVA_DATA_DIR", raising=False)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.delenv("APPDATA", raising=False)
     d = nova_safety._runtime_data_dir()

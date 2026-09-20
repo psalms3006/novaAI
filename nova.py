@@ -1738,9 +1738,19 @@ def _execute_tool_sync(tool_name: str, args: dict, meta: dict) -> str:
     # ── Tier 6: hard confirmation gate ───────────────────────────────────────
     try:
         from nova_safety import safety_gate, log_tool_run
+        # Ask where the person can answer.
+        #
+        # This used to be input() on stdin unconditionally. During a voice
+        # session that is a question printed to a terminal nobody is watching:
+        # NOVA went silent waiting to be typed at, took the silence as "no" --
+        # correctly -- and explained none of it. The refusal was right; the
+        # channel was wrong.
+        from nova_confirm import VoiceConfirmer
+        _confirmer = VoiceConfirmer()
         _gate = safety_gate(
             tool_name, args,
-            get_confirmation=lambda: input("NOVA awaiting your yes/no: ").strip(),
+            get_confirmation=_confirmer.ask,
+            speak_fn=_confirmer.speak,
         )
         if _gate is not None:
             return _gate   # user declined — return reason string to model
