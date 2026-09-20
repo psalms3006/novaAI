@@ -14,6 +14,17 @@ Not one compares the artifact to the source, which is why this went unnoticed:
 These tests skip when no bundle is present, so a source-only checkout is not
 punished for it. When a bundle IS present they are the difference between
 "the build succeeded" and "the build contains this code".
+
+They deliberately hold a bundle only to the commit it *claims*, and skip when
+it is behind HEAD. Source moves ahead of the last build constantly, and a
+suite that goes red for that teaches people to ignore it.
+
+The cost of that choice, stated plainly: a skip reads as a pass, so these
+cannot by themselves stop someone running a packaged smoke test against an old
+bundle. What they do guarantee is the failure that actually occurred — a
+bundle asserting a commit while missing two of its packages and carrying a
+frontend from no commit at all. After a rebuild the gate opens and every
+check runs for real.
 """
 from __future__ import annotations
 
@@ -34,12 +45,52 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _built_commit() -> str:
+    info = INTERNAL / "BUILDINFO.json"
+    if not info.exists():
+        return ""
+    try:
+        return json.loads(info.read_text(encoding="utf-8")).get("commit", "")
+    except Exception:
+        return ""
+
+
+def _head() -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _require_a_bundle_claiming_to_be_current():
+    """Only hold a bundle to the source it says it was built from.
+
+    Source moves ahead of the last build constantly during development, and a
+    suite that goes red for that teaches people to ignore it. What must never
+    happen is the opposite: a bundle that claims a commit and does not contain
+    it, which is how a packaged smoke test comes to pass against code from
+    before the fix it is supposedly testing.
+    """
+    built, head = _built_commit(), _head()
+    if not built or not head:
+        pytest.skip("cannot determine which commit this bundle came from")
+    if built != head:
+        behind = subprocess.run(
+            ["git", "rev-list", "--count", f"{built}..{head}"], cwd=REPO,
+            capture_output=True, text=True,
+        ).stdout.strip() or "?"
+        pytest.skip(
+            f"bundle is from {built[:8]}, {behind} commit(s) behind HEAD — "
+            f"rebuild before trusting any packaged result"
+        )
+
+
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def test_the_bundled_frontend_matches_the_source():
     """An uncompressed data file, so this compares content, not module names."""
+    _require_a_bundle_claiming_to_be_current()
     source = REPO / "desk" / "static" / "app.js"
     packaged = INTERNAL / "desk" / "static" / "app.js"
     if not packaged.exists():
@@ -58,6 +109,7 @@ def test_every_top_level_nova_package_reaches_the_bundle():
     A package absent here is absent from the app, however healthy the build
     log looked.
     """
+    _require_a_bundle_claiming_to_be_current()
     toc = REPO / "build" / "nova_desktop" / "PYZ-00.toc"
     if not toc.exists():
         pytest.skip("no PYZ table of contents from this build")
@@ -89,30 +141,4 @@ def test_the_bundle_records_which_commit_it_came_from():
     assert stamp.get("clean_tree") is True, (
         f"this bundle was built from a dirty tree, so it corresponds to no "
         f"commit. Uncommitted at build time: {stamp.get('dirty_files')}"
-    )
-
-
-def test_the_bundle_is_not_behind_the_current_checkout():
-    """A bundle from an older commit is a bundle that will lie to a smoke test."""
-    info = INTERNAL / "BUILDINFO.json"
-    if not info.exists():
-        pytest.skip("bundle predates the build stamp")
-
-    built = json.loads(info.read_text(encoding="utf-8")).get("commit", "")
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=REPO,
-        capture_output=True, text=True,
-    ).stdout.strip()
-
-    if not head or built == "unknown":
-        pytest.skip("cannot determine commits")
-
-    behind = subprocess.run(
-        ["git", "rev-list", "--count", f"{built}..{head}"], cwd=REPO,
-        capture_output=True, text=True,
-    ).stdout.strip()
-
-    assert behind == "0", (
-        f"the bundle is {behind} commit(s) behind HEAD (built {built[:8]}, "
-        f"HEAD {head[:8]}). Rebuild before trusting any packaged test."
     )

@@ -1119,7 +1119,26 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "nova_task",
-        "description": "Start or manage background tasks on the AIOS task manager. Commands: 'submit' (start a multi-step task, needs 'steps' in args), 'status', 'pause', 'resume', 'cancel', 'list'. Steps are [{tool, arg, verify}]. This tool takes a 'cmd' string and optional 'args' dict.",
+        "description": (
+            "Work on something in the background while the conversation "
+            "continues. Use this when the user asks for something that takes "
+            "more than one step or more than a few seconds — researching a "
+            "topic, gathering sources, producing a document — so they do not "
+            "have to wait or ask again. You plan the steps yourself. "
+            "Commands: 'submit', 'status', 'pause', 'resume', 'cancel', 'list'. "
+            "Steps are [{tool, args}] — each step names a tool and the exact "
+            "arguments that tool takes, and they run in order. "
+            'Example: {"cmd": "submit", "args": {"title": "Research AI '
+            'developments", "steps": [{"tool": "web_search", "args": '
+            '{"query": "significant AI developments this month"}}, '
+            '{"tool": "web_search", "args": {"query": "AI research papers '
+            'this month"}}, {"tool": "generate_document", "args": '
+            '{"title": "AI developments", "content": "..."}}]}}. '
+            "Steps may name any tool you can call directly, such as "
+            "'web_search', 'file_processor' or 'generate_document'. "
+            "The user is told when the task finishes, so do not promise to "
+            "report back yourself."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
