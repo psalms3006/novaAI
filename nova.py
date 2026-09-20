@@ -429,23 +429,35 @@ except ImportError:
             return f"Agent {self.agent_type.value} executed: {desc}"
 
 
-class ProactiveAgent:  # type: ignore[no-redef]
-    """Minimal fallback proactive agent.
+try:
+    from nova_proactive import ProactiveAgent, ProactiveEvent, Priority
+except Exception:  # pragma: no cover — core must still boot without it
+    ProactiveEvent = None  # type: ignore[assignment,misc]
+    Priority = None  # type: ignore[assignment,misc]
 
-    Real implementation can replace this via import/monkeypatch; this keeps
-    ``main()`` booting when only the core module is present.
-    """
-    def __init__(self, speak_fn=None, meta=None, planner=None):
-        self.speak_fn = speak_fn
-        self.meta = meta
-        self.planner = planner
-        self._running = False
+    class ProactiveAgent:  # type: ignore[no-redef]
+        """Minimal fallback proactive agent.
 
-    def start(self) -> None:
-        self._running = True
+        Real implementation can replace this via import/monkeypatch; this keeps
+        ``main()`` booting when only the core module is present.
+        """
+        def __init__(self, speak_fn=None, meta=None, planner=None):
+            self.speak_fn = speak_fn
+            self.meta = meta
+            self.planner = planner
+            self._running = False
 
-    def update_speak(self, speak_fn) -> None:
-        self.speak_fn = speak_fn
+        def start(self) -> None:
+            self._running = True
+
+        def update_speak(self, speak_fn) -> None:
+            self.speak_fn = speak_fn
+
+        def set_busy(self, busy_fn) -> None:
+            pass
+
+        def emit(self, event) -> bool:
+            return False
 
 try:
     from nova_memory import NovaMemory  # type: ignore[import]
@@ -2079,12 +2091,47 @@ def _start_ambient_intelligence(meta: dict):
         except Exception:
             log.info("[PROACTIVE] %s", text)
 
+    def _nova_is_speaking() -> bool:
+        """Is NOVA mid-sentence right now?
+
+        Proactive notices wait for a gap rather than talking over the answer
+        the user actually asked for.
+        """
+        try:
+            from desk import live_session as _live
+            return bool(_live.get_live_manager().status().get("speaking"))
+        except Exception:
+            return False
+
     try:
         _proactive = ProactiveAgent(speak_fn=_speak, meta=meta, planner=nova_state._planner)
+        _proactive.set_busy(_nova_is_speaking)
         _proactive.start()
         log.info("[DESK] proactive agent started")
     except Exception as e:
         log.warning("Proactive agent failed to start: %s", e)
+
+    # Background task outcomes had no route to the user on this surface.
+    # `set_notify` was wired only in the terminal and offline paths, so in the
+    # desktop app -- the one people actually run -- a task could finish and
+    # never say so. Route it through the proactive agent, which decides
+    # whether now is a reasonable moment.
+    try:
+        if nova_state._task_manager is not None:
+            def _task_notice(text: str) -> None:
+                if ProactiveEvent is None or _proactive is None:
+                    _speak(text)
+                    return
+                _proactive.emit(ProactiveEvent(
+                    kind="completion",
+                    priority=Priority.HIGH,
+                    message=text,
+                ))
+
+            nova_state._task_manager.set_notify(_task_notice)
+            log.info("[DESK] task notices routed through the proactive agent")
+    except Exception as e:
+        log.warning("Task notification wiring failed: %s", e)
 
     try:
         from nova_heartbeat import Heartbeat
