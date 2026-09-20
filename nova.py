@@ -2160,6 +2160,20 @@ def _start_ambient_intelligence(meta: dict):
                 ))
 
             nova_state._task_manager.set_notify(_task_notice)
+
+            def _task_activity(busy: bool) -> None:
+                """Show background work on the orb while it happens."""
+                try:
+                    import desk.bridge as _br
+                    _br.publish_event({
+                        "type": "task_activity",
+                        "busy": bool(busy),
+                        "ts": time.time(),
+                    })
+                except Exception:
+                    log.debug("[TASK] could not publish activity", exc_info=True)
+
+            nova_state._task_manager.set_on_activity(_task_activity)
             log.info("[DESK] task notices routed through the proactive agent")
     except Exception as e:
         log.warning("Task notification wiring failed: %s", e)

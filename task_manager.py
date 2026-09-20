@@ -23,11 +23,13 @@ Import-safe: does NOT import nova at module top; the tool-executor is injected,
 so it can be unit-tested standalone.
 """
 from __future__ import annotations
-import json, os, re, threading, time, uuid
+import json, logging, os, re, threading, time, uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 import nova_paths
+
+log = logging.getLogger("nova.task")
 
 __all__ = ["TaskManager", "TaskStep", "get_task_manager", "init_task_manager"]
 
@@ -157,6 +159,7 @@ class TaskManager:
         self._tool_executor = tool_executor      # fn(tool_name, args, meta) -> result str
         self._verify_fn = verify_fn              # fn(output_text) -> verification status
         self._notify: Optional[Callable[[str], None]] = None
+        self._on_activity: Optional[Callable[[bool], None]] = None
         self._speak = None
         self._lock = threading.RLock()
         self._tasks: List[Task] = []
@@ -169,6 +172,27 @@ class TaskManager:
     # ── wiring ──────────────────────────────────────────────────────────────
     def set_notify(self, fn: Optional[Callable[[str], None]]) -> None:
         self._notify = fn
+
+    def set_on_activity(self, fn: Optional[Callable[[bool], None]]) -> None:
+        """Observe whether background work is in progress.
+
+        Called with True when a task starts and False when the queue drains.
+        The desktop surface uses it to show that NOVA is working: a task now
+        runs for a while off the back of a single spoken request, and an orb
+        sitting at "listening" throughout is indistinguishable from NOVA
+        having ignored the person.
+        """
+        self._on_activity = fn
+
+    def _signal_activity(self, busy: bool) -> None:
+        """Never raises: this runs on the worker thread."""
+        fn = self._on_activity
+        if fn is None:
+            return
+        try:
+            fn(busy)
+        except Exception:
+            log.debug("[TASK] activity observer failed", exc_info=True)
 
     def set_tool_executor(self, fn: Callable[[str, Dict, Dict], Any]) -> None:
         self._tool_executor = fn
@@ -388,6 +412,7 @@ class TaskManager:
                 t.started = t.started or time.time()
                 t.updated = time.time()
                 self._save()
+            self._signal_activity(True)
             try:
                 self._run_task(t)
             except Exception as e:
@@ -399,6 +424,15 @@ class TaskManager:
                     t.updated = time.time()
                     self._save()
                 self._notify_done(t)
+            finally:
+                # Released on every exit, including a crash. An orb left
+                # showing work that has stopped is worse than one that never
+                # showed it: the user waits for something that is not coming.
+                with self._lock:
+                    more = any(x.status == "QUEUED" and self._deps_ready(x)
+                               for x in self._tasks)
+                if not more:
+                    self._signal_activity(False)
 
     def _run_task(self, t: Task) -> None:
         tool_exec = self._tool_executor

@@ -1,0 +1,171 @@
+"""The orb has to show the two things it currently cannot: work, and being cut off.
+
+Two gaps, both of them cases where NOVA knows something and the surface does
+not:
+
+* **Background work is invisible.** Now that one spoken request can start a
+  task that runs for a while, the orb sits at "listening" throughout. From the
+  user's side that is indistinguishable from NOVA having ignored them.
+
+* **Interruption is published and unhandled.** `LiveManager` emits an
+  `interrupted` event when the user talks over NOVA, and no frontend handler
+  exists for it, so the one moment the user actively took control looks the
+  same as any other.
+
+The canonical channel already exists -- `desk.bridge.publish_orb_state` -- so
+neither of these needs a new transport, only for the signal to be connected to
+it.
+"""
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import pytest
+
+from task_manager import TaskManager
+
+REPO = Path(__file__).resolve().parents[1]
+STATIC = REPO / "desk" / "static"
+
+
+def _manager(tmp_path, executor=None, **kw):
+    return TaskManager(
+        path=str(tmp_path / "tasks.json"),
+        tool_executor=executor or (lambda tool, args, meta: "Saved: out.txt"),
+        **kw,
+    )
+
+
+def _drain(manager, task, timeout=10.0):
+    terminal = {"COMPLETED", "FAILED", "CANCELLED", "PARTIALLY_COMPLETED",
+                "UNVERIFIED"}
+    manager.start()
+    try:
+        deadline = time.time() + timeout
+        while time.time() < deadline and task.status not in terminal:
+            time.sleep(0.02)
+    finally:
+        manager.stop()
+    return task
+
+
+def test_the_task_manager_reports_when_it_starts_and_stops_working(tmp_path):
+    """Fails until there is any way to know work is happening."""
+    seen = []
+    manager = _manager(tmp_path)
+    assert hasattr(manager, "set_on_activity"), (
+        "nothing can observe that a background task is running"
+    )
+    manager.set_on_activity(lambda busy: seen.append(busy))
+
+    task = manager.submit("Research something",
+                          [{"tool": "web_search", "args": {"query": "x"}}])
+    _drain(manager, task)
+
+    assert seen, "the task ran and reported nothing"
+    assert seen[0] is True, f"first signal should be 'busy': {seen}"
+    assert seen[-1] is False, f"work finished without saying so: {seen}"
+
+
+def test_the_activity_signal_settles_after_the_last_task(tmp_path):
+    """Two tasks must not leave the orb stuck showing work."""
+    seen = []
+    manager = _manager(tmp_path)
+    manager.set_on_activity(lambda busy: seen.append(busy))
+
+    first = manager.submit("One", [{"tool": "web_search", "args": {"query": "a"}}])
+    second = manager.submit("Two", [{"tool": "web_search", "args": {"query": "b"}}])
+    manager.start()
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and second.status in ("QUEUED", "RUNNING"):
+            time.sleep(0.02)
+    finally:
+        manager.stop()
+
+    assert seen[-1] is False, f"ended busy: {seen}"
+
+
+def test_a_failing_observer_does_not_disturb_the_work(tmp_path):
+    """This is called from the worker thread."""
+    def explode(_busy):
+        raise RuntimeError("the surface is gone")
+
+    manager = _manager(tmp_path)
+    manager.set_on_activity(explode)
+    task = manager.submit("Still runs",
+                          [{"tool": "web_search", "args": {"query": "x"}}])
+    _drain(manager, task)
+
+    assert task.status == "COMPLETED", task.reason_for_stop
+
+
+def test_a_task_that_fails_still_releases_the_orb(tmp_path):
+    seen = []
+    manager = _manager(
+        tmp_path, executor=lambda tool, args, meta: "Error: it went wrong")
+    manager.set_on_activity(lambda busy: seen.append(busy))
+
+    task = manager.submit("Doomed",
+                          [{"tool": "web_search", "args": {"query": "x"}}])
+    _drain(manager, task)
+
+    assert task.status == "FAILED"
+    assert seen[-1] is False, f"a failed task left the orb showing work: {seen}"
+
+
+# ── the surface ─────────────────────────────────────────────────────────────
+
+def test_the_orb_has_a_state_for_being_interrupted():
+    """`interrupted` is published by LiveManager and was handled nowhere."""
+    for name in ("orb3d.js", "orb.js"):
+        text = (STATIC / name).read_text(encoding="utf-8", errors="replace")
+        assert "interrupted" in text, (
+            f"{name} cannot show that the user cut NOVA off"
+        )
+
+
+def test_the_interrupted_event_reaches_the_orb():
+    app = (STATIC / "app.js").read_text(encoding="utf-8", errors="replace")
+    assert 'case "interrupted"' in app, (
+        "LiveManager publishes 'interrupted' and app.js ignores it, so the "
+        "one moment the user took control looks like every other moment"
+    )
+
+
+def test_the_surface_shows_background_work():
+    app = (STATIC / "app.js").read_text(encoding="utf-8", errors="replace")
+    assert "task_activity" in app, (
+        "app.js has no handler for background work starting or stopping"
+    )
+
+
+def test_the_desktop_wires_task_activity_to_the_surface():
+    """The signal exists only if something publishes it."""
+    import inspect
+
+    import nova
+
+    source = inspect.getsource(nova._start_ambient_intelligence)
+    assert "set_on_activity" in source, (
+        "nothing observes the task manager's activity, so background work "
+        "stays invisible however well the orb could show it"
+    )
+    assert "task_activity" in source, (
+        "the activity signal is observed but never published to the surface"
+    )
+
+
+def test_the_activity_publisher_survives_a_missing_bridge():
+    """Runs on the worker thread; the desk bridge may not be up."""
+    import inspect
+
+    import nova
+
+    source = inspect.getsource(nova._start_ambient_intelligence)
+    activity = source[source.index("def _task_activity"):]
+    activity = activity[:activity.index("nova_state._task_manager.set_on_activity")]
+    assert "except Exception" in activity, (
+        "a failure to draw the orb would propagate into the task worker"
+    )

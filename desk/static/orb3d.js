@@ -39,6 +39,12 @@ const STATES = {
 // are different things to tell a person, and the orb is the only place NOVA
 // says either of them without words.
 STATES.hearing = { hue: 0.46, amp: 0.30, freq: 1.45, speed: 0.55, rim: 1.20, spin: 0.085, glow: 0.92, chaos: 0.26 };
+// The user talked over NOVA and she stopped. A brief, dimmer beat that
+// reads as yielding rather than as an error -- being interrupted is a
+// normal part of a conversation, not a fault.
+STATES.interrupted = { hue: 0.52, amp: 0.09, freq: 1.10, speed: 0.28, rim: 0.70, spin: 0.030, glow: 0.45, chaos: 0.14 };
+// Background work, as distinct from a tool running inside this turn.
+STATES.researching = STATES.working;
 STATES.executing = STATES.working;
 STATES.connecting = STATES.thinking;
 STATES.awaiting_input = STATES.listening;

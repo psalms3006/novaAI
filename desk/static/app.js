@@ -427,6 +427,31 @@ function handleLiveEvent(ev) {
     case "tool_result":
       setOrb("thinking");
       break;
+    case "interrupted":
+      // The user talked over NOVA and she stopped. This was published by the
+      // session and handled nowhere, so the one moment the user actively took
+      // control looked exactly like every other moment. Brief: the next real
+      // event replaces it, and mic_level will normally do so immediately
+      // because the user is mid-sentence.
+      state.speaking = false;
+      setOrb("interrupted");
+      break;
+    case "task_activity":
+      // Work happening outside this turn. A single spoken request can now
+      // start a task that runs for a while, and an orb sitting at "listening"
+      // throughout is indistinguishable from NOVA having ignored the person.
+      //
+      // Deliberately does not override speaking or hearing: what is happening
+      // in the conversation right now matters more than what is happening
+      // behind it.
+      state.backgroundWork = !!ev.busy;
+      if (!state.speaking && !state.listening) {
+        setOrb(ev.busy ? "researching" : "idle");
+      } else if (ev.busy && !state.speaking) {
+        const label = $("orb-label");
+        if (label) label.textContent = "working in the background";
+      }
+      break;
     case "vision_capture":
       // NOVA reading the screen must always be visible while it happens.
       // This is the most sensitive thing she does, and the window showing

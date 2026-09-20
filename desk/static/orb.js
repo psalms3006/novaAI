@@ -19,6 +19,7 @@
 
 const STATES = {
   idle:       { hue: 172, sat: 72, amp: 0.06, speed: 0.10, spin: 0.55, glow: 0.55, particles: 26 },
+  interrupted:       { hue: 172, sat: 72, amp: 0.06, speed: 0.10, spin: 0.55, glow: 0.55, particles: 26 },
   listening:  { hue: 186, sat: 85, amp: 0.16, speed: 0.22, spin: 0.90, glow: 0.85, particles: 44 },
   hearing:  { hue: 186, sat: 85, amp: 0.16, speed: 0.22, spin: 0.90, glow: 0.85, particles: 44 },
   thinking:   { hue: 205, sat: 80, amp: 0.11, speed: 0.34, spin: 1.60, glow: 0.75, particles: 38 },
