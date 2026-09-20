@@ -162,3 +162,35 @@ def test_the_model_is_told_which_tools_a_step_may_name():
         f"the description suggests tool(s) the permission engine will refuse: "
         f"{undeclared}"
     )
+
+
+def test_the_prompt_tells_nova_she_can_work_in_the_background():
+    """Declaring the tool is not enough; she has to know to reach for it.
+
+    Verified against the live model on 2026-09-20, same prompt both ways,
+    only this section differing:
+
+        without it — four turns of memory searches, then "I don't have the
+        details of your assignment yet. What is the topic?" and no work
+        started, three runs out of three.
+
+        with it — nova_task submitted with two authorised web_search steps
+        and real queries, two runs out of two.
+
+    The tool was declared and correct the whole time. Nothing told her the
+    option existed, so she tried to answer everything inside the
+    conversation and stalled when she could not.
+    """
+    import nova
+
+    prompt = nova.NOVA_SYSTEM_PROMPT.lower()
+    assert "nova_task" in prompt, (
+        "the system prompt never names the background-work tool"
+    )
+    assert "background" in prompt
+
+    # The specific failure the section exists to prevent.
+    assert "stall" in prompt or "do not stall" in prompt, (
+        "nothing tells her what to do when she cannot identify what the user "
+        "is working on, which is the state she got stuck in"
+    )
