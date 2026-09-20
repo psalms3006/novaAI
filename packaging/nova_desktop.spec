@@ -234,11 +234,9 @@ a = Analysis(
         (os.path.join(ROOT, "desk", "static"), "desk/static"),
         # which commit this bundle came from — see _build_stamp above
         (_buildinfo, "."),
-        # Gmail's discovery document only. googleapiclient ships 580 of these
-        # totalling 93 MB; bundling the lot to reach one 0.2 MB file would
-        # put a Google API catalogue in the installer. Without it build()
-        # falls back to fetching over HTTP, which works but needs the network
-        # at the moment of the first call.
+        # Gmail's discovery document. Adding it here is not enough on its
+        # own -- see the a.datas filter below, which is what actually keeps
+        # the other 579 out.
         *_gmail_discovery(),
         # NOTE: nova_embedder is deliberately NOT bundled. Loading it needs
         # sentence-transformers, which needs torch + transformers — all three
@@ -286,6 +284,24 @@ a = Analysis(
     cipher=block_cipher,
     noarchive=False,
 )
+
+# Drop the Google API catalogue the googleapiclient hook drags in.
+#
+# hook-googleapiclient.model.py from pyinstaller-hooks-contrib collects every
+# discovery document in the package: 580 files, 95 MB, roughly a sixth of the
+# bundle. NOVA calls exactly one Google service, read-only. Naming gmail.v1
+# in `datas` does not prevent this -- the hook has already run by the time
+# Analysis finishes -- so the collection is undone here, which is the only
+# point where that is possible.
+_kept, _dropped = [], 0
+for _entry in a.datas:
+    _dest = _entry[0].replace("\\", "/")
+    if "discovery_cache/documents/" in _dest and "gmail.v1.json" not in _dest:
+        _dropped += 1
+        continue
+    _kept.append(_entry)
+a.datas = _kept
+print(f"spec: dropped {_dropped} unused Google discovery documents")
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
