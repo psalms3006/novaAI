@@ -2188,9 +2188,51 @@ def _start_ambient_intelligence(meta: dict):
 
         runner = WorkflowRunner()
         runner.set_proactive(_proactive)
-        # No connectors exist yet, so no kinds are registered. A workflow of
-        # an unhandled kind fails honestly and says which capability is
-        # missing, rather than succeeding at nothing forever.
+
+        # Connectors register the kinds they can run. A kind nobody handles
+        # fails honestly and names the missing capability rather than
+        # succeeding at nothing forever.
+        try:
+            from integrations.gmail import GmailConnector
+            from nova_scheduler import RunOutcome as _Outcome
+
+            _gmail = GmailConnector()
+
+            def _sweep_mail(workflow):
+                """Look for mail worth mentioning since the last sweep."""
+                from integrations.gmail import GmailUnavailable
+                since = workflow.last_run or (time.time() - 86400)
+                try:
+                    notable = _gmail.important_since(
+                        since,
+                        me=workflow.params.get("me", ""),
+                        topics=workflow.params.get("topics", []),
+                    )
+                except GmailUnavailable as exc:
+                    log.info("[GMAIL] sweep could not run: %s", exc)
+                    return _Outcome.FAILED
+                if not notable:
+                    # Nothing worth saying. Silence is the correct output.
+                    return _Outcome.NOTHING_TO_DO
+                if ProactiveEvent is not None and _proactive is not None:
+                    top = notable[0]
+                    _proactive.emit(ProactiveEvent(
+                        kind="discovery",
+                        priority=Priority.MEDIUM,
+                        message=(f"{len(notable)} message(s) in your mail look "
+                                 f"worth a look. "
+                                 + top.verdict.describe(top.message)),
+                        dedupe_key=f"mail:{top.message.message_id}",
+                    ))
+                return _Outcome.DONE
+
+            runner.register(GmailConnector.kind, _sweep_mail)
+            _health = _gmail.health()
+            log.info("[DESK] gmail connector registered (connected=%s)",
+                     _health.get("connected"))
+        except Exception as e:
+            log.info("[DESK] gmail connector unavailable: %s", e)
+
         scheduler = get_scheduler()
         scheduler.start(runner, interval_seconds=60.0)
         nova_state._scheduler = scheduler
