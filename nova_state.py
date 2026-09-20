@@ -22,3 +22,9 @@ _task_manager: Optional[Any] = None   # task_manager.TaskManager, set in main()
 
 # Heartbeat instance, so any surface can ask for missed notices.
 _heartbeat = None
+
+# Scheduled workflows and the registry that runs them. Set by
+# nova._start_ambient_intelligence so any surface can list, pause or cancel
+# what NOVA has committed to.
+_scheduler: Optional[Any] = None
+_workflow_runner: Optional[Any] = None

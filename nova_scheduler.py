@@ -44,7 +44,7 @@ log = logging.getLogger("nova.scheduler")
 
 __all__ = [
     "Scheduler", "Workflow", "WorkflowStatus", "ApprovalMode", "RunOutcome",
-    "get_scheduler",
+    "WorkflowRunner", "get_scheduler",
 ]
 
 WORKFLOWS_FILENAME = "workflows.json"
@@ -132,6 +132,67 @@ class Workflow:
                 f"next {when}")
 
 
+
+class WorkflowRunner:
+    """Turns a due workflow into the work it stands for.
+
+    A registry rather than a chain of ifs, so a connector adds a kind without
+    the scheduler learning anything about it. Kinds with no handler are the
+    interesting case: there is no TikTok connector, so a TikTok workflow must
+    say so rather than quietly succeed at nothing -- a workflow that runs
+    forever doing nothing is worse than one that stops and explains itself.
+
+    Results are offered to the proactive agent, which owns the decision about
+    whether the user is interrupted. Routine runs stay silent.
+    """
+
+    def __init__(self) -> None:
+        self._handlers: dict[str, Callable[["Workflow"], "RunOutcome"]] = {}
+        self._unhandled: set[str] = set()
+        self._proactive = None
+
+    def register(self, kind: str,
+                 handler: Callable[["Workflow"], "RunOutcome"]) -> None:
+        self._handlers[kind] = handler
+
+    def handles(self, kind: str) -> bool:
+        return kind in self._handlers
+
+    def unhandled_kinds(self) -> set[str]:
+        """Kinds asked for that nothing can do. Worth reporting to the user."""
+        return set(self._unhandled)
+
+    def set_proactive(self, agent) -> None:
+        self._proactive = agent
+
+    def __call__(self, workflow: "Workflow") -> "RunOutcome":
+        handler = self._handlers.get(workflow.kind)
+        if handler is None:
+            self._unhandled.add(workflow.kind)
+            log.warning("[SCHED] no handler for kind %r (%s)",
+                        workflow.kind, workflow.id)
+            return RunOutcome.FAILED
+
+        outcome = RunOutcome(handler(workflow))
+        self._announce(workflow, outcome)
+        return outcome
+
+    def _announce(self, workflow: "Workflow", outcome: "RunOutcome") -> None:
+        """Offer the result. The proactive policy decides if it is spoken."""
+        if self._proactive is None or outcome is RunOutcome.NOTHING_TO_DO:
+            return
+        try:
+            from nova_proactive import Priority, ProactiveEvent
+            self._proactive.emit(ProactiveEvent(
+                kind="completion",
+                priority=Priority.MEDIUM,
+                message=f"{workflow.title} is done.",
+                dedupe_key=f"{workflow.id}:{workflow.runs}",
+            ))
+        except Exception:
+            log.debug("[SCHED] could not announce %s", workflow.id, exc_info=True)
+
+
 class Scheduler:
     """Decides which workflows are due, and what to do about late ones."""
 
@@ -140,6 +201,8 @@ class Scheduler:
         self._lock = threading.RLock()
         self._workflows: dict[str, Workflow] = {}
         self._clock: Callable[[], float] = time.time
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
         self._load()
 
     # ── seams ───────────────────────────────────────────────────────────────
@@ -343,6 +406,44 @@ class Scheduler:
             missed_steps = int((now - w.next_due) // step) + 1
             nxt = w.next_due + missed_steps * step
         return nxt
+
+
+    # ── the loop ────────────────────────────────────────────────────────────
+    def start(self, runner: Callable[["Workflow"], "RunOutcome"],
+              interval_seconds: float = 60.0) -> None:
+        """Tick until stopped. Idempotent.
+
+        A daemon thread, not a per-workflow timer: the schedule lives in the
+        file, and this only asks "is anything due yet". That is what lets a
+        month-long workflow survive a restart -- there is no countdown to
+        lose.
+        """
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._loop, args=(runner, float(interval_seconds)),
+                daemon=True, name="NOVAScheduler")
+            self._thread.start()
+        log.info("[SCHED] loop started (every %.0fs)", interval_seconds)
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
+        self._thread = None
+
+    def _loop(self, runner, interval_seconds: float) -> None:
+        while not self._stop.is_set():
+            try:
+                self.run_due(runner)
+            except Exception:
+                # One bad tick must not end the loop: the workflow that broke
+                # will back off on its own, and the others are still due.
+                log.warning("[SCHED] tick failed", exc_info=True)
+            self._stop.wait(interval_seconds)
 
     # ── narration ───────────────────────────────────────────────────────────
     def summary(self) -> str:

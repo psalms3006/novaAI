@@ -2178,6 +2178,30 @@ def _start_ambient_intelligence(meta: dict):
     except Exception as e:
         log.warning("Task notification wiring failed: %s", e)
 
+    # ── Scheduled workflows ──────────────────────────────────────────────────
+    # Commitments that outlive this process: "post twice a day for a month",
+    # "sweep my inbox every hour". The schedule lives in a file and this only
+    # asks whether anything is due, so closing NOVA pauses the work rather
+    # than forgetting it.
+    try:
+        from nova_scheduler import WorkflowRunner, get_scheduler
+
+        runner = WorkflowRunner()
+        runner.set_proactive(_proactive)
+        # No connectors exist yet, so no kinds are registered. A workflow of
+        # an unhandled kind fails honestly and says which capability is
+        # missing, rather than succeeding at nothing forever.
+        scheduler = get_scheduler()
+        scheduler.start(runner, interval_seconds=60.0)
+        nova_state._scheduler = scheduler
+        nova_state._workflow_runner = runner
+        pending = len([w for w in scheduler.workflows()
+                       if w.status.value == "active"])
+        log.info("[DESK] scheduler started (%d active workflow(s))", pending)
+    except Exception as e:
+        nova_state._scheduler = None
+        log.warning("Scheduler failed to start: %s", e)
+
     try:
         from nova_heartbeat import Heartbeat
         hb = Heartbeat(speak_fn=_speak, meta=meta, planner=nova_state._planner)
