@@ -406,6 +406,71 @@ class LiveEvent:
         return d
 
 
+class ResponseWatchdog:
+    """Notices that speech went up and nothing came back.
+
+    From a real session: four turns over ninety seconds, every one of them
+    heard and sent, none answered, and no complaint from anywhere. At teardown
+    the receiver was still pending on a Future that never resolved and
+    keepalive was still running, so the socket looked healthy from every angle
+    the code checked. The existing reconnect fires on an exception, and a
+    silent stall raises nothing.
+
+    Deliberately dumb, because the clever version would be wrong: it does not
+    try to tell an overloaded provider from a dead socket from a lost network.
+    Speech went up, nothing came back, and after a while that is worth saying
+    out loud whatever the cause.
+
+    The clock is *not* reset by further speech. Restarting it each turn would
+    mean a user who keeps trying never triggers it -- the harder they try to
+    get an answer, the longer NOVA stays broken.
+    """
+
+    #: Turn 8 of that session took 15.4 s from speech to playback, and it was
+    #: a good answer. Cutting a legitimately slow reply short would be worse
+    #: than the bug this exists for.
+    DEFAULT_TIMEOUT_S = 25.0
+
+    def __init__(self, timeout_seconds: float = DEFAULT_TIMEOUT_S) -> None:
+        self.timeout_seconds = float(timeout_seconds)
+        self._awaiting_since = 0.0
+        self._reported = False
+        self._now = time.time          # seam: tests drive this
+
+    def user_spoke(self) -> None:
+        """A turn began. Starts the clock, never restarts it."""
+        if not self._awaiting_since:
+            self._awaiting_since = self._now()
+
+    def model_responded(self) -> None:
+        self._awaiting_since = 0.0
+        self._reported = False
+
+    def reset(self) -> None:
+        self._awaiting_since = 0.0
+        self._reported = False
+
+    def waiting_for(self) -> float:
+        if not self._awaiting_since:
+            return 0.0
+        return max(0.0, self._now() - self._awaiting_since)
+
+    def stalled(self) -> bool:
+        return self.waiting_for() > self.timeout_seconds
+
+    def take_stall(self) -> bool:
+        """True once per stall, so the caller does not reconnect in a loop."""
+        if self._reported or not self.stalled():
+            return False
+        self._reported = True
+        return True
+
+    def message(self) -> str:
+        seconds = int(self.waiting_for())
+        return (f"I heard you, but nothing came back for {seconds} seconds — "
+                f"the connection looks stuck, so I'm reconnecting.")
+
+
 class MicLevelThrottle:
     """Decides which microphone amplitudes are worth sending to the surface.
 
@@ -866,6 +931,8 @@ class LiveManager:
         self._mic_dropped = 0
         #: Rate-limits microphone amplitude on its way to the orb.
         self._mic_level_throttle = MicLevelThrottle()
+        #: Notices a session that has gone quiet without erroring.
+        self._watchdog = ResponseWatchdog()
         self._send_total = 0.0
         self._send_count = 0
         self._send_worst = 0.0
@@ -1735,6 +1802,13 @@ class LiveManager:
                 # like it was listening. Throttled: this is a real-time
                 # callback and the socket does not need fifty updates a
                 # second.
+                # Has NOVA gone quiet without erroring? This callback already
+                # runs constantly, so noticing costs a comparison and needs no
+                # extra thread. The work itself is handed to the session loop:
+                # nothing slow or blocking belongs on the audio thread.
+                if self._watchdog.take_stall():
+                    self._on_stall()
+
                 level = self._gate.last_level
                 if self._mic_level_throttle.should_send(level):
                     self._publish(LiveEvent(
@@ -1865,6 +1939,26 @@ class LiveManager:
 
     # ── subscriber fan-out ────────────────────────────────────────────────
 
+    def _on_stall(self) -> None:
+        """Speech went up and nothing came back. Say so, then reconnect.
+
+        Called from the microphone callback, so it must not block: it
+        publishes, logs, and asks the session loop to drop the connection.
+        The reconnect path already exists -- it simply had nothing to trigger
+        it, because a silent stall raises no exception.
+        """
+        message = self._watchdog.message()
+        _log("[LIVE] %s", message)
+        try:
+            self._publish(LiveEvent("error", message=message, recoverable=True))
+        except Exception:
+            pass
+        try:
+            # Same door the network-failure path uses.
+            self._post_to_loop(self._mic_queue, None)
+        except Exception:
+            pass
+
     def _publish(self, event: LiveEvent) -> None:
         with self._subs_lock:
             subs = list(self._subscribers)
@@ -1904,6 +1998,38 @@ class LiveManager:
             with self._state_lock:
                 self._state = LiveState.ERROR
             self._publish(LiveEvent("state", state="error", error=str(e)))
+        finally:
+            self._drain_loop()
+
+    def _drain_loop(self) -> None:
+        """Cancel whatever is still pending before letting the loop go.
+
+        stop() ends the session with loop.stop(), which leaves tasks suspended
+        rather than cancelled -- the websocket keepalive and the receiver,
+        which is parked on a Future that will never resolve. Python then
+        reports each one as "Task was destroyed but it is pending!" at ERROR,
+        and those were the only errors in an otherwise clean shutdown.
+
+        Nothing here is allowed to raise: this runs on the way out, and a
+        failure to tidy up must not become the last thing the session does.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+            if not pending:
+                return
+            for task in pending:
+                task.cancel()
+            # Let the cancellations actually be delivered; without this the
+            # tasks are cancelled but never resumed, which reports the same
+            # way.
+            loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True))
+            _log("[LIVE] cancelled %d pending task(s) on shutdown", len(pending))
+        except Exception as exc:
+            _log("[LIVE] could not drain the session loop: %s", exc)
 
     @staticmethod
     def _is_offline(err: str) -> bool:
@@ -2426,6 +2552,7 @@ class LiveManager:
                                         self._trace.mark("first_model_audio")
                                 if self._trace:
                                     self._trace.turn_timing("model audio")
+                                self._watchdog.model_responded()
                                 # NOVA Core owns playback. Previously the raw PCM
                                 # was shipped to the browser, which meant any
                                 # surface with the page open played it — with the
@@ -2438,6 +2565,7 @@ class LiveManager:
                         if text:
                             if self._trace:
                                 self._trace.turn_started()
+                            self._watchdog.user_spoke()
                             heard.append(text)
                             self._publish(LiveEvent("user_transcript", text=text))
 

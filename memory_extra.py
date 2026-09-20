@@ -321,6 +321,40 @@ def _is_rate_limited() -> bool:
     return time.time() < nova_state._rest_backoff_until
 
 
+
+#: Provider conditions that mean "come back later" rather than "something is
+#: wrong". 429 was already understood; 503 is the same situation said
+#: differently, and it used to be logged at ERROR -- four of them in three
+#: minutes of one session, in the same log someone reads to find out why NOVA
+#: went quiet. Logging a transient condition at ERROR buries the real failure
+#: and teaches the reader to skim past the word.
+_TRANSIENT_PROVIDER_MARKERS = (
+    "429", "RESOURCE_EXHAUSTED",
+    "503", "UNAVAILABLE", "high demand",
+    "500", "INTERNAL",
+    "504", "DEADLINE_EXCEEDED", "timed out", "timeout",
+)
+
+
+def _is_transient_provider_error(message: str) -> bool:
+    text = (message or "")
+    lowered = text.lower()
+    return any(
+        (marker.lower() in lowered) if not marker.isdigit() else (marker in text)
+        for marker in _TRANSIENT_PROVIDER_MARKERS
+    )
+
+
+def _note_extraction_failure(message: str) -> None:
+    """Back off quietly when the provider is busy; shout when it is our bug."""
+    if _is_transient_provider_error(message):
+        _record_rate_limit()
+        log.info("Memory extraction deferred; the model is busy (%s)",
+                 message[:120])
+        return
+    log.error("Memory extraction failed: %s", message)
+
+
 def _record_rate_limit() -> None:
     """Called on any 429 — doubles the backoff window (max 30 min)."""
     nova_state._rest_backoff_secs = min(max(nova_state._rest_backoff_secs * 2, 120), 1800)
@@ -439,11 +473,7 @@ def extract_memory_updates(user_msg: str, ai_reply: str, meta: dict) -> dict:
         _reset_rate_limit()
         return meta
     except Exception as e:
-        err = str(e)
-        if "429" in err or "RESOURCE_EXHAUSTED" in err:
-            _record_rate_limit()
-        else:
-            log.error(f"Memory extraction failed: {e}")
+        _note_extraction_failure(str(e))
     return meta
 
 
