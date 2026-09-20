@@ -195,7 +195,7 @@ class BrowserAgent(BaseAgent):
                 "Describe what you see, extract key info, and suggest implementations."
             )
             response = client.models.generate_content(
-                model="gemini-2.5-flash-preview-05-20",
+                model="gemini-flash-latest",
                 contents=[prompt, gtypes.Part.from_bytes(data=img_bytes, mime_type="image/png")]
             )
             # FIX: guard against response.text being None

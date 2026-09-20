@@ -174,7 +174,7 @@ class GeminiProvider:
 
         self._client = genai.Client(api_key=api_key)
         self._types = types
-        self._model = model or os.getenv("AGENT_MODEL", "gemini-2.0-flash")
+        self._model = model or os.getenv("AGENT_MODEL", "gemini-flash-latest")
 
     def _to_gemini_tools(self, tools: list[dict[str, Any]] | None) -> list[Any] | None:
         if not tools:

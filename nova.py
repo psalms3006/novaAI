@@ -22,7 +22,7 @@ v3.4 changes:
   • AgentType / AgentTask / BaseAgent consolidated into nova_agents.py (single source of truth)
   • nova.py imports them from nova_agents; fallback definitions kept for standalone use
   • Groq removed entirely — replaced by Gemini REST as online brain fallback
-  • Vision model fixed — VISION_MODEL constant (default: gemini-2.0-flash)
+  • Vision model fixed — VISION_MODEL constant (default: gemini-flash-latest)
   • extract_memory_updates migrated from Groq to Gemini REST
   • init_agents() duplicate-log bug fixed
   • BaseAgent task.description access hardened across all agents

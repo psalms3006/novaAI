@@ -87,7 +87,7 @@ def _detect_faces(image_path: Path) -> Dict[str, Any]:
 def _gemini_vision(image_path: Path, question: str) -> str:
     """
     Analyse an image using Gemini generateContent.
-    Uses VISION_MODEL (default: gemini-2.0-flash). Override via NOVA_VISION_MODEL env var.
+    Uses VISION_MODEL (default: gemini-flash-latest). Override via NOVA_VISION_MODEL env var.
     Respects shared REST rate-limit backoff — skips call if quota is exhausted.
     """
     if not HAS_GEMINI or not GEMINI_API_KEY:

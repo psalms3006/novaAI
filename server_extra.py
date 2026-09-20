@@ -359,7 +359,7 @@ NOVA_UI_HTML = """<!DOCTYPE html>
     <div class="panel-title">Activity Log</div>
     <div id="activity-log">
       <div class="log-entry sys">SYS: NOVA v3.4 initialized</div>
-      <div class="log-entry sys">SYS: Vision model: gemini-2.0-flash</div>
+      <div class="log-entry sys">SYS: Vision model: gemini-flash-latest</div>
       <div class="log-entry sys">SYS: Offline brain: Gemini REST / TinyLlama</div>
     </div>
     <div class="panel-title">File Upload</div>
