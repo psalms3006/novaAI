@@ -164,3 +164,23 @@ archive/
 build_v*/
 dist_v*/
 build_voice/
+
+# PyInstaller's --distpath staging directory. Not covered by dist/ or dist_v*/,
+# so `git add -A` would have staged 3,518 files and 525 MB of build output,
+# 207 MB of it DLLs that no other rule here excludes.
+dist_stage/
+
+# =========================
+# Runtime state written by a dev run
+# =========================
+# A dev run keeps NOVA's data in the working directory, which for this
+# repository is the repository. These are one user's memories, goals and
+# tasks -- not source, and not something a fresh clone should start life
+# already believing.
+living_memory.json
+goals.json
+nova_tasks.json
+nova_tasks_aios.json
+nova_cost.json
+# Ad-hoc captures from vision testing.
+screenshot_*.png

@@ -27,6 +27,8 @@ import json, os, re, threading, time, uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+import nova_paths
+
 __all__ = ["TaskManager", "TaskStep", "get_task_manager", "init_task_manager"]
 
 TASK_STATUSES = ["PLANNED", "QUEUED", "RUNNING", "WAITING", "VERIFYING",
@@ -35,9 +37,19 @@ TASK_STATUSES = ["PLANNED", "QUEUED", "RUNNING", "WAITING", "VERIFYING",
 STEP_STATUSES = ["QUEUED", "RUNNING", "VERIFIED", "UNVERIFIED", "FAILED",
                  "SKIPPED"]
 
-DEFAULT_TASKS_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "nova_tasks_aios.json"
-)
+TASKS_FILENAME = "nova_tasks_aios.json"
+
+
+def default_tasks_path() -> str:
+    """Resolved per call, not at import.
+
+    This was anchored to the module's own directory, which for a frozen
+    install is the install directory — not writable by a standard user, and
+    `_save()` swallows every exception, so tasks would have failed to persist
+    in silence. In development it is the repository, which is how one user's
+    tasks came to be a tracked file.
+    """
+    return str(nova_paths.data_file(TASKS_FILENAME))
 
 # tool names that produce filesystem artifacts we should validate
 _FILE_TOOLS = {"file_processor", "file_controller", "self_editor", "web_search",
@@ -138,10 +150,10 @@ class Task:
 class TaskManager:
     """Background task executor running on a dedicated daemon thread."""
 
-    def __init__(self, path: str = DEFAULT_TASKS_PATH,
+    def __init__(self, path: Optional[str] = None,
                  tool_executor: Optional[Callable[[str, Dict, Dict], Any]] = None,
                  verify_fn: Optional[Callable[[str], str]] = None) -> None:
-        self.path = path
+        self.path = path or default_tasks_path()
         self._tool_executor = tool_executor      # fn(tool_name, args, meta) -> result str
         self._verify_fn = verify_fn              # fn(output_text) -> verification status
         self._notify: Optional[Callable[[str], None]] = None
@@ -210,9 +222,19 @@ class TaskManager:
     def submit(self, title: str, steps: List[Dict[str, Any]], meta: Optional[dict] = None,
                dependencies: Optional[List[str]] = None, priority: str = "NORMAL",
                task_id: Optional[str] = None) -> Task:
-        """steps: list of {"tool": ..., "args": {...}}. Returns the created Task."""
+        """steps: list of {"tool": ..., "args": {...}}. Returns the created Task.
+
+        A task with no steps used to become a single step naming a tool called
+        "agent", which has never existed in NOVA. The permission engine
+        fail-closed on it, and the task was reported to the user as unverified
+        rather than as the empty submission it was. A task with nothing to run
+        is a caller error, so say so.
+        """
         if not steps:
-            steps = [{"tool": "agent", "args": {"objective": title}}]
+            raise ValueError(
+                "a task needs at least one step: "
+                '[{"tool": ..., "args": {...}}, ...]'
+            )
         with self._lock:
             t = Task(title=title, steps=[TaskStep(tool=s["tool"], args=s.get("args", {}))
                                         for s in steps],
@@ -305,8 +327,13 @@ class TaskManager:
             except Exception:
                 pass
         low = text.lower()
+        # "refused:" is how nova.py reports an authorisation denial. Without it
+        # a categorically refused step verified as UNKNOWN, and the task was
+        # reported as "steps ran but success could not be verified" — when in
+        # fact nothing ran at all.
         failure = ["error:", "failed", "exception", "not found", "unavailable",
-                   "denied", "blocked", "timeout", "unable to", "unknown "]
+                   "denied", "blocked", "timeout", "unable to", "unknown ",
+                   "refused:"]
         for f in failure:
             if f in low:
                 return "FAILURE"
@@ -417,8 +444,15 @@ class TaskManager:
                     step.finished = time.time()
                     ver = self._verify_step(t, step)
                     step.verification = ver
-                    step.status = "VERIFIED" if ver in ("CONFIRMED_SUCCESS", "LIKELY_SUCCESS") \
-                        else "UNVERIFIED"
+                    if ver in ("CONFIRMED_SUCCESS", "LIKELY_SUCCESS"):
+                        step.status = "VERIFIED"
+                    elif ver == "FAILURE":
+                        # A step whose output says it failed did not merely go
+                        # unverified — it failed, and the task must stop and
+                        # say so rather than finish as "could not be verified".
+                        step.status = "FAILED"
+                    else:
+                        step.status = "UNVERIFIED"
                 with self._lock:
                     self._validate_artifacts(t)
                     done = sum(1 for s in t.steps
@@ -490,7 +524,11 @@ class TaskManager:
                      meta: Optional[dict] = None) -> str:
         c = (cmd or "").strip().lower()
         if c in ("create", "add", "submit", "run"):
-            t = self.submit(title or "Untitled task", steps or [], meta=meta)
+            if not steps:
+                return ("nova_task submit needs a 'steps' list, e.g. "
+                        '{"steps": [{"tool": "web_search", '
+                        '"args": {"query": "..."}}]}. Nothing was started.')
+            t = self.submit(title or "Untitled task", steps, meta=meta)
             return (f"Task {t.id} queued: '{t.title}' "
                     f"({len(t.steps)} step(s)). You'll be notified when it finishes.")
         if c in ("status", "progress", "what"):
@@ -520,7 +558,7 @@ def init_task_manager(path: Optional[str] = None,
                       verify_fn: Optional[Callable] = None,
                       auto_start: bool = True) -> TaskManager:
     global _singleton
-    _singleton = TaskManager(path=path if path else DEFAULT_TASKS_PATH,
+    _singleton = TaskManager(path=path or None,
                              tool_executor=tool_executor,
                              verify_fn=verify_fn)
     if auto_start:
