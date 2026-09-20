@@ -206,7 +206,12 @@ for _pkg in ("actions", "capabilities", "core", "orchestrator", "memory",
              # identity lookup, desk/live_session.py's speaker check), and
              # both were absent from the last build: a PYZ table-of-contents
              # dump listed 36 nova_* modules and neither of these.
-             "nova_identity", "nova_self"):
+             "nova_identity", "nova_self",
+             # Not yet reached from nova.py -- the extension system is built
+             # but not wired in. Listed so the first build after it is wired
+             # carries it, rather than the app reporting it missing on a
+             # machine where it works from source.
+             "nova_extensions"):
     try:
         hidden += [m for m in collect_submodules(_pkg)
                    if not m.endswith(("._init_", ".__main__", "._smoke_test"))]
