@@ -20,6 +20,7 @@ Endpoints (all under /api, guarded by a per-run random token):
 from __future__ import annotations
 
 import io
+import functools
 import json
 import logging
 import queue
@@ -265,11 +266,14 @@ def _check_desk_token() -> bool:
 
 
 def require_token(fn):
+    # functools.wraps rather than copying __name__ by hand: it also sets
+    # __wrapped__, so inspect.getsource on an endpoint shows the endpoint
+    # instead of this wrapper, and tracebacks name the right function.
+    @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         if not _check_desk_token():
             return jsonify({"error": "unauthorized"}), 401
         return fn(*args, **kwargs)
-    wrapper.__name__ = fn.__name__
     return wrapper
 
 
@@ -469,9 +473,16 @@ def _auth_status() -> dict:
         from desk import creds as desk_creds
         return desk_creds.resolve()
     except Exception as e:
-        return {"mode": "unknown", "onboarded": False, "has_credential": False,
-                "cloud_configured": False, "byok_present": False,
-                "byok_masked": "", "cloud_error": str(e)[:120]}
+        # Deliberately no "onboarded" or "has_credential" key.
+        #
+        # This used to report both as False, which is an assertion that the
+        # user has never set NOVA up -- and the interface believed it and
+        # reopened the first-run screen. A failure to read the credential
+        # posture is not evidence about the user; it is the absence of
+        # evidence, and saying so lets the interface leave things alone.
+        return {"mode": "unknown", "cloud_configured": False,
+                "byok_present": False, "byok_masked": "",
+                "cloud_error": str(e)[:120]}
 
 
 @app.get("/api/capabilities")
@@ -1938,6 +1949,77 @@ def _creds():
 @require_token
 def api_onboarding_status():
     return jsonify({"ok": True, "auth": _auth_status()})
+
+
+@app.get("/api/accounts")
+@require_token
+def api_accounts():
+    """Which external services NOVA is connected to, and what she may do.
+
+    Never contains a token: the account layer keeps credentials in the
+    credential store and returns only metadata, because everything here
+    reaches the interface and can reach the model.
+    """
+    try:
+        from integrations.accounts import PROVIDERS, get_account_store
+        store = get_account_store()
+        connected = {c["provider"]: c for c in store.connected()}
+        out = []
+        for name, spec in sorted(PROVIDERS.items()):
+            if name.endswith("_placeholder"):
+                continue
+            entry = connected.get(name) or {"provider": name,
+                                            "status": "disconnected",
+                                            "grants": []}
+            entry["description"] = spec.description
+            entry["supports"] = sorted(g.value for g in spec.supports)
+            out.append(entry)
+        return jsonify({"ok": True, "accounts": out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:200]}), 500
+
+
+@app.post("/api/accounts/gmail/connect")
+@require_token
+def api_accounts_gmail_connect():
+    """Start Google's consent flow. Opens a browser on this machine.
+
+    Read-only: the scope requested cannot send, delete or archive anything.
+    Run on a worker thread because the flow blocks until the person either
+    consents or closes the window, and the request must not hold the server.
+    """
+    import threading
+
+    def _run():
+        try:
+            from integrations.gmail import authorise
+            result = authorise()
+            log.info("[GMAIL] connected as %s", result.get("account", "?"))
+            publish_event({"type": "account_changed", "provider": "gmail",
+                           "ok": True, "ts": time.time()})
+        except Exception as e:
+            log.warning("[GMAIL] consent failed: %s", e)
+            publish_event({"type": "account_changed", "provider": "gmail",
+                           "ok": False, "error": str(e)[:200],
+                           "ts": time.time()})
+
+    threading.Thread(target=_run, daemon=True,
+                     name="GmailConsent").start()
+    return jsonify({"ok": True, "started": True})
+
+
+@app.post("/api/accounts/<provider>/disconnect")
+@require_token
+def api_accounts_disconnect(provider):
+    """Forget the account and destroy the credential."""
+    try:
+        from integrations.accounts import get_account_store
+        get_account_store().disconnect(provider)
+        publish_event({"type": "account_changed", "provider": provider,
+                       "ok": True, "ts": time.time()})
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:200]}), 500
 
 
 @app.post("/api/onboarding/byok")

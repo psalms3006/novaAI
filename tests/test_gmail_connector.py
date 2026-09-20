@@ -256,3 +256,41 @@ def test_a_quiet_sweep_says_nothing():
     assert "NOTHING_TO_DO" in sweep, (
         "an empty sweep would be reported as a completed run and announced"
     )
+
+
+def test_gmail_can_be_connected_from_the_app_not_only_a_script():
+    """A CLI script is not a feature a person can find."""
+    import io
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+
+    bridge = io.open(root / "desk" / "bridge.py", encoding="utf-8").read()
+    assert "/api/accounts/gmail/connect" in bridge, (
+        "there is no way to connect Gmail from the running app"
+    )
+    assert "/api/accounts" in bridge
+
+    app_js = io.open(root / "desk" / "static" / "app.js",
+                     encoding="utf-8").read()
+    assert "connections(host)" in app_js, "no Connections panel"
+    assert "account_changed" in app_js, (
+        "consent finishes in a browser and the app never learns the outcome"
+    )
+
+    html = io.open(root / "desk" / "static" / "index.html",
+                   encoding="utf-8").read()
+    assert 'data-tab="connections"' in html, "the panel has no tab to open it"
+
+
+def test_the_consent_flow_does_not_block_the_server():
+    """It waits for a human in a browser; a request thread cannot."""
+    import inspect
+
+    import desk.bridge as bridge
+
+    source = inspect.getsource(bridge.api_accounts_gmail_connect)
+    assert "Thread" in source, (
+        "the consent flow runs inline, so the server is stuck until the "
+        "person finishes or closes the window"
+    )

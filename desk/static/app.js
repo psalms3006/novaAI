@@ -436,6 +436,20 @@ function handleLiveEvent(ev) {
       state.speaking = false;
       setOrb("interrupted");
       break;
+    case "account_changed": {
+      // Consent finished in the browser. Show the outcome where the user was
+      // last looking, rather than leaving a Connect button that did something.
+      const note = $("conn-note");
+      if (note) {
+        note.textContent = ev.ok
+          ? "Connected. NOVA can read your mail, and nothing else."
+          : "Could not connect: " + (ev.error || "consent was not completed");
+      }
+      const body = $("settings-body");
+      if (body && note) SETTINGS_TABS.connections(body);
+      refreshStatus();
+      break;
+    }
     case "task_activity":
       // Work happening outside this turn. A single spoken request can now
       // start a task that runs for a while, and an orb sitting at "listening"
@@ -752,11 +766,29 @@ function toggleRightField(show) {
    key did exactly that: the key was stored correctly, the flag was not set,
    and the only escape was picking offline, which did set it. The flag is
    fixed at the source; this latch makes the loop impossible regardless. */
+/* Pure, so it can be tested without a browser. Returns true only when the
+   backend has affirmatively said this person has never been set up. */
+function shouldShowOnboarding(statusData) {
+  if (!statusData) return false;
+  const a = statusData.auth;
+  if (!a || typeof a !== "object") return false;
+  if (a.onboarded === true || a.has_credential === true) return false;
+  // Both flags must be present and false. Missing means "not answered yet",
+  // which is not the same as "new user" -- that conflation is what reopened
+  // this screen on every slow start.
+  if (a.onboarded === undefined && a.has_credential === undefined) return false;
+  return !(a.onboarded || a.has_credential);
+}
+
 function maybeShowOnboarding() {
   if (state.onboardingDone) return;
-  const a = (state.statusData || {}).auth || {};
-  if (a.onboarded || a.has_credential) {
-    state.onboardingDone = true;
+  if (!shouldShowOnboarding(state.statusData)) {
+    const a = (state.statusData || {}).auth || {};
+    // Only latch it closed once we actually know; otherwise a later status
+    // response can still put it up for a genuinely new user.
+    if (a.onboarded === true || a.has_credential === true) {
+      state.onboardingDone = true;
+    }
     $("onboard-modal").style.display = "none";
     return;
   }
@@ -773,6 +805,72 @@ function closeOnboarding() {
 
 /* ── Settings Modal ────────────────────────────────── */
 const SETTINGS_TABS = {
+  /* External services NOVA can reach. Connecting and being allowed to act
+     are shown as separate things, because they are: authorising Gmail lets
+     her read, and nothing else. */
+  async connections(host) {
+    host.innerHTML = '<div class="settings-sec"><p class="acct-note">Loading…</p></div>';
+    let accounts = [];
+    try {
+      const j = await api_json("/api/accounts");
+      accounts = j.accounts || [];
+    } catch (e) {
+      host.innerHTML = '<div class="settings-sec"><p class="acct-note">' +
+        'Could not read your connections: ' + String(e.message || e) + '</p></div>';
+      return;
+    }
+
+    const rows = accounts.map((a) => {
+      const connected = a.status === "connected";
+      const needsAuth = a.status === "needs_reauth";
+      const grants = (a.grants || []).join(", ") || "nothing yet";
+      const state = needsAuth
+        ? '<span class="acct-note">needs reconnecting</span>'
+        : connected
+          ? '<span class="acct-note">connected as ' + (a.account || "?") +
+            ' — may ' + grants + '</span>'
+          : '<span class="acct-note">not connected</span>';
+      const button = a.provider === "gmail"
+        ? (connected
+            ? '<button class="btn-sm" data-disconnect="gmail">Disconnect</button>'
+            : '<button class="btn-sm primary" data-connect="gmail">Connect</button>')
+        : '<span class="acct-note">not available yet</span>';
+      return '<div class="settings-sec"><h4>' + a.description + '</h4>' +
+             state + '<div style="margin-top:8px">' + button + '</div></div>';
+    }).join("");
+
+    host.innerHTML = rows +
+      '<p class="set-note" id="conn-note">Connecting Gmail asks Google for ' +
+      'read-only access. NOVA cannot send, delete or archive mail.</p>';
+
+    host.querySelectorAll("[data-connect]").forEach((b) => {
+      b.addEventListener("click", async () => {
+        const note = $("conn-note");
+        b.disabled = true;
+        if (note) note.textContent = "A browser window will open for consent…";
+        try {
+          await api_json("/api/accounts/gmail/connect", { method: "POST", body: "{}" });
+        } catch (e) {
+          if (note) note.textContent = "Could not start: " + String(e.message || e);
+          b.disabled = false;
+        }
+      });
+    });
+
+    host.querySelectorAll("[data-disconnect]").forEach((b) => {
+      b.addEventListener("click", async () => {
+        b.disabled = true;
+        try {
+          await api_json("/api/accounts/" + b.dataset.disconnect + "/disconnect",
+                         { method: "POST", body: "{}" });
+          SETTINGS_TABS.connections(host);
+        } catch (e) {
+          b.disabled = false;
+        }
+      });
+    });
+  },
+
   account(host) {
     // The Account tab existed in the markup with nothing behind it. It is now
     // rendered by account.js, which owns the account state; on a local-only

@@ -22,7 +22,9 @@ def test_every_settings_tab_has_a_handler():
     assert tabs, "no settings tabs found in index.html"
 
     body = js[js.index("const SETTINGS_TABS = {"):]
-    handlers = set(re.findall(r"^\s{2}([a-z_]+)\(host\)", body, re.M))
+    # `async` is allowed: a panel that fetches its own data needs it, and the
+    # pattern predates the first one that did.
+    handlers = set(re.findall(r"^\s{2}(?:async\s+)?([a-z_]+)\(host\)", body, re.M))
 
     missing = [t for t in tabs if t not in handlers]
     assert not missing, f"settings tabs with no handler: {missing}"
