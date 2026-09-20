@@ -60,6 +60,8 @@ MAX_FAILURES = 5
 #: years into the future.
 RETRY_BASE_SECONDS = 5 * 60
 RETRY_CAP_SECONDS = 6 * 3600
+#: The tightest cadence a workflow may actually run at. See _next_slot.
+MIN_INTERVAL_SECONDS = 60.0
 
 
 class WorkflowStatus(str, enum.Enum):
@@ -400,7 +402,12 @@ class Scheduler:
         keep firing until it caught up -- the burst this design exists to
         avoid.
         """
-        step = max(60.0, float(w.every_seconds))
+        # A floor, deliberately. These workflows call other people's APIs,
+        # and a cadence of seconds -- from a typo, or a model inventing
+        # "every_seconds": 1 -- would hammer a provider until it rate-limited
+        # the user's account. Sub-minute scheduling is not a thing this is
+        # for, so it is clamped rather than honoured.
+        step = max(MIN_INTERVAL_SECONDS, float(w.every_seconds))
         nxt = w.next_due + step
         if nxt <= now:
             missed_steps = int((now - w.next_due) // step) + 1

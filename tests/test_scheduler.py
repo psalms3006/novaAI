@@ -287,3 +287,20 @@ def test_a_runner_that_raises_does_not_stop_the_scheduler(scheduler):
 
     assert "two" in seen, "one workflow's crash stopped the others"
     assert result["failed"] >= 1
+
+
+def test_an_absurdly_tight_cadence_is_clamped(scheduler):
+    """A typo, or a model inventing every_seconds=1, must not hammer an API.
+
+    These workflows call other people's services. A cadence of seconds would
+    rate-limit the user's own account, so it is clamped rather than honoured.
+    """
+    from nova_scheduler import MIN_INTERVAL_SECONDS, RunOutcome
+
+    workflow = scheduler.add(_workflow(every_seconds=1.0))
+    _at(scheduler, workflow.next_due + 1)
+    scheduler.run_due(lambda w: RunOutcome.DONE)
+
+    assert workflow.next_due - scheduler.now() >= MIN_INTERVAL_SECONDS - 2, (
+        "a one-second workflow would run again immediately"
+    )
