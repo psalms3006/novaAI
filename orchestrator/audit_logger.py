@@ -70,15 +70,14 @@ class AuditLogger:
         for the packaged app is the install directory. Under Program Files that
         is not writable by a standard user, so auditing silently disabled
         itself; it also contradicts the installer's guarantee that user data
-        never lives inside the install directory. When frozen, write to the
-        per-user app data directory instead.
+        never lives inside the install directory.
+
+        This used to carry its own copy of the frozen/dev rule, which is how
+        it came to ignore NOVA_DATA_DIR and write outside the sandbox the test
+        suite sets up. nova_paths is the one place that decides.
         """
-        import sys
-        if getattr(sys, "frozen", False):
-            base = os.getenv("APPDATA")
-            root = Path(base) / "NOVA" if base else Path.home() / ".nova"
-            return root / "nova_audit.ndjson"
-        return Path("data") / "nova_audit.ndjson"
+        import nova_paths
+        return nova_paths.data_file("nova_audit.ndjson")
 
     def __init__(self, path: Optional[str] = None, max_lines: int = 2000) -> None:
         self.path = Path(path) if path else self.default_path()

@@ -25,12 +25,31 @@ def _appdata_root() -> Path:
     return Path(base) / "NOVA" if base else Path.home() / ".nova"
 
 
-def test_audit_ndjson_stays_relative_in_development():
-    assert not getattr(sys, "frozen", False), "test assumes a source checkout"
-    assert not AuditLogger.default_path().is_absolute()
+def test_audit_ndjson_follows_the_one_data_directory_rule():
+    """The audit log used to carry its own copy of the path rule.
+
+    It resolved to a relative "data/" directory in development, which meant
+    the repository -- the same class of mistake that had one user's memories
+    and tasks tracked in git -- and it ignored NOVA_DATA_DIR, so the sandbox
+    the suite sets up did not contain it. It now asks nova_paths, which is
+    the single place that decides.
+    """
+    import nova_paths
+
+    resolved = AuditLogger.default_path()
+    assert resolved.name == "nova_audit.ndjson"
+    assert str(resolved).startswith(str(nova_paths.data_dir())), (
+        f"audit log at {resolved}, data dir is {nova_paths.data_dir()}"
+    )
 
 
 def test_audit_ndjson_moves_to_app_data_when_frozen(monkeypatch):
+    """The guarantee that still matters: never inside the install directory.
+
+    NOVA_DATA_DIR is cleared here because the suite sets it, and it
+    deliberately wins over the frozen default.
+    """
+    monkeypatch.delenv("NOVA_DATA_DIR", raising=False)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     p = AuditLogger.default_path()
     assert p.is_absolute()

@@ -2188,6 +2188,15 @@ def _start_ambient_intelligence(meta: dict):
 
         runner = WorkflowRunner()
         runner.set_proactive(_proactive)
+        # So "what have you been doing?" is answered from a record of what
+        # happened, not from a model recalling a conversation it was not
+        # present for.
+        try:
+            from nova_activity import get_activity_trail
+            nova_state._activity = get_activity_trail()
+            runner.set_trail(nova_state._activity)
+        except Exception as e:
+            log.info("[DESK] activity trail unavailable: %s", e)
 
         # Connectors register the kinds they can run. A kind nobody handles
         # fails honestly and names the missing capability rather than

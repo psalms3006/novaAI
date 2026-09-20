@@ -148,10 +148,11 @@ class WorkflowRunner:
     whether the user is interrupted. Routine runs stay silent.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, trail=None) -> None:
         self._handlers: dict[str, Callable[["Workflow"], "RunOutcome"]] = {}
         self._unhandled: set[str] = set()
         self._proactive = None
+        self._trail = trail
 
     def register(self, kind: str,
                  handler: Callable[["Workflow"], "RunOutcome"]) -> None:
@@ -167,15 +168,34 @@ class WorkflowRunner:
     def set_proactive(self, agent) -> None:
         self._proactive = agent
 
+    def set_trail(self, trail) -> None:
+        """Where to record what was done, so it can be recounted later."""
+        self._trail = trail
+
+    def _note(self, method: str, *args, **kw) -> None:
+        """Recording must never disturb the work being recorded."""
+        if self._trail is None:
+            return
+        try:
+            getattr(self._trail, method)(*args, **kw)
+        except Exception:
+            log.debug("[SCHED] could not record %s", method, exc_info=True)
+
     def __call__(self, workflow: "Workflow") -> "RunOutcome":
         handler = self._handlers.get(workflow.kind)
         if handler is None:
             self._unhandled.add(workflow.kind)
             log.warning("[SCHED] no handler for kind %r (%s)",
                         workflow.kind, workflow.id)
+            self._note("workflow_finished", workflow.id, workflow.title,
+                       outcome="failed",
+                       detail=f"no connector for {workflow.kind}")
             return RunOutcome.FAILED
 
+        self._note("workflow_started", workflow.id, workflow.title)
         outcome = RunOutcome(handler(workflow))
+        self._note("workflow_finished", workflow.id, workflow.title,
+                   outcome=outcome.value)
         self._announce(workflow, outcome)
         return outcome
 

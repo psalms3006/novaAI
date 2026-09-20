@@ -28,3 +28,6 @@ _heartbeat = None
 # what NOVA has committed to.
 _scheduler: Optional[Any] = None
 _workflow_runner: Optional[Any] = None
+
+# Record of autonomous activity, for "what have you been doing?".
+_activity: Optional[Any] = None
