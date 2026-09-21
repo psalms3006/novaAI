@@ -98,6 +98,20 @@ def _entry_file(root: Path) -> Optional[Path]:
     return pys[0] if pys else None
 
 
+def _module_name(root: Path, entry: Path) -> str:
+    """What the package is importable as.
+
+    For `__init__.py` that is the *directory* name, not "__init__" --
+    importing the latter raises ModuleNotFoundError, so the probe failed for a
+    reason with nothing to do with the package under test. Found by pointing
+    the tool at a real package rather than at a fixture, which is the only way
+    this was ever going to surface.
+    """
+    if entry.name == "__init__.py":
+        return root.name
+    return entry.stem
+
+
 def generate_probes(root, max_probes: int = DEFAULT_MAX_PROBES) -> list[Probe]:
     """Read the package and decide what is worth asking it. Never runs it."""
     root = Path(root)
@@ -105,7 +119,7 @@ def generate_probes(root, max_probes: int = DEFAULT_MAX_PROBES) -> list[Probe]:
     if entry is None:
         return []
 
-    module = entry.stem
+    module = _module_name(root, entry)
     try:
         source = entry.read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(source)
@@ -186,7 +200,11 @@ def _imported(tree: ast.AST) -> set:
 
 def run_probes(root, probes: list, timeout_seconds: int = 30) -> ProbeReport:
     """Run each probe in its own isolated process."""
-    root = Path(root)
+    # Absolute, because the probe runs with its working directory set to a
+    # throwaway temp folder: a relative path put on sys.path there points at
+    # nothing, and the package fails to import for a reason that has nothing
+    # to do with the package.
+    root = Path(root).resolve()
     report = ProbeReport(mocked_only=all(p.mocked for p in probes) if probes
                          else False)
 
@@ -197,7 +215,10 @@ def run_probes(root, probes: list, timeout_seconds: int = 30) -> ProbeReport:
             # script itself is removed afterwards so nothing is left behind.
             runner.write_text(
                 "import sys\n"
-                f"sys.path.insert(0, r{str(root)!r})\n" + probe.script,
+                f"sys.path.insert(0, r{str(root)!r})\n"
+                # Also the parent, so a package is importable by its own
+                # directory name rather than as "__init__".
+                f"sys.path.insert(0, r{str(root.parent)!r})\n" + probe.script,
                 encoding="utf-8")
             result = try_extension(root, runner.name,
                                    timeout_seconds=timeout_seconds)

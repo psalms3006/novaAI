@@ -1041,6 +1041,26 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "learn_resource",
+        "description": (
+            "Look at a folder on this computer that the user has pointed you "
+            "at, and say whether it could become a NOVA capability. Reads the "
+            "code without running it, checks what it claims against what it "
+            "does, and tries it in an isolated process. It does not install "
+            "anything and does not enable anything -- report what you found "
+            "and let the user decide. Use it when the user says something "
+            "like 'learn this folder' or 'see if we can use this'."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "path": {"type": "STRING",
+                         "description": "Folder on this computer to examine"},
+            },
+            "required": ["path"],
+        },
+    },
+    {
         "name": "self_editor",
         "description": (
             "Read NOVA's own source, and propose changes to it. A proposal is "
@@ -1757,6 +1777,9 @@ def _execute_tool_sync(tool_name: str, args: dict, meta: dict) -> str:
     except ImportError:
         pass
 
+    if tool_name == "learn_resource":
+        return _execute_learn_resource(args)
+
     if tool_name == "vision":
         return _vision_analyze(
             angle=args.get("angle", "screen"),
@@ -1870,6 +1893,64 @@ def _execute_tool_sync(tool_name: str, args: dict, meta: dict) -> str:
     except Exception as e:
         log.exception(f"Tool execution failed: {tool_name}")
         return f"Tool '{tool_name}' error: {e}"
+
+
+def _execute_learn_resource(args: dict) -> str:
+    """Look at something the user pointed at. Never installs it.
+
+    The whole point of the extension pipeline is that it is allowed to say
+    no, so this reports and stops. Installing needs a person, and the trust
+    ladder exists so that "it looked fine" cannot become "it is enabled"
+    without someone deciding.
+    """
+    target = str(args.get("path") or args.get("folder") or "").strip()
+    if not target:
+        return "Tell me which folder to look at."
+
+    if target.lower().startswith(("http://", "https://", "git@")):
+        return (
+            f"I can only look at a folder on this computer for now, and "
+            f"{target} is a remote address. Downloading and reading code from "
+            f"the internet is a bigger decision than reading a folder you "
+            f"already have, so I have not fetched it. Clone or download it "
+            f"yourself and point me at the folder."
+        )
+
+    try:
+        from nova_extensions.inspect import inspect_resource
+        from nova_extensions.probes import generate_probes, run_probes
+    except Exception as e:
+        return f"I couldn't load the inspection tools: {e}"
+
+    try:
+        report = inspect_resource(target)
+    except Exception as e:
+        return f"I couldn't read {target}: {e}"
+
+    if not report.files_examined:
+        return (f"I couldn't find anything readable at {target}, so there is "
+                f"nothing for me to judge.")
+
+    lines = [report.summary()]
+
+    if report.risk.value == "high":
+        lines.append(
+            "I have not tried running any of it. At this risk level that "
+            "would need you to say so explicitly.")
+        return "\n".join(lines)
+
+    try:
+        probes = generate_probes(target)
+        if probes:
+            outcome = run_probes(target, probes)
+            lines.append(outcome.summary())
+    except Exception as e:
+        lines.append(f"I could not try it safely, so I did not: {e}")
+
+    lines.append(
+        "Nothing has been installed and nothing is enabled. Tell me if you "
+        "want me to go further.")
+    return "\n".join(lines)
 
 
 def _tool_available(tool_name: str) -> bool:

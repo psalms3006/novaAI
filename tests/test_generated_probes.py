@@ -169,3 +169,23 @@ def test_running_no_probes_is_reported_honestly(tmp_path):
     report = run_probes(root, [], timeout_seconds=10)
     assert report.passed == 0 and report.failed == 0
     assert "nothing" in report.summary().lower()
+
+
+def test_a_package_is_imported_by_its_own_name_not_as_init(tmp_path):
+    """Found by pointing the tool at a real package.
+
+    `__init__.py` is not importable as "__init__" -- the probe failed with
+    ModuleNotFoundError for a reason that had nothing to do with the package
+    under test, which is the worst kind of red.
+    """
+    pkg = tmp_path / "mypkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    probes = generate_probes(pkg)
+    body = " ".join(p.script for p in probes)
+    assert "import mypkg" in body, body
+    assert "import __init__" not in body
+
+    report = run_probes(pkg, probes, timeout_seconds=30)
+    assert report.failed == 0, report.summary()

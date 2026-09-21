@@ -293,6 +293,11 @@ TOOL_CAPABILITIES: dict[str, frozenset[Capability]] = {
     "run_command": _caps(C.CODE_EXECUTE),
     "run_python": _caps(C.CODE_EXECUTE),
     "self_editor": _caps(C.SELF_MODIFY, C.FILE_WRITE),
+    # Reading a package the user pointed at. It never installs or runs
+    # anything in NOVA's process -- the trial is a separate, scrubbed
+    # subprocess -- but pointing NOVA at arbitrary code is a decision a
+    # web page must not be able to make, so it is CONFIRM under taint.
+    "learn_resource": _caps(C.FILE_READ, C.CODE_EXECUTE),
     "send_message": _caps(C.NETWORK_WRITE),
     "remember": _caps(C.MEMORY_WRITE),
     "recall": _caps(C.MEMORY_READ),
