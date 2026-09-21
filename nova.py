@@ -2333,8 +2333,35 @@ def _start_ambient_intelligence(meta: dict):
         except Exception as e:
             log.info("[DESK] gmail connector unavailable: %s", e)
 
+        # Voice recovery rides the scheduler's tick rather than starting
+        # another thread: the session gave up at 01:24:19 on 2026-09-21 and
+        # the network returned at 01:25:13, and nothing was watching for the
+        # chance to start again.
+        try:
+            from desk.live_session import VoiceSupervisor
+
+            def _network_healthy() -> bool:
+                try:
+                    conn = globals().get("_connectivity")
+                    if conn is None:
+                        return True
+                    state = getattr(conn, "state", None)
+                    value = getattr(state() if callable(state) else state,
+                                    "value", None)
+                    return value != "offline"
+                except Exception:
+                    return True
+
+            _voice_supervisor = VoiceSupervisor(is_healthy=_network_healthy)
+            nova_state._voice_supervisor = _voice_supervisor
+        except Exception as e:
+            log.info("[DESK] voice supervisor unavailable: %s", e)
+
         scheduler = get_scheduler()
-        scheduler.start(runner, interval_seconds=60.0)
+        scheduler.start(
+            runner, interval_seconds=60.0,
+            on_tick=(nova_state._voice_supervisor.check
+                     if nova_state._voice_supervisor else None))
         nova_state._scheduler = scheduler
         nova_state._workflow_runner = runner
         pending = len([w for w in scheduler.workflows()

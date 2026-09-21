@@ -406,6 +406,71 @@ class LiveEvent:
         return d
 
 
+class VoiceSupervisor:
+    """Restarts a voice session that gave up, once the network is back.
+
+    The session has a retry budget, and exhausting it is reasonable -- six
+    failures in two minutes usually means something is genuinely wrong. What
+    is not reasonable is that exhausting it was *permanent*: on 2026-09-21
+    NOVA gave up at 01:24:19 and the network returned at 01:25:13, and she
+    then logged "api_healthy=True" every twenty seconds for six minutes with
+    the microphone dead, because the session owns the microphone and nothing
+    was watching for the chance to start again.
+
+    This is the safety net rather than the fix. Classifying a handshake
+    timeout as an outage keeps the budget from being spent in the first
+    place; this catches whatever the classification misses, because a healthy
+    network and a dead session should never sit side by side.
+
+    Restarts are backed off, so a session that keeps dying costs a few
+    attempts rather than a hot loop -- but the backoff resets with time, so a
+    recovery an hour later is still tried.
+    """
+
+    #: Attempts before waiting for the cool-off.
+    MAX_CONSECUTIVE = 3
+    #: How long to wait after that, before trying again.
+    COOLOFF_S = 600.0
+
+    def __init__(self, live_factory=None, is_healthy=None) -> None:
+        self._live_factory = live_factory or (lambda: get_live_manager())
+        self._is_healthy = is_healthy or (lambda: True)
+        self._attempts = 0
+        self._last_attempt = 0.0
+        self._now = time.time
+
+    def check(self) -> bool:
+        """Restart if it is dead and the network is up. Never raises."""
+        try:
+            if not self._is_healthy():
+                return False
+
+            manager = self._live_factory()
+            if manager is None:
+                return False
+
+            status = manager.status() or {}
+            if status.get("state") != "error" and not status.get("gave_up"):
+                self._attempts = 0
+                return False
+
+            now = self._now()
+            if self._attempts >= self.MAX_CONSECUTIVE:
+                if (now - self._last_attempt) < self.COOLOFF_S:
+                    return False
+                self._attempts = 0      # the cool-off has passed; try again
+
+            self._attempts += 1
+            self._last_attempt = now
+            _log("[LIVE] the network is back and the session had given up; "
+                 "starting it again (attempt %d)", self._attempts)
+            manager.start()
+            return True
+        except Exception:
+            _log("[LIVE] could not check whether voice needs restarting")
+            return False
+
+
 class ResponseWatchdog:
     """Notices that speech went up and nothing came back.
 
@@ -2052,7 +2117,17 @@ class LiveManager:
                 or "network is unreachable" in e
                 or "no route to host" in e
                 or "errno 11001" in e
-                or "errno 11002" in e)
+                or "errno 11002" in e
+                # A connection that never completes is the same situation
+                # wearing a different message. On 2026-09-21 an outage
+                # produced six "timed out during opening handshake" in two
+                # minutes; because those read as a refusal rather than an
+                # outage, they burned the give-up budget and voice died
+                # fifty-four seconds before the network came back.
+                or "timed out during opening handshake" in e
+                or "handshake operation timed out" in e
+                or "timed out during handshake" in e
+                or "connection timed out" in e)
 
     @staticmethod
     def _is_auth_failure(err: str) -> bool:

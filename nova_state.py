@@ -31,3 +31,6 @@ _workflow_runner: Optional[Any] = None
 
 # Record of autonomous activity, for "what have you been doing?".
 _activity: Optional[Any] = None
+
+# Restarts the voice session when the network returns after a give-up.
+_voice_supervisor: Optional[Any] = None

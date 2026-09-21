@@ -437,7 +437,8 @@ class Scheduler:
 
     # ── the loop ────────────────────────────────────────────────────────────
     def start(self, runner: Callable[["Workflow"], "RunOutcome"],
-              interval_seconds: float = 60.0) -> None:
+              interval_seconds: float = 60.0,
+              on_tick: Optional[Callable[[], None]] = None) -> None:
         """Tick until stopped. Idempotent.
 
         A daemon thread, not a per-workflow timer: the schedule lives in the
@@ -450,7 +451,8 @@ class Scheduler:
                 return
             self._stop.clear()
             self._thread = threading.Thread(
-                target=self._loop, args=(runner, float(interval_seconds)),
+                target=self._loop,
+                args=(runner, float(interval_seconds), on_tick),
                 daemon=True, name="NOVAScheduler")
             self._thread.start()
         log.info("[SCHED] loop started (every %.0fs)", interval_seconds)
@@ -462,8 +464,16 @@ class Scheduler:
             thread.join(timeout=5.0)
         self._thread = None
 
-    def _loop(self, runner, interval_seconds: float) -> None:
+    def _loop(self, runner, interval_seconds: float, on_tick=None) -> None:
         while not self._stop.is_set():
+            # Periodic health work that is not a workflow. It rides this tick
+            # rather than starting another thread, and its failures are
+            # isolated from the workflows.
+            if on_tick is not None:
+                try:
+                    on_tick()
+                except Exception:
+                    log.debug("[SCHED] tick hook failed", exc_info=True)
             try:
                 self.run_due(runner)
             except Exception:
