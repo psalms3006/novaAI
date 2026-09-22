@@ -143,6 +143,18 @@ except ImportError:
     HAS_PYAUTOGUI = False
     print("⚠️  pyautogui not installed. computer_control disabled. Fix: pip install pyautogui")
 
+# offline_extra.py reads this via getattr(nova, 'pyttsx3', None). Nothing
+# ever set it -- there was no `import pyttsx3` anywhere in this file -- so
+# that getattr always returned None and offline TTS always skipped straight
+# to Piper, whether or not pyttsx3 was actually installed.
+try:
+    import pyttsx3
+    HAS_PYTTSX3 = True
+except ImportError:
+    pyttsx3 = None
+    HAS_PYTTSX3 = False
+    print("⚠️  pyttsx3 not installed. Offline TTS falls back to Piper only. Fix: pip install pyttsx3")
+
 # ── faster-whisper (lazy) ───────────────────────────────────────────────────
 # Detect the package without importing it; the real import pulls in
 # torch + transformers (~45s), so it is deferred until STT is first loaded.

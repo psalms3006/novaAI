@@ -123,6 +123,92 @@ def _offline_tts_worker():
 _tts_thread = threading.Thread(target=_offline_tts_worker, daemon=True)
 _tts_thread.start()
 
+# ─── OFFLINE BARGE-IN ──────────────────────────────────────────────────────
+#
+# Reuses nova_voice.VoiceGate/EchoCanceller -- the same mechanism the (off by
+# default; see simple_voice_default()) full-duplex cloud path uses -- rather
+# than a second, offline-specific echo/VAD heuristic. terminal_voice.py exists
+# because two implementations of the same thing drift; a second barge-in
+# detector would be that mistake again. Forced to full-duplex here regardless
+# of NOVA_VOICE_FULL_DUPLEX: offline has no interruption button, so the
+# mute-only "simple" policy would mean no barge-in is possible at all -- the
+# "wait until she finishes" behaviour real barge-in exists to avoid.
+
+#: Mic rate barge-in listens at. Matches listen_offline()'s own `fs`.
+_BARGE_IN_MIC_RATE = 16000
+
+_offline_gate_lock = threading.Lock()
+_offline_gate = None
+_offline_barge_event = threading.Event()
+
+
+def _on_offline_barge_in() -> None:
+    _offline_barge_event.set()
+
+
+def _get_offline_gate():
+    global _offline_gate
+    with _offline_gate_lock:
+        if _offline_gate is None:
+            import nova_voice
+            _offline_gate = nova_voice.VoiceGate(
+                chunk_samples=1024, on_barge_in=_on_offline_barge_in,
+                simple=False,
+            )
+        return _offline_gate
+
+
+def _play_pcm_with_barge_in(audio_i16: np.ndarray, samplerate: int) -> bool:
+    """Play mono int16 *audio_i16*, stoppable by a real voice interruption.
+
+    Returns True if the user actually barged in. The mic runs concurrently
+    with playback rather than being polled between chunks: interruption has
+    to be heard while it is happening, not after the fact.
+    """
+    gate = _get_offline_gate()
+    _offline_barge_event.clear()
+    gate.set_speaking(True)
+
+    mic_stop = threading.Event()
+
+    def _mic_feed() -> None:
+        try:
+            with sd.InputStream(samplerate=_BARGE_IN_MIC_RATE, channels=1,
+                                dtype="int16", blocksize=1024) as stream:
+                while not mic_stop.is_set():
+                    frame, _ = stream.read(1024)
+                    gate.process(np.asarray(frame).reshape(-1))
+        except Exception as e:
+            log.debug("offline barge-in mic feed stopped: %s", e)
+
+    mic_thread = threading.Thread(target=_mic_feed, daemon=True,
+                                  name="nova-offline-bargein-mic")
+    mic_thread.start()
+
+    interrupted = False
+    chunk = 1024
+    try:
+        with sd.OutputStream(samplerate=samplerate, channels=1,
+                             dtype="int16") as out:
+            for i in range(0, len(audio_i16), chunk):
+                block = audio_i16[i:i + chunk]
+                # Fed at the moment it is written, not at enqueue time -- the
+                # echo canceller aligns against when the room actually hears
+                # it. See the identical comment in desk/live_session.py.
+                gate.reference(block.tobytes(), rate=samplerate)
+                out.write(block.reshape(-1, 1))
+                if _offline_barge_event.is_set():
+                    interrupted = True
+                    break
+    finally:
+        mic_stop.set()
+        mic_thread.join(timeout=1.0)
+        gate.set_speaking(False, interrupted=interrupted)
+
+    if interrupted:
+        print("   … stopped (barge-in)", flush=True)
+    return interrupted
+
 def speak_offline(text: str, block: bool = False) -> None:
     """
     Queue text for speaking. Non-blocking by default.
@@ -164,9 +250,32 @@ def _speak_pyttsx3(text: str) -> bool:
             if isinstance(name, str) and isinstance(vid, str) and "english" in name.lower():
                 engine.setProperty("voice", vid)
                 break
-        engine.say(text)
-        engine.runAndWait()
-        engine.stop()
+
+        # Rendered to a file rather than played via engine.say()+
+        # runAndWait(), so playback goes through the same barge-in-aware
+        # path as Piper -- one stream the gate can be fed a reference from
+        # and stop early, instead of a playback call neither the mic thread
+        # nor anything else can interrupt.
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            engine.save_to_file(text, tmp_path)
+            engine.runAndWait()
+            engine.stop()
+            rate, audio = wav_write.read(tmp_path)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+        if audio.ndim > 1:
+            audio = audio[:, 0]
+        if audio.dtype != np.int16:
+            audio = audio.astype(np.int16)
+        if len(audio) == 0:
+            return False
+        _play_pcm_with_barge_in(audio, rate)
         return True
     except Exception as e:
         log.error(f"pyttsx3: {e}")
@@ -185,8 +294,7 @@ def _speak_piper(text: str) -> bool:
         audio = np.frombuffer(result.stdout, dtype=np.int16)
         if len(audio) == 0:
             return False
-        sd.play(audio, samplerate=PIPER_RATE)
-        sd.wait()
+        _play_pcm_with_barge_in(audio, PIPER_RATE)
         return True
     except Exception as e:
         log.error(f"Piper: {e}")
@@ -273,7 +381,13 @@ def listen_offline() -> str:
     
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
-        wav_write(tmp_path, fs, audio_i16)
+        # `wav_write` is the scipy.io.wavfile *module* (see the import at the
+        # top of this file), not its write() function -- calling it directly
+        # raised "'module' object is not callable" every single time, i.e.
+        # every time listen_offline() actually captured real speech, and
+        # that raise was outside the try/except below, so it killed the
+        # whole offline loop uncaught.
+        wav_write.write(tmp_path, fs, audio_i16)
     
     print("🔍 Transcribing with faster-whisper...")
     set_offline_state(OfflineState.THINKING)
@@ -983,7 +1097,12 @@ def run_offline_loop_v2(meta: dict) -> None:
         _nova._mem_extract_turn_counter += 1
         if _nova._mem_extract_turn_counter % _MEM_EXTRACT_EVERY_N == 0:
             meta = extract_memory_updates(user_input, reply, meta)
-        
-        set_offline_state(OfflineState.IDLE)
+        # Deliberately not forcing IDLE here. speak_offline() just queued the
+        # reply and returned without waiting for it, so the TTS worker has
+        # not necessarily set SPEAKING yet -- setting IDLE here raced it and
+        # sometimes won, and the next loop iteration's "if state == SPEAKING:
+        # wait" then read IDLE and opened the mic while NOVA was still
+        # talking. The worker already owns this transition (SPEAKING ->
+        # LISTENING once done); nothing here needs to duplicate it.
 # At the bottom of your offline code, add:
 run_offline_loop = run_offline_loop_v2  # Alias for compatibility
