@@ -109,7 +109,23 @@ class TerminalVoice:
                 pass
 
     async def run(self) -> str:
-        """Hold a conversation until the user stops it. Returns why it ended."""
+        """Hold a conversation until the user stops it. Returns why it ended.
+
+        nova.py calls this a second time to resume Gemini Live after an
+        offline excursion, reusing the same TerminalVoice instance. Every
+        piece of state a previous run leaves behind must be reset here, or
+        the second call inherits it: `_stop` in particular is a
+        threading.Event, which stays set once set, so without this reset
+        `_pump`'s `while not self._stop.is_set()` is false before its first
+        iteration and the "resumed" session exits immediately -- indistinguishable
+        from the user asking to quit, which is why nova.py shut the whole
+        process down right after the network came back instead of reconnecting.
+        """
+        self._stop.clear()
+        self._ready.clear()
+        self._offline_since = 0.0
+        self._said = []
+        self._heard = []
         self._events = self._mgr.subscribe()
         result = self._mgr.start()
         if not result.get("ok"):

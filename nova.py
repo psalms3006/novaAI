@@ -2637,9 +2637,13 @@ def main() -> None:
                 _local_runtime.ensure_running()
         atexit.register(_local_runtime.stop)
 
-        # Store runtime as module attribute for status endpoint
+        # Store runtime as module attribute for status endpoint, and
+        # connectivity so VoiceSupervisor's is_healthy() closure (which reads
+        # it via globals()) can actually see it -- without this it always
+        # found None and treated the network as healthy unconditionally.
         import nova as _nova_module
         _nova_module._local_runtime = _local_runtime
+        _nova_module._connectivity = _connectivity
 
         # The configured name, not the verified one, whenever the cloud can
         # answer. Verifying means asking Ollama what it has installed, which
@@ -2668,6 +2672,26 @@ def main() -> None:
             ollama_provider=_ollama_provider,
             connectivity=_connectivity,
         )
+
+        # A second local model, tried only once the first one has actually
+        # failed. Until now "ollama" was a single OllamaProvider bound to one
+        # model, so a Qwen failure (not installed, OOM, Ollama down for that
+        # model) fell straight through to "no intelligence provider
+        # available" even with TinyLlama sitting on disk. Registered under a
+        # key that sorts after "ollama" alphabetically, the router's existing
+        # rank_providers()/complete() failover walks onto it with no router
+        # changes needed -- ranking and retry were already generic over
+        # however many providers are registered.
+        #
+        # Constructing it is free (no I/O); the router's is_available() probe
+        # that finds out whether TinyLlama is actually installed happens
+        # lazily on first use, same as the primary provider, so this adds no
+        # startup cost.
+        if "tinyllama" not in _ollama_model:
+            _ollama_fallback = OllamaProvider(model="tinyllama")
+            _ollama_fallback.runtime = _local_runtime
+            _nova_router.register_provider("ollama-fallback", _ollama_fallback)
+
         _nova_router.set_online_preferred(not FORCE_OFFLINE)
         _t["IntelligenceRouter"] = time.time() - _ir0
         # Deliberately not asking the provider whether Ollama is running: that

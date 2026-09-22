@@ -322,3 +322,45 @@ def test_ranking_does_not_depend_on_a_provider_being_named_gemini():
 
     r_off = _router(state=ConnectivityState.OFFLINE, anthropic=cloud, ollama=local)
     assert [p.name for p in r_off.rank_providers()] == ["ollama", "anthropic"]
+
+
+# ── two-tier local fallback (Qwen primary, TinyLlama secondary) ────────────────
+#
+# nova.py registers a second OllamaProvider under the key "ollama-fallback"
+# once it starts up so a Qwen failure (not installed, OOM, crashed) does not
+# read as "no intelligence provider available" when TinyLlama is sitting
+# right there on disk. No router change was needed for this -- rank_providers
+# and complete()/stream() were already generic over however many providers
+# are registered. These tests pin that the plain registration is enough.
+
+def test_falls_through_gemini_then_qwen_to_tinyllama():
+    gemini = FakeProvider("gemini", raises=RuntimeError("no network"))
+    qwen = FakeProvider("ollama", raises=RuntimeError("model not installed"))
+    tinyllama = FakeProvider("ollama-fallback", text="tinyllama answer")
+    r = _router(gemini=gemini, ollama=qwen, **{"ollama-fallback": tinyllama})
+
+    result = r.complete(MSGS)
+
+    assert result.text == "tinyllama answer"
+    assert gemini.complete_calls == 1
+    assert qwen.complete_calls == 1
+    assert tinyllama.complete_calls == 1
+
+
+def test_tinyllama_only_tried_after_qwen_fails():
+    qwen = FakeProvider("ollama", text="qwen answer")
+    tinyllama = FakeProvider("ollama-fallback", text="tinyllama answer")
+    r = _router(state=ConnectivityState.OFFLINE, ollama=qwen,
+                **{"ollama-fallback": tinyllama})
+
+    assert r.complete(MSGS).text == "qwen answer"
+    assert tinyllama.complete_calls == 0
+
+
+def test_local_fallback_ranks_after_the_primary_local_model():
+    qwen = FakeProvider("ollama")
+    tinyllama = FakeProvider("ollama-fallback")
+    r = _router(state=ConnectivityState.OFFLINE, ollama=qwen,
+                **{"ollama-fallback": tinyllama})
+
+    assert [p.name for p in r.rank_providers()] == ["ollama", "ollama-fallback"]
