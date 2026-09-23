@@ -66,13 +66,37 @@ class VoiceConfirmer:
             return None
 
     def speak(self, text: str) -> None:
-        """Say the question. Used as safety_gate's speak_fn."""
+        """Say the question. Used as safety_gate's speak_fn.
+
+        From a real session (2026-09-23): a computer_settings confirmation
+        looped for three-plus minutes, ~20.5s per attempt -- the exact
+        DEFAULT_TIMEOUT_S wait, every single time, meaning the user never
+        got a real chance to answer. The question text was being sent to
+        send_text() verbatim ("I'm about to change a setting. Should I
+        proceed?"), which desk/live_session.py injects as a "role": "user"
+        turn -- content the model treats as something *the user* just said
+        to *it*. Gemini answered its own question ("Sure, go ahead") rather
+        than relaying it to the actual person and waiting, so no real
+        question was ever voiced and ask() timed out every time on schedule.
+
+        The greeting uses the identical send_text/"role":"user" mechanism
+        and works, because it sends an instruction ("say this out loud to
+        the user") rather than the content itself. Same fix here: wrap the
+        question so the model understands it is being told to ask someone
+        else, not being asked itself.
+        """
         manager = self._session()
         if manager is None:
             print(f"\n[NOVA] {text}")
             return
+        instruction = (
+            "Ask the user this exact question out loud, in your own "
+            "natural voice, right now, then stop and wait for their yes "
+            "or no. This question is for them, not for you -- do not "
+            f"answer it yourself. Question: {text}"
+        )
         try:
-            manager.send_text(text)
+            manager.send_text(instruction)
         except Exception:
             log.debug("[CONFIRM] could not speak the question", exc_info=True)
             print(f"\n[NOVA] {text}")

@@ -108,3 +108,34 @@ def test_the_seven_consequential_tools_still_ask_in_an_ordinary_turn(declines):
     )
     assert declines["asked"] >= 1
     assert verdict is not None
+
+
+# ── a declined confirmation must not become a retry loop ───────────────────
+#
+# From a real session (2026-09-23): a computer_settings confirmation that got
+# no answer was retried by the model every ~20.5s for three-plus minutes,
+# dropping the user's mic audio the whole time because the session never got
+# back to processing anything else. "I won't do X without your yes" reads as
+# a status, not an instruction not to try again -- the model kept trying.
+
+def test_a_timed_out_confirmation_tells_the_model_not_to_retry():
+    def no_answer():
+        return ""  # VoiceConfirmer.ask() returns "" when nothing was heard
+
+    verdict = nova_safety.safety_gate(
+        "file_controller", {"action": "delete", "path": "x.txt"},
+        no_answer, trust=Trust.USER,
+    )
+    assert verdict is not None
+    assert "do not" in verdict.lower() or "don't" in verdict.lower(), (
+        "a timed-out confirmation did not tell the model to stop retrying"
+    )
+
+
+def test_an_explicit_decline_also_tells_the_model_not_to_retry(declines):
+    verdict = nova_safety.safety_gate(
+        "file_controller", {"action": "delete", "path": "x.txt"},
+        declines["fn"], trust=Trust.USER,
+    )
+    assert verdict is not None
+    assert "do not" in verdict.lower() or "don't" in verdict.lower()

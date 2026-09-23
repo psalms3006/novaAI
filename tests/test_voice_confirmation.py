@@ -80,6 +80,38 @@ def test_the_question_is_spoken_into_the_live_session():
     assert "shut down" in live.spoken[0].lower()
 
 
+def test_the_model_is_told_to_relay_the_question_not_answer_it():
+    """From a real session (2026-09-23): a computer_settings confirmation
+    looped for three-plus minutes, ~20.5s per attempt (exactly
+    DEFAULT_TIMEOUT_S) -- the user never got a real chance to answer.
+
+    send_text() delivers the text to desk/live_session.py as a "role":
+    "user" turn -- content the model treats as something the user just said
+    to it. Sending the bare question ("I'm about to X. Should I proceed?")
+    reads exactly like the user asking the model for permission, so Gemini
+    answered its own question instead of relaying it to the real person.
+    The greeting uses the identical mechanism and works, because it sends
+    an instruction ("say this out loud to the user") rather than content to
+    react to -- speak() must do the same.
+    """
+    live = FakeLive()
+    confirmer = _confirmer(live)
+
+    confirmer.speak("I'm about to shut down this computer. Should I proceed?")
+
+    sent = live.spoken[0].lower()
+    assert "shut down" in sent  # the actual question must still be in there
+    assert "ask the user" in sent or "out loud" in sent, (
+        "the model was not instructed to voice the question to the user -- "
+        "sent as bare content, Gemini answers it itself instead of relaying "
+        "it, which is why no one ever heard a real question to reply to"
+    )
+    assert "not" in sent or "wait" in sent, (
+        "nothing tells the model to stop and wait for a real answer rather "
+        "than continuing on its own"
+    )
+
+
 def test_a_spoken_yes_is_the_answer():
     live = FakeLive()
     confirmer = _confirmer(live)

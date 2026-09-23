@@ -262,7 +262,22 @@ def _ask_permission(
         return None  # proceed
     else:
         _log(f"DECLINED: {tool_name} — user said: {response[:40]!r}")
-        return f"Action cancelled. You said: '{response}'. I won't {description} without your explicit yes."
+        # Explicit about not retrying, for the same reason
+        # desk/live_session.py's own tool-timeout message is: from a real
+        # session, a computer_settings confirmation that got no real answer
+        # (see nova_confirm.VoiceConfirmer.speak for why) was retried by the
+        # model every ~20.5s for three-plus minutes, dropping the user's mic
+        # audio the whole time because the session never got back to
+        # processing anything else. "I won't do X without your yes" reads as
+        # a status, not an instruction not to try again.
+        if response:
+            return (f"Action cancelled. You said: '{response}'. I won't "
+                    f"{description} without your explicit yes. Do not call "
+                    f"this tool again for this request.")
+        return (f"Action cancelled — no response was heard. I won't "
+                f"{description} without your explicit yes. Do NOT call "
+                f"this tool again for this request; if it's still wanted, "
+                f"wait for the user to bring it up again themselves.")
 
 
 def _describe_action(tool_name: str, args: dict) -> str:

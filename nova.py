@@ -2074,6 +2074,7 @@ def get_local_ip() -> str:
 from live_extra import (
     _call_gemini_chat,
     _trim_history,
+    _load_whisper_async,
 )
 from agents_extra import agent_process
 def _zim_data_path() -> str:
@@ -2491,6 +2492,20 @@ def main() -> None:
             _rebuild_index()
 
     threading.Thread(target=_load_embedder_async, daemon=True, name="EmbedLoader").start()
+
+    # ── Whisper STT (LAZY — loads in background, same reasoning as the
+    # embedder above) ─────────────────────────────────────────────────────
+    # live_extra._load_whisper_async sets _stt_loaded and nova._stt_model
+    # once it finishes -- offline_extra.listen_offline() waits up to 10s on
+    # _stt_loaded before it can transcribe anything. Nothing ever started
+    # this thread: _stt_loaded was created and waited on, but never set,
+    # so every single offline listen attempt waited the full 10s and then
+    # gave up with "Whisper not loaded yet" -- offline voice input has
+    # never worked, on any machine, regardless of network conditions.
+    # Started unconditionally (not only when offline is actually entered):
+    # a network drop or a spoken "switch to offline" should not then also
+    # have to wait through a cold model load before NOVA can hear anything.
+    threading.Thread(target=_load_whisper_async, daemon=True, name="WhisperLoader").start()
 
     # ── Load memory ───────────────────────────────────────────────────────────
     _t0 = time.time(); meta = load_memory(); _t["Memory load"] = time.time() - _t0
