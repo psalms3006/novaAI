@@ -154,7 +154,8 @@ class TaskManager:
 
     def __init__(self, path: Optional[str] = None,
                  tool_executor: Optional[Callable[[str, Dict, Dict], Any]] = None,
-                 verify_fn: Optional[Callable[[str], str]] = None) -> None:
+                 verify_fn: Optional[Callable[[str], str]] = None,
+                 max_concurrent: int = 3) -> None:
         self.path = path or default_tasks_path()
         self._tool_executor = tool_executor      # fn(tool_name, args, meta) -> result str
         self._verify_fn = verify_fn              # fn(output_text) -> verification status
@@ -163,7 +164,15 @@ class TaskManager:
         self._speak = None
         self._lock = threading.RLock()
         self._tasks: List[Task] = []
-        self._thread: Optional[threading.Thread] = None
+        # A worker pool, not one dedicated thread: independent tasks (no
+        # shared dependency chain) can now genuinely run at the same
+        # time instead of queueing behind each other one at a time. 3 by
+        # default -- this runs on the same machine as everything else
+        # NOVA does, including local model inference, so unbounded
+        # concurrency would compete with itself for the same CPU/RAM a
+        # local LLM fallback needs.
+        self._max_concurrent = max(1, int(max_concurrent))
+        self._threads: List[threading.Thread] = []
         self._stop = threading.Event()
         self._cond = threading.Condition(self._lock)
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
@@ -201,13 +210,30 @@ class TaskManager:
         self._verify_fn = fn
 
     def start(self) -> None:
+        """Start the worker pool -- self._max_concurrent threads, each
+        running the identical claim-a-task/run-it/loop-again cycle.
+
+        This module's own docstring has called it a "Concurrent Task
+        Manager" since it was written; the implementation was a single
+        dedicated thread pulling one task at a time, which is the
+        opposite of that. Independent tasks (no shared dependency chain
+        -- see _deps_ready) can genuinely run at the same time; nothing
+        about the claim logic below assumed only one worker would ever
+        be doing it, because the claim itself (check status, flip to
+        RUNNING) already happens under self._lock/self._cond -- the
+        thing that made it correct for one worker also makes it correct
+        for several.
+        """
         with self._lock:
-            if self._thread is not None and self._thread.is_alive():
+            if self._threads and any(t.is_alive() for t in self._threads):
                 return
             self._stop.clear()
-            self._thread = threading.Thread(target=self._worker_loop, daemon=True,
-                                            name="NOVATaskManager")
-            self._thread.start()
+            self._threads = []
+            for i in range(max(1, self._max_concurrent)):
+                t = threading.Thread(target=self._worker_loop, daemon=True,
+                                     name=f"NOVATaskManager-{i}")
+                t.start()
+                self._threads.append(t)
 
     def stop(self) -> None:
         self._stop.set()
@@ -428,9 +454,18 @@ class TaskManager:
                 # Released on every exit, including a crash. An orb left
                 # showing work that has stopped is worse than one that never
                 # showed it: the user waits for something that is not coming.
+                #
+                # With one worker, "no more QUEUED-and-ready tasks" was the
+                # same question as "is anything still running" -- the one
+                # worker finishing WAS the only thing that could have been
+                # running. With a pool, that stopped being true: this
+                # worker finishing task A while a sibling worker is still
+                # running task B must not report "done" while B is still
+                # going.
                 with self._lock:
-                    more = any(x.status == "QUEUED" and self._deps_ready(x)
-                               for x in self._tasks)
+                    more = (any(x.status == "RUNNING" for x in self._tasks)
+                           or any(x.status == "QUEUED" and self._deps_ready(x)
+                                  for x in self._tasks))
                 if not more:
                     self._signal_activity(False)
 
@@ -590,11 +625,13 @@ _singleton: Optional[TaskManager] = None
 def init_task_manager(path: Optional[str] = None,
                       tool_executor: Optional[Callable] = None,
                       verify_fn: Optional[Callable] = None,
-                      auto_start: bool = True) -> TaskManager:
+                      auto_start: bool = True,
+                      max_concurrent: int = 3) -> TaskManager:
     global _singleton
     _singleton = TaskManager(path=path or None,
                              tool_executor=tool_executor,
-                             verify_fn=verify_fn)
+                             verify_fn=verify_fn,
+                             max_concurrent=max_concurrent)
     if auto_start:
         _singleton.start()
     return _singleton
