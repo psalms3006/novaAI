@@ -170,6 +170,37 @@ OUTPUT_LATENCY_S = 0.5
 PREROLL_MS = 120
 LIVE_RATE = 24000  # Gemini Live outputs 24 kHz 16-bit mono PCM
 
+#: Below this peak level, a chunk is treated as silence for spectrum
+#: purposes. Without a floor, a near-silent chunk's tiny magnitudes still
+#: get normalised up to a full-scale band pattern below, which reads to the
+#: orb as loud, textured speech when nothing is actually being said.
+_SPECTRUM_SILENCE_FLOOR = 0.02
+
+
+def _spectrum_bands(samples: "np.ndarray", level: float) -> list:
+    """8-band magnitude spectrum for one audio chunk, 0..1 per band.
+
+    A real FFT, not a synthetic pulse: the orb's shader wraps these bands
+    around the form (bandAt() in orb3d.js) so the displacement traces the
+    actual shape of what NOVA is saying rather than a uniform swell. Band
+    edges are log-spaced (np.geomspace) so the 8 bands bias toward voice-
+    relevant low/mid frequencies instead of spending most of them on
+    inaudible highs, the way a linear split over a 24 kHz spectrum would.
+    """
+    if samples.size == 0 or level < _SPECTRUM_SILENCE_FLOOR:
+        return [0.0] * 8
+    windowed = samples.astype(np.float32) * np.hanning(samples.size)
+    mags = np.abs(np.fft.rfft(windowed))
+    if mags.size < 9:
+        return [0.0] * 8
+    edges = np.geomspace(1, mags.size, 9).astype(np.int64)
+    bands = []
+    for i in range(8):
+        lo, hi = edges[i], max(edges[i] + 1, edges[i + 1])
+        bands.append(float(mags[lo:hi].mean()) if hi > lo else 0.0)
+    peak = max(bands) or 1.0
+    return [round(min(1.0, b / peak), 3) for b in bands]
+
 
 class VoiceTrace:
     """Stage timings for one voice session.
@@ -1688,12 +1719,26 @@ class LiveManager:
             pass
         # Amplitude drives the orb on every surface. Cheap: one pass over a
         # decimated view, not the whole buffer.
+        #
+        # The orb's shader (orb3d.js) has had full 8-band spectrum
+        # reactivity since it was written -- uBands, bandAt() wrapping the
+        # displacement around the form so a voice reads as shape, not just
+        # a pulse -- and setSpectrum() to feed it. Nothing has ever called
+        # setSpectrum(): only this scalar peak has ever been published, so
+        # that shader code has been dead since it landed. A real FFT on the
+        # same chunk already being measured for level costs microseconds
+        # and gives the frontend something to actually deform against.
         try:
-            samples = np.frombuffer(audio, dtype=np.int16)[::16]
-            level = float(np.abs(samples).max()) / 32768.0 if samples.size else 0.0
+            samples = np.frombuffer(audio, dtype=np.int16)
+            if samples.size:
+                level = float(np.abs(samples[::16]).max()) / 32768.0
+            else:
+                level = 0.0
+            bands = _spectrum_bands(samples, level)
         except Exception:
             level = 0.0
-        self._publish(LiveEvent("audio_level", level=round(level, 4)))
+            bands = [0.0] * 8
+        self._publish(LiveEvent("audio_level", level=round(level, 4), bands=bands))
 
     def _barge_in(self) -> None:
         """User spoke over NOVA — stop playing and let them finish."""

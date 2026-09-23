@@ -388,6 +388,7 @@ function handleLiveEvent(ev) {
     case "audio_level":
       window.__novaAudioLevel = ev.level || 0;
       if (orb && orb.setAmplitude) orb.setAmplitude(ev.level || 0);
+      if (orb && orb.setSpectrum && ev.bands) orb.setSpectrum(ev.bands);
       break;
     case "mic_level":
       // The user's own voice. audio_level above is NOVA's outgoing audio, so
@@ -492,9 +493,10 @@ function handleLiveEvent(ev) {
       // again it means two surfaces would speak at once, so ignore it.
       break;
     case "audio_level":
-      // Amplitude only — the orb visualises what Core is actually playing.
+      // The orb visualises what Core is actually playing.
       window.__novaAudioLevel = ev.level || 0;
       if (orb && orb.setAmplitude) orb.setAmplitude(ev.level || 0);
+      if (orb && orb.setSpectrum && ev.bands) orb.setSpectrum(ev.bands);
       break;
   }
 }
