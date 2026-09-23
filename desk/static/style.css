@@ -42,6 +42,90 @@
   --radius-sm: 8px;
   --panel-w: 280px;
   --ease: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* ── Claymorphism ──────────────────────────────────────
+     Dark-mode claymorphism: the usual light-pastel recipe (a bright
+     base + a dark drop shadow + a light inset highlight) inverted onto
+     this palette's near-black surfaces. The "light" shadow here is a
+     faint white glow standing in for the highlight a raised pastel
+     surface would catch; the "dark" shadow goes deeper than --bg so a
+     clay surface still reads as raised against an already-dark
+     background instead of just looking flat-with-rounder-corners. */
+  --clay-bg: linear-gradient(160deg, #191d27 0%, #0d0f15 100%);
+  --clay-bg-raised: linear-gradient(160deg, #20242f 0%, #12151d 100%);
+  --clay-shadow-dark: rgba(0, 0, 0, 0.65);
+  --clay-shadow-light: rgba(255, 255, 255, 0.05);
+  --clay-border: rgba(255, 255, 255, 0.06);
+  --clay-radius: 22px;
+  --clay-radius-sm: 16px;
+}
+
+/* One surface, one button, one edge language everywhere they appear:
+   raised, soft, never a hairline. .clay-surface is for panels/cards/
+   bubbles; .clay-btn is for anything clickable, including the pressed
+   (inset) state that makes a click feel like it actually moved. */
+.clay-surface {
+  background: var(--clay-bg);
+  border: 1px solid var(--clay-border);
+  border-radius: var(--clay-radius);
+  box-shadow:
+    10px 10px 24px var(--clay-shadow-dark),
+    -8px -8px 20px var(--clay-shadow-light),
+    inset 1px 1px 1px rgba(255, 255, 255, 0.04),
+    inset -1px -1px 1px rgba(0, 0, 0, 0.35);
+}
+.clay-btn {
+  background: var(--clay-bg-raised);
+  border: 1px solid var(--clay-border);
+  border-radius: var(--clay-radius-sm);
+  box-shadow:
+    5px 5px 12px var(--clay-shadow-dark),
+    -4px -4px 10px var(--clay-shadow-light);
+  transition: box-shadow 0.15s var(--ease), transform 0.15s var(--ease);
+}
+.clay-btn:hover {
+  box-shadow:
+    6px 6px 15px var(--clay-shadow-dark),
+    -5px -5px 12px var(--clay-shadow-light);
+  transform: translateY(-1px);
+}
+.clay-btn:active {
+  box-shadow:
+    inset 3px 3px 8px var(--clay-shadow-dark),
+    inset -2px -2px 6px var(--clay-shadow-light);
+  transform: translateY(0);
+}
+.clay-btn:disabled {
+  box-shadow:
+    3px 3px 8px var(--clay-shadow-dark),
+    -2px -2px 6px var(--clay-shadow-light);
+  transform: none;
+}
+/* The accent/primary button gets the same puffy shape with a colored
+   glow standing in for the dark shadow, so it reads as "the one that
+   matters" without breaking the clay language everything else uses. */
+.clay-btn.primary,
+.clay-btn.clay-primary {
+  background: linear-gradient(160deg, var(--accent-strong), var(--accent));
+  color: #04231c;
+  border-color: transparent;
+  box-shadow:
+    5px 5px 16px var(--glow),
+    -4px -4px 10px rgba(255, 255, 255, 0.10),
+    inset 0 1px 1px rgba(255, 255, 255, 0.35);
+}
+.clay-btn.primary:hover,
+.clay-btn.clay-primary:hover {
+  box-shadow:
+    6px 6px 20px var(--glow-strong),
+    -5px -5px 12px rgba(255, 255, 255, 0.12),
+    inset 0 1px 1px rgba(255, 255, 255, 0.4);
+}
+.clay-btn.primary:active,
+.clay-btn.clay-primary:active {
+  box-shadow:
+    inset 3px 3px 8px rgba(0, 0, 0, 0.35),
+    inset -2px -2px 6px rgba(255, 255, 255, 0.15);
 }
 
 /* ═══ Reset ═══ */
@@ -52,10 +136,28 @@ body {
   font-size: 13px;
   line-height: 1.5;
   color: var(--text);
+  /* The nebula (nebula.js) is the real background now, painted into
+     #global-nebula-canvas below; this solid color is only what shows
+     for the instant before that WebGL context exists (page load, or a
+     machine where it fails to initialize). */
   background: var(--bg);
 }
 button { cursor: pointer; font-family: inherit; }
 input, textarea, select { font-family: inherit; }
+
+/* ── Global cosmic background ───────────────────────────
+   nebula.js used to live inside #orb-container, scaled to just that
+   box. It is instantiated into #global-nebula-host instead now (see
+   index.html) -- one canvas, fixed behind the entire window, so the
+   nebula is the app's actual background rather than something that
+   only shows around the orb. Every panel above it needs its own solid
+   (clay) surface to stay legible against a moving starfield; .app
+   itself stays transparent so there is nothing between the nebula and
+   the panels floating on top of it. */
+#global-nebula-host {
+  position: fixed; inset: 0; z-index: 0;
+  pointer-events: none;
+}
 
 /* ═══ Init Screen ═══ */
 .init-screen {
@@ -86,7 +188,8 @@ input, textarea, select { font-family: inherit; }
 .app {
   display: flex;
   height: 100vh; width: 100vw;
-  background: var(--bg);
+  background: transparent;
+  position: relative; z-index: 1;
 }
 
 /* ── Left Panel (drawer) ────────────────────────────── */
@@ -94,8 +197,13 @@ input, textarea, select { font-family: inherit; }
   width: var(--panel-w);
   min-width: var(--panel-w);
   height: 100vh;
-  background: var(--surface);
-  border-right: 1px solid var(--border);
+  background: var(--clay-bg);
+  /* Flush to the window's own left/top/bottom edges, so only the right
+     edge can read as "raised" -- a directional shadow instead of
+     .clay-surface's all-around one, same puffy language, shaped for a
+     panel rather than a floating card. */
+  border-right: 1px solid var(--clay-border);
+  box-shadow: 10px 0 24px var(--clay-shadow-dark);
   display: flex; flex-direction: column;
   overflow: hidden;
   transition: width 0.2s var(--ease), min-width 0.2s var(--ease), opacity 0.2s var(--ease);
@@ -180,7 +288,11 @@ input, textarea, select { font-family: inherit; }
 .center-col {
   flex: 1; display: flex; flex-direction: column;
   min-width: 0; position: relative;
-  background: var(--bg);
+  /* Transparent so the global nebula (#global-nebula-host, behind the
+     whole app) actually shows through here -- this is where the orb
+     lives and where most of the window's visible area is, so an opaque
+     background here would have hidden the nebula almost entirely. */
+  background: transparent;
 }
 
 .topbar {
@@ -262,24 +374,34 @@ input, textarea, select { font-family: inherit; }
 }
 .transcript-messages { display: flex; flex-direction: column; gap: 6px; }
 .transcript-msg {
-  padding: 6px 10px; border-radius: var(--radius-sm);
+  padding: 8px 12px; border-radius: var(--clay-radius-sm);
   font-size: 12px; line-height: 1.5; max-width: 80%;
 }
 .transcript-msg.user {
   align-self: flex-end; background: var(--accent-soft);
-  color: var(--accent-text); border-bottom-right-radius: 2px;
+  color: var(--accent-text); border-bottom-right-radius: 4px;
+  box-shadow:
+    4px 4px 10px var(--clay-shadow-dark),
+    -2px -2px 6px rgba(255, 255, 255, 0.03);
 }
 .transcript-msg.nova {
-  align-self: flex-start; background: var(--surface2);
-  color: var(--text); border-bottom-left-radius: 2px;
+  align-self: flex-start; background: var(--clay-bg-raised);
+  color: var(--text); border-bottom-left-radius: 4px;
+  box-shadow:
+    4px 4px 10px var(--clay-shadow-dark),
+    -3px -3px 8px var(--clay-shadow-light);
 }
 
 /* ── Command Bar ────────────────────────────────────── */
 .command-bar {
   display: flex; align-items: center; gap: 6px;
   padding: 10px 14px; margin: 0 14px 14px;
-  background: var(--surface); border: 1px solid var(--border);
-  border-radius: var(--radius);
+  background: var(--clay-bg-raised);
+  border: 1px solid var(--clay-border);
+  border-radius: var(--clay-radius-sm);
+  box-shadow:
+    6px 6px 16px var(--clay-shadow-dark),
+    -5px -5px 12px var(--clay-shadow-light);
 }
 .command-bar input {
   flex: 1; background: none; border: none; color: var(--text);
@@ -351,17 +473,69 @@ input, textarea, select { font-family: inherit; }
 .modal p { margin-bottom: 10px; }
 .modal .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 .btn {
-  padding: 8px 16px; border-radius: var(--radius-sm);
-  border: 1px solid var(--border); background: var(--surface2);
+  padding: 8px 16px; border-radius: var(--clay-radius-sm);
+  background: var(--clay-bg-raised); border: 1px solid var(--clay-border);
   color: var(--text); font-size: 12px;
+  box-shadow:
+    5px 5px 12px var(--clay-shadow-dark),
+    -4px -4px 10px var(--clay-shadow-light);
+  transition: box-shadow 0.15s var(--ease), transform 0.15s var(--ease);
 }
-.btn.primary { background: var(--accent); color: #000; border-color: var(--accent); }
+.btn:hover {
+  box-shadow:
+    6px 6px 15px var(--clay-shadow-dark),
+    -5px -5px 12px var(--clay-shadow-light);
+  transform: translateY(-1px);
+}
+.btn:active {
+  box-shadow:
+    inset 3px 3px 8px var(--clay-shadow-dark),
+    inset -2px -2px 6px var(--clay-shadow-light);
+  transform: translateY(0);
+}
+.btn.primary {
+  background: linear-gradient(160deg, var(--accent-strong), var(--accent));
+  color: #04231c; border-color: transparent;
+  box-shadow:
+    5px 5px 16px var(--glow),
+    -4px -4px 10px rgba(255, 255, 255, 0.10),
+    inset 0 1px 1px rgba(255, 255, 255, 0.35);
+}
+.btn.primary:hover {
+  box-shadow:
+    6px 6px 20px var(--glow-strong),
+    -5px -5px 12px rgba(255, 255, 255, 0.12),
+    inset 0 1px 1px rgba(255, 255, 255, 0.4);
+}
 .btn-sm {
-  padding: 6px 12px; border-radius: var(--radius-sm);
-  border: 1px solid var(--border); background: var(--surface2);
+  padding: 6px 12px; border-radius: var(--clay-radius-sm);
+  background: var(--clay-bg-raised); border: 1px solid var(--clay-border);
   color: var(--text); font-size: 12px;
+  box-shadow:
+    4px 4px 10px var(--clay-shadow-dark),
+    -3px -3px 8px var(--clay-shadow-light);
+  transition: box-shadow 0.15s var(--ease), transform 0.15s var(--ease);
 }
-.btn-sm.primary { background: var(--accent); color: #000; border-color: var(--accent); }
+.btn-sm:hover {
+  box-shadow:
+    5px 5px 12px var(--clay-shadow-dark),
+    -4px -4px 10px var(--clay-shadow-light);
+  transform: translateY(-1px);
+}
+.btn-sm:active {
+  box-shadow:
+    inset 2px 2px 6px var(--clay-shadow-dark),
+    inset -2px -2px 5px var(--clay-shadow-light);
+  transform: translateY(0);
+}
+.btn-sm.primary {
+  background: linear-gradient(160deg, var(--accent-strong), var(--accent));
+  color: #04231c; border-color: transparent;
+  box-shadow:
+    4px 4px 12px var(--glow),
+    -3px -3px 8px rgba(255, 255, 255, 0.10),
+    inset 0 1px 1px rgba(255, 255, 255, 0.35);
+}
 
 .settings-tabs {
   display: flex; gap: 4px; margin-bottom: 16px;

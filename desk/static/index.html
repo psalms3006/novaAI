@@ -13,6 +13,10 @@
 <body>
   <script>window.DESK_TOKEN = "__DESK_TOKEN__"; window.DESK_VERSION = "__DESK_VERSION__";</script>
 
+  <!-- The cosmic background, fixed behind the entire window -- see
+       style.css's #global-nebula-host and the NovaNebula setup below. -->
+  <div id="global-nebula-host"></div>
+
   <!-- ═══════════════════════════════════════════════════════
        INITIALIZATION SCREEN
        ═══════════════════════════════════════════════════════ -->
@@ -343,10 +347,27 @@
   </script>
   <script type="module" src="/static/mind/main.js" defer></script>
   <script type="module">
+    import { NovaNebula } from "/static/nebula.js";
+    import { NovaOrb3D } from "/static/orb3d.js";
+
+    // Cosmic background, fixed behind the whole window -- independent of
+    // whether the orb itself gets WebGL (a 2D-fallback machine still gets
+    // the nebula; it just does not get a color/glow feed from a 3D orb).
+    const nebulaHost = document.getElementById("global-nebula-host");
+    let nebula = null;
+    if (nebulaHost) {
+      nebula = new NovaNebula(nebulaHost);
+      if (nebula.available) {
+        window.__novaNebula = nebula;
+        nebula.start();
+      } else {
+        nebula.dispose();
+        nebula = null;
+      }
+    }
+
     // Volumetric orb. Falls back silently to the 2D canvas orb if the machine
     // has no usable WebGL context (app.js checks window.__novaOrb first).
-    import { NovaOrb3D } from "/static/orb3d.js";
-    import { NovaNebula } from "/static/nebula.js";
     const host = document.getElementById("orb-container");
     if (host) {
       const o = new NovaOrb3D(host);
@@ -354,21 +375,13 @@
         window.__novaOrb = o;
         if (window.__novaSetOrb) window.__novaSetOrb(o);
 
-        // Background is a separate renderer/scene from the orb on
-        // purpose (see nebula.js) -- only wired together here, in the
-        // one place that already knows both exist, so neither module
-        // needs to know about the other.
-        const nebula = new NovaNebula(host);
-        if (nebula.available) {
-          window.__novaNebula = nebula;
-          nebula.start();
-
+        if (nebula) {
           // Convert the orb's HSV-style hue (0..1) + glow to an RGB hex
           // each frame, the same hsv2rgb the orb's own fragment shader
           // uses (ported to JS here, not read back from the GPU), and
-          // hand it to the nebula so the glow behind the orb tracks
-          // what the orb is actually doing without either module having
-          // to import the other.
+          // hand it to the nebula so the glow behind the orb tracks what
+          // the orb is actually doing without either module having to
+          // import the other.
           const hsv2hex = (h, s, v) => {
             h = h % 1;
             const i = Math.floor(h * 6);
@@ -394,8 +407,6 @@
             nebula.setOrbColor(hsv2hex(c.hue, 0.85, Math.min(1, 0.5 + c.glow * 0.5)), c.glow);
           };
           requestAnimationFrame(syncNebula);
-        } else {
-          nebula.dispose();
         }
       } else {
         o.dispose();   // leaves the 2D canvas orb in place
