@@ -326,6 +326,77 @@ class OllamaProvider:
             log.warning("[OLLAMA] stream error: %s", e)
             raise
 
+    def stream_complete(
+        self,
+        messages: List[Dict[str, Any]],
+        system: str = "",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+    ) -> Iterator[tuple]:
+        """Stream text as it arrives, then a final ("done", GenerateResult).
+
+        Without this, IntelligenceRouter.stream_complete() falls back to
+        this provider's plain complete() -- the whole reply generated
+        before anything is handed back -- because it only checks for
+        stream_complete specifically, not the plain-text stream() this
+        class already had. That made offline voice wait for a complete
+        Ollama response before speaking a single sentence of it, every
+        turn, regardless of how long the reply was.
+
+        Tool calls: Ollama-compatible models that call tools while
+        streaming emit them in the final chunk's message, same shape as
+        complete()'s non-streamed response -- parsed identically here.
+        """
+        t0 = time.time()
+        full_text_parts: List[str] = []
+        tool_calls: List[Dict[str, Any]] = []
+        try:
+            payload = self._build_payload(messages, system, tools, temperature, max_tokens)
+            payload["stream"] = True
+            with requests.post(
+                f"{self._base_url}/api/chat",
+                json=payload,
+                timeout=self._timeout,
+                stream=True,
+            ) as r:
+                r.raise_for_status()
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = chunk.get("message", {})
+                    content = msg.get("content", "")
+                    if content:
+                        full_text_parts.append(content)
+                        yield ("text", content)
+                    for tc in msg.get("tool_calls", []) or []:
+                        func = tc.get("function", {})
+                        name = func.get("name", "")
+                        args = func.get("arguments", {})
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except Exception:
+                                args = {}
+                        if name:
+                            tool_calls.append({"name": name, "args": args})
+                    if chunk.get("done"):
+                        break
+            latency = (time.time() - t0) * 1000
+            self._health.record_success(latency)
+            yield ("done", GenerateResult(
+                text="".join(full_text_parts), tool_calls=tool_calls,
+                provider="ollama", model=self._model, latency_ms=latency,
+            ))
+        except Exception as e:
+            self._health.record_failure(str(e))
+            log.warning("[OLLAMA] stream_complete error: %s", e)
+            raise
+
     def get_model_info(self) -> dict:
         return {
             "provider": "ollama",

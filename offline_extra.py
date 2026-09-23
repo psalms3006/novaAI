@@ -1035,16 +1035,105 @@ def _get_offline_response_v2(
     
     return None
 
+
+#: Splits a growing text buffer into complete sentences plus a trailing
+#: partial one. Not full NLP sentence segmentation -- good enough for
+#: "speak what is clearly finished, hold back what might still be
+#: growing", which is all pipelining TTS actually needs.
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _get_offline_response_streaming(
+    messages: List[Dict[str, Any]],
+    use_tools: bool,
+    speak_fn,
+) -> Optional[Dict[str, Any]]:
+    """Like _get_offline_response_v2, but speaks each sentence via speak_fn
+    as it streams in rather than after the whole reply is generated --
+    Ollama replies of any real length used to mean dead air for the whole
+    generation time before a word was spoken.
+
+    Router-only: the legacy Gemini-REST/direct-Ollama cascade
+    _get_offline_response_v2 falls back to has no streaming path, and
+    duplicating it in a streaming-aware form is not worth the risk for a
+    fallback of a fallback. Returns None (never partially speaks and then
+    fails) when the router is unavailable or the call errors before any
+    text arrives, so the caller can fall back to the ordinary, complete,
+    non-streaming path with nothing already said.
+    """
+    try:
+        import nova
+        router = getattr(nova, "_nova_router", None)
+        if not router:
+            return None
+
+        buf = ""
+        parts_spoken: List[str] = []
+        result = None
+        for kind, payload in router.stream_complete(
+            messages=messages,
+            system=NOVA_OFFLINE_PROMPT,
+            tools=TOOL_DECLARATIONS if use_tools else None,
+        ):
+            if kind == "text":
+                buf += payload
+                pieces = _SENTENCE_END_RE.split(buf)
+                for sentence in pieces[:-1]:
+                    sentence = sentence.strip()
+                    if sentence:
+                        speak_fn(sentence, block=False)
+                        parts_spoken.append(sentence)
+                buf = pieces[-1]
+            else:
+                result = payload
+
+        if result is None or result.error or not result.ok:
+            # Nothing usable came back. Anything already spoken from buf
+            # was still real generated text, not garbage, so it is left
+            # said rather than retracted -- but the caller must not treat
+            # this as a normal reply (no tool_calls to act on, no clean
+            # final text), so still return None like the router-unavailable
+            # case.
+            if buf.strip():
+                speak_fn(buf.strip(), block=False)
+                parts_spoken.append(buf.strip())
+            if not parts_spoken:
+                return None
+
+        elif buf.strip():
+            speak_fn(buf.strip(), block=False)
+            parts_spoken.append(buf.strip())
+
+        full_text = " ".join(parts_spoken).strip() or (result.text if result else "")
+        return {
+            "text": full_text,
+            "tool_calls": result.tool_calls if result else [],
+            "already_spoken": True,
+        }
+    except Exception as e:
+        log.debug("streaming router call failed, falling back: %s", e)
+        return None
+
+
 # ─── OFFLINE THINKING — FIXED AGENT HIJACKING ───────────────────────────────
 
-def think_offline_v2(user_message: str, meta: dict) -> str:
+def think_offline_v2(user_message: str, meta: dict, speak_fn=None) -> str:
     """
     v2: Fixed offline thinking.
     - Agent only handles specific dev tasks, not everything
     - Proper tool execution with offline fallbacks
     - Memory integration
+
+    speak_fn: when given (matches speak_offline's signature), the reply is
+    spoken sentence-by-sentence as it streams from the model instead of
+    waiting for the whole thing -- this function then takes over
+    responsibility for speaking entirely, and the caller must not also
+    call speak_fn on the returned text, or it says the reply twice. When
+    None (the default, used by every caller that only wants text back --
+    desk/chat.py, server_extra.py), nothing is spoken and behaviour is
+    unchanged from before this parameter existed.
     """
-    
+
     # [FIX] Agent only for specific patterns, not hijacking
     dev_patterns = [
         "write code", "create file", "edit file", "fix bug", 
@@ -1074,12 +1163,25 @@ def think_offline_v2(user_message: str, meta: dict) -> str:
     sys_content += "\n\nOFFLINE CAPABILITIES: You have access to offline Wikipedia (ZIM) and offline maps. Use them when relevant."
     
     messages = [{"role": "system", "content": sys_content}] + _nova.conversation_history
-    
+
+    def _get_response(msgs, use_tools_flag: bool):
+        """Streams and speaks as it goes when speak_fn is set and the
+        router supports it; otherwise the ordinary, complete, unspoken
+        response -- see _get_offline_response_streaming's own docstring
+        for why streaming is router-only."""
+        if speak_fn is not None:
+            streamed = _get_offline_response_streaming(msgs, use_tools_flag, speak_fn)
+            if streamed is not None:
+                return streamed
+        return _get_offline_response_v2(msgs, use_tools=use_tools_flag)
+
     # Get LLM response
-    result = _get_offline_response_v2(messages, use_tools=True)
-    
+    result = _get_response(messages, True)
+
     if result is None:
         err = "All brain engines offline. Check your connection or start Ollama."
+        if speak_fn is not None:
+            speak_fn(err)
         _nova.conversation_history.append({"role": "assistant", "content": err})
         _trim_history()
         return err
@@ -1121,15 +1223,25 @@ def think_offline_v2(user_message: str, meta: dict) -> str:
         ]
         
         # Get final response after tool execution
-        final = _get_offline_response_v2(followup, use_tools=False)
-        text = final["text"].strip() if final and final["text"].strip() else "Done."
-        
+        final = _get_response(followup, False)
+        had_real_text = bool(final and final.get("text", "").strip())
+        text = final["text"].strip() if had_real_text else "Done."
+        # already_spoken only covers text that was actually streamed --
+        # the "Done." fallback is synthesized right here, after the fact,
+        # for a reply that came back empty, so it was never said by
+        # either path and always needs speaking explicitly.
+        if speak_fn is not None and not (had_real_text and final.get("already_spoken")):
+            speak_fn(text)
+
         _nova.conversation_history.append({"role": "assistant", "content": text})
         _trim_history()
         return text
-    
+
     # No tool calls, just text
-    text = result["text"].strip() or "I couldn't generate a response."
+    had_real_text = bool(result.get("text", "").strip())
+    text = result["text"].strip() if had_real_text else "I couldn't generate a response."
+    if speak_fn is not None and not (had_real_text and result.get("already_spoken")):
+        speak_fn(text)
     _nova.conversation_history.append({"role": "assistant", "content": text})
     _trim_history()
     return text
@@ -1332,8 +1444,12 @@ def run_offline_loop_v2(meta: dict) -> None:
             break
         
         # Main thinking
-        reply = think_offline_v2(user_input, meta)
-        speak_offline(reply)
+        # think_offline_v2 now speaks the reply itself, streaming
+        # sentence-by-sentence via speak_offline as the model generates it
+        # rather than only after the whole reply is ready -- calling
+        # speak_offline(reply) again here on the same text would say it
+        # twice.
+        reply = think_offline_v2(user_input, meta, speak_fn=speak_offline)
         
         # [living memory] feed finished turn
         _living_turn = getattr(_nova, "_living_turn", None)
