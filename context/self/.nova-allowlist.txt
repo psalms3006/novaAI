@@ -1,0 +1,5 @@
+# References the self-knowledge drift checker (nova_self_knowledge/drift.py)
+# should ignore, one substring per line. A reference is skipped if any line
+# here appears as a substring of it. Use for future-tense promises, examples
+# borrowed from a third-party doc, or deliberately approximate wording --
+# not as a way to silence a real, currently-broken reference.

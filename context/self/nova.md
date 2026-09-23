@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (108):
+Commits in the last 14 days (109):
 
+- 157ad8f 2026-09-23 Give NOVA a living self-knowledge doc, grounded in the code that exists
 - 1d22b61 2026-09-23 Feed the orb's dormant spectrum shader real audio, add a visual test harness
 - b0a2fef 2026-09-23 Actually start the STT model, and stop NOVA answering her own questions
 - f0258f6 2026-09-23 Stop giving up on Gemini mid-retry, and stop NOVA hearing herself
@@ -154,8 +155,7 @@ Commits in the last 14 days (108):
 - a16d814 2026-09-20 Stop a volume check killing NOVA a moment later
 - 47b370d 2026-09-20 Ask permission on the typed path too, not only by voice
 - ee7744a 2026-09-20 Keep NOVA's runtime state out of the repository
-- 014dea0 2026-09-19 Keep two people's memories apart
-- ...and 68 more
+- ...and 69 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

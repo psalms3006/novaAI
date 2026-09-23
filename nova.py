@@ -869,6 +869,23 @@ Your goal is not simply to answer questions.
 Your goal is to become an intelligent operating system that helps people think better, work better, and live better while remaining truthful, dependable, and respectful of the user's control.
 """
 
+# Grounded in what the codebase actually contains right now (sub-agents,
+# integrations), not restated from memory -- see nova_self_knowledge/.
+# Computed once at import time, not per-turn: sub-agents and integrations
+# do not change mid-process under normal operation, and recomputing this
+# on every single turn would cost an AST parse of several files for no
+# benefit over doing it once at startup. If a future capability can
+# actually change mid-session (a newly-installed Ollama model, say), that
+# is a reason to move this call, not a reason it needed to exist per-turn
+# from day one.
+try:
+    from nova_self_knowledge.generate import slim_summary as _self_knowledge_summary
+    NOVA_CORE = NOVA_CORE + "\n\n## Self-Knowledge\n\n" + _self_knowledge_summary()
+except Exception as _sk_error:
+    # Never let a broken self-knowledge import take the whole prompt --
+    # and therefore NOVA's ability to start a turn at all -- down with it.
+    pass
+
 NOVA_ONLINE_DELTA = ""
 
 NOVA_OFFLINE_DELTA = ""

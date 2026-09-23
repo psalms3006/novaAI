@@ -41,6 +41,64 @@ def rendered_doc(doc_path: Path = DOC_PATH) -> str:
     return render(blocks, overrides, line_ending=detect_line_ending(original))
 
 
+def slim_summary() -> str:
+    """~200-400 token grounding block for every turn's system prompt.
+
+    Not identity or principles -- NOVA_CORE already covers those
+    exhaustively, and restating them here would just be the same prose
+    twice. What NOVA_CORE cannot cover, because it is static text that
+    does not change when the registries do, is *which* sub-agents and
+    integrations actually exist right now. Tool names are deliberately
+    left out: they already reach the model as real function-calling
+    schemas (TOOL_DECLARATIONS passed to the API), which is a stronger
+    grounding than prose repeating the same names could ever be -- listing
+    them again here would be redundant, not additional safety.
+
+    Falls back to a short, honest "unavailable" note rather than raising:
+    a broken self-knowledge summary must never be the reason NOVA fails
+    to start a turn.
+    """
+    try:
+        agents_md = GENERATORS["subagents"]()
+        integrations_md = GENERATORS["integrations"]()
+    except Exception as e:
+        return (f"[Self-knowledge summary unavailable this turn: {e}. "
+                f"Do not guess at sub-agents or integrations; say you are "
+                f"not sure rather than inventing one.]")
+
+    def _names_from_table(md: str, col: int) -> list[str]:
+        names = []
+        for line in md.splitlines():
+            if not line.startswith("|") or line.startswith("| ---"):
+                continue
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if len(cells) > col and cells[col] not in ("Agent", "Integration"):
+                names.append(cells[col].strip("`"))
+        return names
+
+    agent_names = _names_from_table(agents_md, 0)
+    integration_rows = [
+        line for line in integrations_md.splitlines()
+        if line.startswith("|") and not line.startswith("| ---")
+        and "Integration" not in line
+    ]
+    configured = [
+        row.split("|")[1].strip() for row in integration_rows
+        if "configured" in row.lower() and "not installed" not in row.lower()
+    ]
+
+    return (
+        "Self-knowledge (generated from the current codebase, not "
+        "memorised -- trust this over any prior assumption about your "
+        "own capabilities):\n"
+        f"- Sub-agents that actually exist: {', '.join(agent_names) or 'none'}.\n"
+        f"- Integrations currently configured: {', '.join(configured) or 'none'}.\n"
+        "- Your callable tools are provided to you directly as function "
+        "declarations -- consult those, not this summary, for what you "
+        "can invoke."
+    )
+
+
 def cmd_render() -> int:
     sys.stdout.write(rendered_doc())
     return 0
