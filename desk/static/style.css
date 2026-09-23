@@ -216,6 +216,14 @@ input, textarea, select { font-family: inherit; }
 }
 #orb-canvas:hover { transform: scale(1.05); }
 
+/* The orb (orb3d.js) has no position rule of its own (static), and
+   nebula.js's background canvas is absolutely positioned to fill the
+   same container. Without an explicit stacking order, CSS paints
+   positioned elements above static ones regardless of DOM order -- the
+   background would sit on TOP of the orb. */
+#orb-canvas-3d { position: relative; z-index: 1; }
+#nebula-canvas { z-index: 0; }
+
 .orb-label {
   margin-top: 12px;
   font-size: 12px; color: var(--muted);

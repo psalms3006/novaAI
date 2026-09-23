@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (110):
+Commits in the last 14 days (111):
 
+- b56fd02 2026-09-23 Speak offline replies as they generate, not after the whole thing is done
 - fc807ad 2026-09-23 Wire the self-knowledge summary into NOVA's actual system prompt
 - 157ad8f 2026-09-23 Give NOVA a living self-knowledge doc, grounded in the code that exists
 - 1d22b61 2026-09-23 Feed the orb's dormant spectrum shader real audio, add a visual test harness
@@ -154,8 +155,7 @@ Commits in the last 14 days (110):
 - eaa00b7 2026-09-20 Ask before a web page types on your keyboard
 - fd50203 2026-09-20 Refuse an application name that carries shell syntax
 - a16d814 2026-09-20 Stop a volume check killing NOVA a moment later
-- 47b370d 2026-09-20 Ask permission on the typed path too, not only by voice
-- ...and 70 more
+- ...and 71 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns
