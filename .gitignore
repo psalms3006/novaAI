@@ -107,6 +107,20 @@ memory_meta.json
 memory_texts.json
 data/nova_audit.ndjson
 data/trust_preferences.json
+# The audit log is written to the repo root, not data/, despite the
+# ignore rule above naming data/nova_audit.ndjson -- a real path
+# mismatch, out of scope to chase down here, but both locations need to
+# be ignored or every PyInstaller build reports a dirty tree over a
+# runtime log, not a source change.
+/nova_audit.ndjson
+/workflows.json
+
+# =========================
+# Claude Code session state (this tool's own working directories, not
+# NOVA source)
+# =========================
+.claude/
+.claude-flow/
 
 # =========================
 # Temporary / Backup

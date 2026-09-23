@@ -152,6 +152,46 @@ def test_the_notice_is_sent_as_a_completed_turn():
     assert "turn_complete=False" not in body
 
 
+def test_a_failed_send_does_not_stop_the_text_sender_from_accepting_more():
+    """_text_sender used to `break` out of its own loop on any exception
+    from send_client_content. The queue (_input_text_queue) kept accepting
+    new text from send_text() regardless -- it only pushes onto the queue
+    -- but nothing was left running to ever consume it, so every message
+    typed after the first failure silently vanished for the rest of the
+    session. One bad send must cost that one message, not every message
+    after it."""
+    import asyncio
+
+    m = ls.LiveManager.__new__(ls.LiveManager)
+    m._input_text_queue = asyncio.Queue()
+    m._mic_active = True
+
+    sent = []
+    attempts = {"n": 0}
+
+    class _FlakySession:
+        async def send_client_content(self, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise RuntimeError("transient send failure")
+            sent.append(kwargs["turns"]["parts"][0]["text"])
+
+    async def scenario():
+        session_obj = _FlakySession()
+        task = asyncio.ensure_future(m._text_sender(session_obj))
+        await m._input_text_queue.put("first message (will fail)")
+        await m._input_text_queue.put("second message (must still send)")
+        await asyncio.sleep(0.05)
+        await m._input_text_queue.put(None)  # ask the loop to stop cleanly
+        await asyncio.wait_for(task, timeout=2.0)
+
+    asyncio.run(scenario())
+
+    assert sent == ["second message (must still send)"], (
+        "the text sender stopped consuming the queue after one failure"
+    )
+
+
 def test_the_notice_does_not_ask_her_a_question():
     """It is still a stage direction. Being a turn means she may answer it,
     so the wording has to give her as little as possible to answer."""

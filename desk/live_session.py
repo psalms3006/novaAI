@@ -3128,6 +3128,8 @@ class LiveManager:
                 text = await self._input_text_queue.get()
                 if text is None:
                     break
+                _log("[LIVE] sending typed text (%d chars); mic_active=%s",
+                     len(text), self._mic_active)
                 await session.send_client_content(
                     turns={"role": "user", "parts": [{"text": text}]},
                     turn_complete=True,
@@ -3135,8 +3137,16 @@ class LiveManager:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                _log("[LIVE] text send error: %s", e)
-                break
+                # A failed send used to kill this whole loop -- the queue
+                # kept accepting new text from send_text() (it only pushes
+                # onto _input_text_queue), but nothing was left running to
+                # ever consume it, so every message typed after the first
+                # failure silently vanished for the rest of the session.
+                # One bad send is a reason to log and keep listening for
+                # the next one, not a reason to stop being able to type at
+                # all.
+                _log("[LIVE] text send error (will keep accepting more): %s", e)
+                continue
 
 
 # ── module singleton ──────────────────────────────────────────────────────────
