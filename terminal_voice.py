@@ -224,6 +224,21 @@ class TerminalVoice:
                         print("[NOVA] ⚠️  No speaker — you will not hear her.")
                 elif state == "speaking":
                     self._offline_since = 0.0
+                elif state == "connecting":
+                    # LiveManager publishes this before every retry, backoff
+                    # included -- it is still actively trying, not stalled.
+                    # READY_TIMEOUT_S exists for a connection that is truly
+                    # stuck with no sign of life, not for the ordinary case
+                    # of one retry: on 2026-09-22 attempt 1 took ~28s to fail
+                    # with a plain abnormal closure, backoff pushed attempt 2
+                    # past the 45s mark measured from attempt 1, and this
+                    # pump gave up and declared "offline" while LiveManager's
+                    # own retry loop -- which has its own, better-reasoned
+                    # give-up budget -- was still legitimately working and the
+                    # network was confirmed healthy the entire time. Treating
+                    # a fixed deadline from the *first* attempt as the budget
+                    # for however many retries it takes was the bug.
+                    deadline = time.monotonic() + READY_TIMEOUT_S
                 elif state == "offline":
                     if not self._offline_since:
                         self._offline_since = time.monotonic()

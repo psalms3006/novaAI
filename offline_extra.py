@@ -133,6 +133,31 @@ _tts_thread.start()
 # of NOVA_VOICE_FULL_DUPLEX: offline has no interruption button, so the
 # mute-only "simple" policy would mean no barge-in is possible at all -- the
 # "wait until she finishes" behaviour real barge-in exists to avoid.
+#
+# First real-hardware run (2026-09-22) produced continuous false "speech
+# detected", TTS chopped into fragments, and audio not reaching the user's
+# headset at all -- diagnosed (from code, not from that run's log: the
+# per-chunk diagnostics below did not exist yet, and print()-only messages
+# never reached nova.log) to two causes:
+#
+# 1. Device selection. Neither the mic feed nor TTS playback named a device,
+#    so both used whatever Windows called "default" -- which is not
+#    necessarily the headset. desk/live_session.py already solves this
+#    (mic_device/speaker_device settings, WASAPI auto_convert for the sample
+#    rate mismatch a shared-mode device enforces) for the cloud path; offline
+#    ignored all of it and could easily have ended up playing through one
+#    device while "listening" on another with tight acoustic coupling to it
+#    -- which would explain both symptoms as one cause, not two.
+# 2. Mic timing. The mic ran on a blocking stream.read() loop on a plain
+#    Python thread, subject to GIL/thread-wake jitter, instead of a
+#    PortAudio-scheduled callback. VoiceGate's echo alignment assumes frames
+#    arrive on a steady cadence; desk/live_session.py's own microphone has
+#    always used a callback for exactly this reason.
+#
+# Both are fixed below by reusing desk.live_session's own device resolution
+# and callback pattern instead of a second, looser implementation of the
+# same thing. This is NOT verified against real hardware -- see the
+# diagnostics added alongside it.
 
 #: Mic rate barge-in listens at. Matches listen_offline()'s own `fs`.
 _BARGE_IN_MIC_RATE = 16000
@@ -140,6 +165,7 @@ _BARGE_IN_MIC_RATE = 16000
 _offline_gate_lock = threading.Lock()
 _offline_gate = None
 _offline_barge_event = threading.Event()
+_offline_devices_logged = threading.Event()
 
 
 def _on_offline_barge_in() -> None:
@@ -158,6 +184,73 @@ def _get_offline_gate():
         return _offline_gate
 
 
+def _offline_input_device():
+    """The same configured mic (mic_device setting / NOVA_MIC_DEVICE) the
+    cloud path resolves to, or None for the system default. Resolved fresh
+    each call, matching desk.live_session's own reasoning: a cached index
+    is the stale one when the device just changed."""
+    try:
+        from desk.live_session import _mic_device_resolved, _wasapi_settings
+        dev = _mic_device_resolved()
+        return dev, _wasapi_settings(dev)
+    except Exception as e:
+        log.debug("[OFFLINE AUDIO] could not resolve configured mic device: %s", e)
+        return None, None
+
+
+def _offline_output_device():
+    """The same configured speaker (speaker_device / NOVA_SPEAKER_DEVICE)
+    the cloud path resolves to, with WASAPI auto_convert -- without it, a
+    shared-mode device that does not natively run at the TTS sample rate
+    raises "Invalid sample rate" instead of resampling. See
+    desk.live_session._wasapi_settings for the measurements."""
+    try:
+        from desk.live_session import _speaker_device, _wasapi_settings
+        dev = _speaker_device()
+        return dev, _wasapi_settings(dev)
+    except Exception as e:
+        log.debug("[OFFLINE AUDIO] could not resolve configured speaker device: %s", e)
+        return None, None
+
+
+def _offline_device_label(device, output: bool) -> str:
+    try:
+        from desk.live_session import _device_label
+        return _device_label(device, output)
+    except Exception:
+        return "system default" if device is None else str(device)
+
+
+def _open_offline_mic_stream(gate):
+    """Open the barge-in mic on a real PortAudio callback, not a blocking
+    read loop -- see the module-level note on why that matters. Returns the
+    started stream, or None if it could not be opened (barge-in is then
+    simply unavailable for this utterance; TTS still plays)."""
+    device, extra = _offline_input_device()
+
+    def _cb(indata, frames, time_info, status) -> None:
+        try:
+            gate.process(np.asarray(indata).reshape(-1))
+        except Exception:
+            pass
+
+    try:
+        stream = sd.InputStream(
+            samplerate=_BARGE_IN_MIC_RATE, channels=1, dtype="int16",
+            blocksize=1024, callback=_cb, device=device, extra_settings=extra,
+        )
+        stream.start()
+        if not _offline_devices_logged.is_set():
+            log.info("[OFFLINE AUDIO] barge-in mic: %s",
+                     _offline_device_label(device, False))
+        return stream
+    except Exception as e:
+        log.warning("[OFFLINE AUDIO] barge-in mic open failed (%s): %s -- "
+                    "TTS will still play, without interruption support",
+                    _offline_device_label(device, False), e)
+        return None
+
+
 def _play_pcm_with_barge_in(audio_i16: np.ndarray, samplerate: int) -> bool:
     """Play mono int16 *audio_i16*, stoppable by a real voice interruption.
 
@@ -169,27 +262,19 @@ def _play_pcm_with_barge_in(audio_i16: np.ndarray, samplerate: int) -> bool:
     _offline_barge_event.clear()
     gate.set_speaking(True)
 
-    mic_stop = threading.Event()
-
-    def _mic_feed() -> None:
-        try:
-            with sd.InputStream(samplerate=_BARGE_IN_MIC_RATE, channels=1,
-                                dtype="int16", blocksize=1024) as stream:
-                while not mic_stop.is_set():
-                    frame, _ = stream.read(1024)
-                    gate.process(np.asarray(frame).reshape(-1))
-        except Exception as e:
-            log.debug("offline barge-in mic feed stopped: %s", e)
-
-    mic_thread = threading.Thread(target=_mic_feed, daemon=True,
-                                  name="nova-offline-bargein-mic")
-    mic_thread.start()
+    mic_stream = _open_offline_mic_stream(gate)
 
     interrupted = False
     chunk = 1024
+    chunks_written = 0
+    out_device, out_extra = _offline_output_device()
     try:
-        with sd.OutputStream(samplerate=samplerate, channels=1,
-                             dtype="int16") as out:
+        with sd.OutputStream(samplerate=samplerate, channels=1, dtype="int16",
+                             device=out_device, extra_settings=out_extra) as out:
+            if not _offline_devices_logged.is_set():
+                log.info("[OFFLINE AUDIO] TTS output: %s (%d Hz)",
+                         _offline_device_label(out_device, True), samplerate)
+                _offline_devices_logged.set()
             for i in range(0, len(audio_i16), chunk):
                 block = audio_i16[i:i + chunk]
                 # Fed at the moment it is written, not at enqueue time -- the
@@ -197,14 +282,30 @@ def _play_pcm_with_barge_in(audio_i16: np.ndarray, samplerate: int) -> bool:
                 # it. See the identical comment in desk/live_session.py.
                 gate.reference(block.tobytes(), rate=samplerate)
                 out.write(block.reshape(-1, 1))
+                chunks_written += 1
                 if _offline_barge_event.is_set():
                     interrupted = True
                     break
+    except Exception as e:
+        # Logged with the device/rate that failed, then re-raised: the
+        # caller (_speak_pyttsx3/_speak_piper) must see this as a failure
+        # and fall through to the next TTS engine, not report success on an
+        # output stream that never actually opened.
+        log.error("[OFFLINE AUDIO] TTS output stream failed (%s, %d Hz): %s",
+                  _offline_device_label(out_device, True), samplerate, e)
+        raise
     finally:
-        mic_stop.set()
-        mic_thread.join(timeout=1.0)
+        if mic_stream is not None:
+            try:
+                mic_stream.stop()
+                mic_stream.close()
+            except Exception:
+                pass
         gate.set_speaking(False, interrupted=interrupted)
 
+    total_chunks = max(1, -(-len(audio_i16) // chunk))
+    log.debug("[OFFLINE AUDIO] played %d/%d chunk(s), interrupted=%s",
+             chunks_written, total_chunks, interrupted)
     if interrupted:
         print("   … stopped (barge-in)", flush=True)
     return interrupted
@@ -232,6 +333,57 @@ def _speak_offline_impl(text: str) -> None:
             log.warning("TTS failed — text only.")
 
 
+#: NOVA's voice identity. Gemini Live uses "Aoede" -- a female voice -- and
+#: that is now part of who NOVA sounds like; a local fallback should not
+#: turn her into what reads as a different, male assistant just because the
+#: network disappeared. Centralized here rather than picked ad hoc per
+#: engine.
+NOVA_VOICE_GENDER = "female"
+
+#: Name substrings that mark a voice as female when the engine/driver does
+#: not expose a gender attribute pyttsx3 can read.
+_FEMALE_NAME_HINTS = ("zira", "female", "eva", "susan", "hazel", "aria",
+                     "jenny", "samantha")
+
+_offline_voice_logged = threading.Event()
+
+
+def _select_pyttsx3_voice(voices):
+    """Best available English voice matching NOVA_VOICE_GENDER, and its
+    name for diagnostics.
+
+    Not "the first voice whose name contains 'english'": on a machine with
+    Microsoft David (male) enumerated before Zira (female), that always
+    picked David -- which is exactly why offline NOVA sounded like a
+    different, male assistant from the cloud one.
+    """
+    english = []
+    for v in voices:
+        name = getattr(v, "name", None)
+        vid = getattr(v, "id", None)
+        if not isinstance(name, str) or not isinstance(vid, str):
+            continue
+        langs = getattr(v, "languages", None) or []
+        is_english = ("english" in name.lower()
+                     or any("en" in str(lang).lower() for lang in langs))
+        if is_english:
+            gender = str(getattr(v, "gender", "") or "").lower()
+            english.append((vid, name, gender))
+
+    if not english:
+        return None, ""
+
+    def _matches_target_gender(entry) -> bool:
+        _vid, name, gender = entry
+        if gender:
+            return NOVA_VOICE_GENDER in gender
+        return any(hint in name.lower() for hint in _FEMALE_NAME_HINTS)
+
+    matched = [e for e in english if _matches_target_gender(e)]
+    chosen_id, chosen_name, _ = (matched or english)[0]
+    return chosen_id, chosen_name
+
+
 def _speak_pyttsx3(text: str) -> bool:
     if pyttsx3 is None:
         return False
@@ -244,12 +396,13 @@ def _speak_pyttsx3(text: str) -> bool:
             voices = []
         elif not isinstance(voices, (list, tuple, set)):
             voices = [voices]
-        for v in voices:
-            name = getattr(v, "name", None)
-            vid = getattr(v, "id", None)
-            if isinstance(name, str) and isinstance(vid, str) and "english" in name.lower():
-                engine.setProperty("voice", vid)
-                break
+        vid, vname = _select_pyttsx3_voice(voices)
+        if vid:
+            engine.setProperty("voice", vid)
+        if not _offline_voice_logged.is_set():
+            log.info("[OFFLINE VOICE] pyttsx3: %s",
+                     vname or "engine default (no matching voice found)")
+            _offline_voice_logged.set()
 
         # Rendered to a file rather than played via engine.say()+
         # runAndWait(), so playback goes through the same barge-in-aware
@@ -302,48 +455,90 @@ def _speak_piper(text: str) -> bool:
 
 # ─── OFFLINE STT — UNIFIED MIC LOOP (same as online) ─────────────────────────
 
-def listen_offline() -> str:
+#: Seconds to let a room's echo of NOVA's own TTS decay before trusting raw
+#: volume-threshold VAD again. listen_offline() opens a brand new mic stream
+#: independent of the barge-in gate above (VoiceGate's own SPEAK_COOLDOWN_S
+#: only governs *its* stream, not this one), so without an explicit pause
+#: here the tail of NOVA's last sentence -- still audible for a moment after
+#: playback stops, especially on a device without real acoustic isolation
+#: from the speaker -- can register as the user talking.
+LISTEN_SETTLE_S = 0.4
+
+#: Fraction of recorded chunks that must be "loud" for a capture to count as
+#: real speech rather than scattered noise transients. min_speech_r alone
+#: only requires the *count* to accumulate somewhere in the recording, with
+#: no requirement that it be continuous -- occasional spikes spread across a
+#: long, mostly-silent recording would satisfy it.
+MIN_SPEECH_DENSITY = 0.35
+
+
+def listen_offline():
     """
     Offline listening with proper state management.
     Uses the same calibrated threshold approach as online mode.
+
+    Returns:
+        the transcript, if NOVA understood something;
+        "" if a real utterance was captured but STT produced no usable
+            text (the only case that should prompt "I didn't catch that");
+        None for everything else -- true silence, a busy state, a mic
+            failure, or the STT subsystem not being ready. None of those
+            are the user having said something NOVA failed to hear, and
+            speaking as though they were is what turned "the room is quiet"
+            into a loop of "I didn't catch that" answered by more silence.
     """
     global _offline_state
-    
+
     if get_offline_state() == OfflineState.SPEAKING:
         # Don't listen while speaking
-        return ""
-    
+        return None
+
+    if LISTEN_SETTLE_S:
+        time.sleep(LISTEN_SETTLE_S)
+
     set_offline_state(OfflineState.LISTENING)
-    
+
     fs = 16000
     chunk_size = 1024
     threshold = _nova.AMBIENT_THRESHOLD or DEFAULT_THRESHOLD
     silence_limit = 1.8
     min_speech = 0.6
     max_record = 12.0
-    
+
     max_silent = int((fs / chunk_size) * silence_limit)
     min_speech_r = int((fs / chunk_size) * min_speech)
     max_total = int((fs / chunk_size) * max_record)
-    
+
     print(f"\n🎙️  LISTENING... (threshold: {threshold:.4f})")
-    
+    device, extra = _offline_input_device()
+    log.debug("[OFFLINE AUDIO] mic: %s, threshold=%.4f",
+             _offline_device_label(device, False), threshold)
+
     recorded = []
     silent = 0
     speech = 0
+    total_chunks = 0
+    first_speech_i = -1
+    last_speech_i = -1
     is_recording = False
-    
+
     try:
-        with sd.InputStream(samplerate=fs, channels=1, dtype="float32", blocksize=chunk_size) as stream:
+        with sd.InputStream(samplerate=fs, channels=1, dtype="float32",
+                            blocksize=chunk_size, device=device,
+                            extra_settings=extra) as stream:
             while True:
                 chunk, _ = stream.read(chunk_size)
                 vol = float(np.sqrt(np.mean(chunk ** 2)))
-                
+                total_chunks += 1
+
                 # State visualization
                 if vol > threshold:
                     if not is_recording:
                         is_recording = True
                         print("🟢 SPEECH DETECTED")
+                    if first_speech_i < 0:
+                        first_speech_i = total_chunks
+                    last_speech_i = total_chunks
                     speech += 1
                     silent = 0
                     recorded.append(chunk.copy())
@@ -356,7 +551,7 @@ def listen_offline() -> str:
                         recorded.append(chunk.copy())
                         if len(recorded) > int((fs / chunk_size) * 0.5):  # Keep 0.5s buffer
                             recorded.pop(0)
-                
+
                 # Check end conditions
                 if silent >= max_silent and speech >= min_speech_r:
                     print("🔇 Silence detected, processing...")
@@ -364,21 +559,43 @@ def listen_offline() -> str:
                 if len(recorded) >= max_total and is_recording:
                     print("⏱️ Max recording time reached")
                     break
-                    
+
     except Exception as e:
         print(f"❌ Mic error: {e}")
+        log.warning("[OFFLINE AUDIO] mic error (%s): %s",
+                    _offline_device_label(device, False), e)
         set_offline_state(OfflineState.IDLE)
-        return ""
-    
+        return None
+
+    # Density over the *span* containing the detected speech, not the whole
+    # recording -- every recording ends with ~1.8s of mandatory silence
+    # (that's how the loop knows speech ended), which would otherwise dilute
+    # even a real, continuous utterance's ratio toward zero as it goes on.
+    span = (last_speech_i - first_speech_i + 1) if first_speech_i >= 0 else 0
+    density = (speech / span) if span else 0.0
+    log.debug("[OFFLINE AUDIO] capture: chunks=%d speech_chunks=%d "
+             "span=%d density=%.2f duration=%.2fs", total_chunks, speech,
+             span, density, total_chunks * chunk_size / fs)
+
     if speech < min_speech_r:
         print("🔇 No speech detected.")
         set_offline_state(OfflineState.IDLE)
-        return ""
-    
+        return None
+
+    if density < MIN_SPEECH_DENSITY:
+        # Loud chunks accumulated, but scattered thinly across the span they
+        # occupy rather than one continuous burst -- noise, not an utterance.
+        print("🔇 Noise, not speech (too sparse).")
+        log.info("[OFFLINE AUDIO] discarded capture: density=%.2f below "
+                 "%.2f (scattered noise, not continuous speech)",
+                 density, MIN_SPEECH_DENSITY)
+        set_offline_state(OfflineState.IDLE)
+        return None
+
     # Process audio
     audio = np.concatenate(recorded, axis=0)
     audio_i16 = (audio * 32767).astype(np.int16)
-    
+
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
         # `wav_write` is the scipy.io.wavfile *module* (see the import at the
@@ -388,17 +605,21 @@ def listen_offline() -> str:
         # that raise was outside the try/except below, so it killed the
         # whole offline loop uncaught.
         wav_write.write(tmp_path, fs, audio_i16)
-    
+
     print("🔍 Transcribing with faster-whisper...")
     set_offline_state(OfflineState.THINKING)
-    
+
     try:
         if not _stt_loaded.wait(timeout=10):
             print("⚠️  Whisper not loaded yet — skipping.")
-            return ""
+            log.warning("[OFFLINE AUDIO] STT subsystem not ready "
+                        "(model still loading) -- not the user's silence")
+            return None
         with _stt_model_lock:
             if _nova._stt_model is None:
-                return ""
+                log.warning("[OFFLINE AUDIO] STT model unavailable -- "
+                            "not the user's silence")
+                return None
             segments, _ = _nova._stt_model.transcribe(
                 tmp_path,
                 language="en",
@@ -408,10 +629,12 @@ def listen_offline() -> str:
             )
             transcript = " ".join([seg.text.strip() for seg in segments]).strip()
             print(f"📝 Heard: {transcript}")
+            log.debug("[OFFLINE AUDIO] STT result: %d chars", len(transcript))
             return transcript
     except Exception as e:
         print(f"⚠️  Transcription error: {e}")
-        return ""
+        log.warning("[OFFLINE AUDIO] transcription error: %s", e)
+        return None
     finally:
         try:
             os.remove(tmp_path)
@@ -952,12 +1175,13 @@ def run_offline_loop_v2(meta: dict) -> None:
         speak_offline(f"Welcome back, {user_name}." if meta.get("user_name") else f"Hello, {user_name}.")
     
     # Main loop
+    _consecutive_misses = 0
     while True:
         # Check state
         if get_offline_state() == OfflineState.SPEAKING:
             time.sleep(0.1)
             continue
-        
+
         # Get input
         set_offline_state(OfflineState.LISTENING)
         user_input = (
@@ -966,7 +1190,7 @@ def run_offline_loop_v2(meta: dict) -> None:
             else input("You: ") if TEXT_MODE
             else ""
         )
-        
+
         # Network recovery check
         _recover_fn = _nova_get("check_network_recovery")
         if callable(_recover_fn) and _recover_fn(
@@ -975,13 +1199,39 @@ def run_offline_loop_v2(meta: dict) -> None:
             GEMINI_API_KEY or "", FORCE_OFFLINE
         ):
             return
-        
-        if not user_input:
-            if not TEXT_MODE:
-                speak_offline("I didn't catch that.")
+
+        if user_input is None:
+            # Nothing to react to: silence, a mic hiccup, or the STT
+            # subsystem not being ready (listen_offline() logs which, via
+            # log.* rather than print(), so it actually reaches nova.log).
+            # None of those are the user having said something NOVA failed
+            # to hear -- speaking as though they were is what turned "the
+            # room is quiet" into a loop of "I didn't catch that" answered
+            # by more silence, which itself can register as more "speech".
             time.sleep(0.5)  # prevent CPU-pinning busy-loop on repeated mic/input failure
             continue
-        
+
+        if user_input == "":
+            # A real utterance was captured and STT genuinely produced
+            # nothing usable -- the one case "I didn't catch that" belongs
+            # to. Not on every consecutive occurrence, though: a genuinely
+            # broken STT path must not become the same loop with extra
+            # steps, which is exactly what unconditionally repeating it did.
+            _consecutive_misses += 1
+            if not TEXT_MODE:
+                if _consecutive_misses <= 2:
+                    speak_offline("I didn't catch that.")
+                elif _consecutive_misses == 3:
+                    speak_offline("I'm having trouble understanding you -- "
+                                  "you can type instead if that's easier.")
+                else:
+                    log.info("[OFFLINE] %d consecutive unintelligible "
+                             "captures -- no longer repeating "
+                             "\"I didn't catch that\"", _consecutive_misses)
+            time.sleep(0.5)
+            continue
+
+        _consecutive_misses = 0
         print(f"👤 You: {user_input}")
         set_offline_state(OfflineState.PROCESSING)
         

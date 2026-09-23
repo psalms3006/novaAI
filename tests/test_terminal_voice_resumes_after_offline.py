@@ -94,3 +94,62 @@ def test_run_restarts_the_session_on_each_call():
     _run_once(tv)
 
     assert mgr.started == 2
+
+
+# ── the ready-timeout must not fire on a legitimate retry ──────────────────
+#
+# From nova.log, 2026-09-22: connect_start at 19:44:41.440, attempt 1 failed
+# (plain 1006 abnormal closure) at 19:45:11.003 -- ~28s just for one attempt
+# to fail -- backoff, then attempt 2 started at 19:45:13.017. _pump()'s
+# READY_TIMEOUT_S=45s deadline was set once at connect_start and never
+# reset, so it elapsed while attempt 2 was still legitimately in flight, and
+# _pump() gave up and returned "offline" -- while [CONNECTIVITY] logged
+# state=online continuously for the next several minutes. LiveManager
+# publishes state="connecting" before every retry; _pump() read it and did
+# nothing with it.
+
+def test_a_legitimate_retry_does_not_burn_the_ready_timeout(monkeypatch):
+    import terminal_voice as tvmod
+
+    monkeypatch.setattr(tvmod, "READY_TIMEOUT_S", 0.3)
+    mgr = FakeManager()
+    tv = TerminalVoice()
+    tv._mgr = mgr
+    tv._read_typed = lambda: None
+
+    async def scenario():
+        task = asyncio.ensure_future(tv.run())
+        # Attempt 1 "fails" partway through the original deadline...
+        await asyncio.sleep(0.2)
+        # ...and a retry starts. Without the fix this is read and ignored;
+        # with it, the deadline is pushed out from here.
+        _push(mgr, "state", state="connecting", retry_in_s=0.1)
+        # Total elapsed since connect_start is about to cross the original
+        # 0.3s deadline, but only ~0.2s has passed since the retry started.
+        await asyncio.sleep(0.2)
+        _push(mgr, "state", state="ready")
+        await asyncio.sleep(0.05)
+        tv._stop.set()
+        return await task
+
+    status = asyncio.run(scenario())
+    assert status != "offline", (
+        "a legitimate retry burned the ready-timeout budget instead of "
+        "resetting it, so a session that was still actively connecting "
+        "was declared offline"
+    )
+
+
+def test_a_connection_with_no_sign_of_life_still_gives_up(monkeypatch):
+    """The timeout is a real safety net for a connection that is truly
+    stuck -- silence with no "connecting" events at all must still time
+    out, or a genuinely dead session would hang forever."""
+    import terminal_voice as tvmod
+
+    monkeypatch.setattr(tvmod, "READY_TIMEOUT_S", 0.15)
+    mgr = FakeManager()
+    tv = TerminalVoice()
+    tv._mgr = mgr
+    tv._read_typed = lambda: None
+
+    assert _run_once(tv) == "offline"
