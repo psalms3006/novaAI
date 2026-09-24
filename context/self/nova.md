@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (111):
+Commits in the last 14 days (112):
 
+- 90b390c 2026-09-24 Stop room noise from cutting NOVA off mid-sentence
 - 5892f11 2026-09-24 Let NOVA talk while she works, and let the user talk over her
 - 8d7ed20 2026-09-24 Make a stalled voice session actually reconnect, and keep tools off its path
 - 7a73928 2026-09-24 Keep the window attached to the voice session, and let Gmail sign-in finish
@@ -154,8 +155,7 @@ Commits in the last 14 days (111):
 - 5bad8bc 2026-09-20 Show background work, and show being interrupted
 - de59eaf 2026-09-20 Tell NOVA she is allowed to go away and work on something
 - 549eff8 2026-09-20 Let the orb show that it can hear you
-- 40a725b 2026-09-20 Stop pointing at Gemini models that no longer exist
-- ...and 71 more
+- ...and 72 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

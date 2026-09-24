@@ -234,6 +234,127 @@ QUIET_HOLDOVER_S = 1.2
 #: trusted as the no-echo barge-in baseline.
 ROOM_FRAMES_TO_TRUST = 16
 
+# ── speech detection ─────────────────────────────────────────────────────────
+#
+# Loudness cannot tell a voice from a key press, and NOVA was deciding both
+# "the user is talking over her" and "this is worth sending to the model" on
+# loudness alone: she stopped mid-sentence on a chair creak, and the room's
+# noise went up to Gemini, whose own detector then answered it. A speech
+# model can tell: measured here, Silero scored 0% of frames as speech for
+# room noise, keyboard clicks, a door slam and mains hum, and 68% for speech
+# (the rest are the gaps between words), at 0.4 ms per 64 ms frame.
+
+#: Probability at or above which a frame counts as speech.
+VOICE_PROB = 0.5
+#: Stricter bar for the frames that may interrupt her.
+BARGE_IN_VOICE_PROB = 0.6
+#: Keep treating it as speech this long after the last voiced frame, so the
+#: pauses between words and the tail of a sentence are not cut.
+VOICE_HANGOVER_S = 0.6
+#: With a speech model: interrupt her once this many of the last
+#: VOICE_BARGE_IN_WINDOW frames were the user's voice (~0.4 s of speech within
+#: ~0.64 s). Windowed rather than consecutive, because real speech has gaps.
+VOICE_BARGE_IN_WINDOW = 10
+VOICE_BARGE_IN_NEEDED = 6
+#: With a speech model the room margin can be gentler: the model already
+#: rules out noise, and a soft-spoken user should still be able to stop her.
+NOISE_MARGIN_WITH_VOICE = 1.5
+#: A sound this far above the room -- a crash, a slam, a scream. Flagged as an
+#: event, never sent to the model and never an interruption: on this laptop's
+#: mic, desk bangs and typing alone reach it many times a minute, and telling
+#: a *concerning* sound from those needs a sound-classification model.
+LOUD_EVENT_FACTOR = 6.0
+LOUD_EVENT_MIN_RMS = 9000.0
+LOUD_EVENT_HOLD_S = 0.6
+
+
+def _find_vad_model() -> Optional[str]:
+    """Silero VAD, as shipped inside faster-whisper (and bundled with NOVA)."""
+    import importlib.util
+    import os
+    import sys
+    name = "silero_vad_v6.onnx"
+    candidates = []
+    env = os.getenv("NOVA_VAD_MODEL", "").strip()
+    if env:
+        candidates.append(env)
+    try:
+        spec = importlib.util.find_spec("faster_whisper")
+        for loc in (spec.submodule_search_locations or []) if spec else []:
+            candidates.append(os.path.join(loc, "assets", name))
+    except Exception:
+        pass
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        candidates.append(os.path.join(base, "faster_whisper", "assets", name))
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+class SpeechDetector:
+    """Streaming speech probability for 16 kHz int16 frames (Silero VAD).
+
+    If the model cannot be loaded, or fails while running, ``available``
+    becomes False and callers fall back to their loudness rules -- a broken
+    detector must never leave NOVA deaf, which is what scoring everything as
+    "not speech" would do.
+    """
+
+    CHUNK = 512
+    CONTEXT = 64
+
+    def __init__(self, path: Optional[str] = None) -> None:
+        self._session = None
+        self.available = False
+        self.path = path or _find_vad_model()
+        if not self.path:
+            return
+        try:
+            import onnxruntime as ort
+            opts = ort.SessionOptions()
+            opts.inter_op_num_threads = 1
+            opts.intra_op_num_threads = 1
+            opts.log_severity_level = 4
+            self._session = ort.InferenceSession(
+                self.path, providers=["CPUExecutionProvider"], sess_options=opts)
+            self.available = True
+        except Exception:
+            self._session = None
+        self.reset()
+
+    def reset(self) -> None:
+        self._h = np.zeros((1, 1, 128), dtype=np.float32)
+        self._c = np.zeros((1, 1, 128), dtype=np.float32)
+        self._ctx = np.zeros(self.CONTEXT, dtype=np.float32)
+        self._pending = np.zeros(0, dtype=np.float32)
+        self._last = 0.0
+
+    def probability(self, frame: np.ndarray) -> float:
+        """Highest speech probability in this frame (0 when unavailable)."""
+        if not self.available:
+            return 0.0
+        x = np.concatenate([self._pending,
+                            np.asarray(frame, dtype=np.float32).reshape(-1) / 32768.0])
+        best = None
+        try:
+            while len(x) >= self.CHUNK:
+                chunk, x = x[:self.CHUNK], x[self.CHUNK:]
+                inp = np.concatenate([self._ctx, chunk])[None, :]
+                out, self._h, self._c = self._session.run(
+                    None, {"input": inp, "h": self._h, "c": self._c})
+                self._ctx = chunk[-self.CONTEXT:]
+                p = float(np.asarray(out).reshape(-1)[0])
+                best = p if best is None else max(best, p)
+        except Exception:
+            self.available = False
+            return 0.0
+        self._pending = x
+        if best is not None:
+            self._last = best
+        return self._last
+
 
 def frame_rms(frame: np.ndarray) -> float:
     """RMS amplitude of an int16 frame."""
@@ -625,7 +746,18 @@ class VoiceGate:
         cooldown_s: float = SPEAK_COOLDOWN_S,
         rate: int = SEND_RATE,
         simple: Optional[bool] = None,
+        speech_detector: Optional["SpeechDetector"] = None,
     ):
+        #: Tells a voice from other sound. None keeps the loudness rules.
+        self._detector = speech_detector
+        #: Speech probability of the latest frame, and whether the user is
+        #: speaking (with hangover) or something extremely loud just happened.
+        self.last_speech_prob = 0.0
+        self.last_is_voice = False
+        self.last_is_loud_event = False
+        self._last_voice_at = 0.0
+        self._last_loud_event_at = 0.0
+        self._voice_window: list[bool] = []
         #: Half-duplex, with none of the per-frame analysis. See
         #: :func:`simple_voice_default` for why this is the default.
         self.simple = simple_voice_default() if simple is None else bool(simple)
@@ -742,6 +874,7 @@ class VoiceGate:
             if not value:
                 self._last_speak_end = 0.0 if interrupted else time.time()
                 self._speech_runs = 0
+                self._voice_window.clear()
                 self._residual_floor = 0.0
                 self._speaking_frames = 0
                 self._residual_history.clear()
@@ -749,6 +882,7 @@ class VoiceGate:
                 self._last_loud_ref_at = 0.0
             else:
                 self._speech_runs = 0
+                self._voice_window.clear()
                 self._turn_room_floor = (self._room_floor
                                          if self._room_frames >= ROOM_FRAMES_TO_TRUST
                                          else 0.0)
@@ -803,6 +937,7 @@ class VoiceGate:
         written from the microphone callback and meant to be read there.
         """
         self._note_room(frame)
+        self._note_voice(frame)
         if self.simple:
             return self._process_simple(frame)
         with self._lock:
@@ -861,6 +996,29 @@ class VoiceGate:
         self.frames_sent += 1
         self.last_was_silence = False
         return frame.tobytes()
+
+    @property
+    def hears_speech(self) -> bool:
+        """Is a working speech model deciding what counts as the user?"""
+        return self._detector is not None and self._detector.available
+
+    def _note_voice(self, frame: np.ndarray) -> None:
+        """Is this the user's voice, or a sound loud enough to matter?"""
+        now = time.time()
+        level = frame_rms(frame)
+        if level > max(self._room_floor * LOUD_EVENT_FACTOR, LOUD_EVENT_MIN_RMS):
+            self._last_loud_event_at = now
+        self.last_is_loud_event = (self._last_loud_event_at > 0.0 and
+                                   now - self._last_loud_event_at < LOUD_EVENT_HOLD_S)
+        if not self.hears_speech:
+            self.last_speech_prob = 0.0
+            self.last_is_voice = False
+            return
+        self.last_speech_prob = self._detector.probability(frame)
+        if self.last_speech_prob >= VOICE_PROB:
+            self._last_voice_at = now
+        self.last_is_voice = (self._last_voice_at > 0.0 and
+                              now - self._last_voice_at < VOICE_HANGOVER_S)
 
     def _note_room(self, frame: np.ndarray) -> None:
         """Record whether this frame sounds like an empty room.
@@ -985,7 +1143,17 @@ class VoiceGate:
             # No echo path. The leak ratio is meaningless — it compares the
             # microphone against a playback level that never reaches it — so
             # judge the honest way: louder than this room has been.
-            speech = loud and smoothed > noise * NOISE_MARGIN
+            margin = NOISE_MARGIN_WITH_VOICE if self.hears_speech else NOISE_MARGIN
+            speech = loud and smoothed > noise * margin
+        # Whatever the energy says, only a voice may interrupt her. A key, a
+        # chair or a door is loud and is not the user.
+        voiced = (not self.hears_speech
+                  or self.last_speech_prob >= BARGE_IN_VOICE_PROB)
+        speech = speech and voiced
+        if self.hears_speech and not suppressed and not has_echo:
+            with self._lock:
+                self._voice_window.append(bool(speech))
+                del self._voice_window[:-VOICE_BARGE_IN_WINDOW]
 
         if not speech:
             self.echo.accept()
@@ -1015,11 +1183,18 @@ class VoiceGate:
 
         with self._lock:
             self._speech_runs += 1
-            needed = (self._barge_in_chunks if self.last_echo_path
-                      else max(self._barge_in_chunks, NO_ECHO_BARGE_IN_CHUNKS))
-            triggered = self._speech_runs >= needed
+            if self.hears_speech and not self.last_echo_path:
+                # Speech has gaps between words, so count voiced frames in a
+                # window rather than demanding an unbroken run of them.
+                needed = VOICE_BARGE_IN_NEEDED
+                triggered = sum(self._voice_window) >= needed
+            else:
+                needed = (self._barge_in_chunks if self.last_echo_path
+                          else max(self._barge_in_chunks, NO_ECHO_BARGE_IN_CHUNKS))
+                triggered = self._speech_runs >= needed
             if triggered:
                 self._speech_runs = 0
+                self._voice_window.clear()
                 self.last_trigger = {
                     # The deciding number. Playback loud here means the sound
                     # that stopped NOVA was most likely NOVA; playback silent
@@ -1035,6 +1210,7 @@ class VoiceGate:
                     "echo_corr": round(self.echo.last_corr, 3),
                     "frames_speaking": frames,
                     "frames_required": needed,
+                    "voice_prob": round(self.last_speech_prob, 2),
                 }
         return triggered
 

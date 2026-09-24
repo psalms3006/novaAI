@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import os
 import queue
 import threading
@@ -363,6 +364,42 @@ def _relax_websocket_keepalive(client: Any) -> bool:
         _log("[LIVE] could not widen WebSocket keepalive (%s); using the "
              "library default, so a long network stall may drop the session", e)
         return False
+
+
+class UplinkFilter:
+    """Only the user's voice goes to the model.
+
+    Everything the mic heard used to be streamed while NOVA was quiet: the
+    room itself (as periodic keep-alives) and anything louder than it at full
+    rate. Gemini's own detector then took a key press or a chair for speech
+    and answered it -- "she picks up on the slightest sound". Now a frame
+    that is not voice is sent as true silence, which also lets the model
+    hear the end of the user's turn cleanly.
+
+    The speech model decides a frame *after* hearing it, so the first
+    syllable would be lost. The last few raw frames are therefore held back
+    and sent ahead of the first voiced one.
+    """
+
+    def __init__(self, preroll_frames: int = 5) -> None:
+        self._ring: collections.deque = collections.deque(maxlen=preroll_frames)
+
+    def push(self, raw: bytes, gated: bytes, send_real: bool) -> list:
+        """Returns [(payload, is_silence), ...] to hand to the batcher.
+
+        ``raw`` is what the microphone heard, ``gated`` what the gate would
+        send (silence while NOVA speaks), ``send_real`` whether this frame is
+        the user's voice.
+        """
+        if not send_real:
+            self._ring.append(raw)
+            return [(bytes(len(gated)), True)]
+        out = [(r, False) for r in self._ring] + [(gated, False)]
+        self._ring.clear()
+        return out
+
+    def reset(self) -> None:
+        self._ring.clear()
 
 
 class MicBatcher:
@@ -1109,7 +1146,12 @@ class LiveManager:
         self._gate = nova_voice.VoiceGate(
             chunk_samples=MIC_BLOCK, on_barge_in=self._barge_in,
             simple=not _voice_barge_in_enabled(),
+            speech_detector=nova_voice.SpeechDetector(),
         )
+        #: Decides what reaches the model while NOVA is quiet: the user's
+        #: voice (with a little pre-roll), else true silence. See UplinkFilter.
+        self._uplink = UplinkFilter()
+        self._loud_reported = False
         # NOVA Core owns playback. The UI surfaces receive amplitude/state and
         # only visualise it, so the fullscreen window and the ambient orb can
         # never play the same audio twice.
@@ -1865,8 +1907,11 @@ class LiveManager:
         self._play_generation += 1        # discard anything held in the pre-roll
         dropped = nova_voice.drain(self._play_q)
         discarded_ms = self._abort_playback()
+        trig = self._gate.last_trigger or {}
         _log("[LIVE] barge-in — dropped %d queued chunks, %d ms already in "
-             "the sound device", dropped, discarded_ms)
+             "the sound device; voice %.2f, level %s vs room %s, echo path %s",
+             dropped, discarded_ms, trig.get("voice_prob", -1.0),
+             trig.get("smoothed"), trig.get("noise_floor"), trig.get("echo_path"))
         self._publish(LiveEvent("playback_cancelled", queued_chunks=dropped,
                                 device_ms=discarded_ms))
         # Every interruption says what it was measured on.
@@ -2001,6 +2046,7 @@ class LiveManager:
 
         batcher = self._batcher
         batcher.reset()
+        self._uplink.reset()
 
         def _handle(samples):
             # Every rule about what reaches the model lives in nova_voice:
@@ -2023,28 +2069,52 @@ class LiveManager:
                 if self._watchdog.take_stall():
                     self._on_stall()
 
-                level = self._gate.last_level
+                gate = self._gate
+                level = gate.last_level
+                # "Hearing" means a voice when there is a speech model to say
+                # so -- the orb lighting up for a key press is the same
+                # mistake as NOVA answering one.
+                hearing = (gate.last_is_voice if gate.hears_speech
+                           else not gate.last_was_quiet)
                 if self._mic_level_throttle.should_send(level):
                     self._publish(LiveEvent(
                         "mic_level",
                         level=round(level, 4),
-                        hearing=not self._gate.last_was_quiet,
+                        hearing=hearing,
                     ))
-                # Two kinds of nothing: the gate muting NOVA's own voice, and
-                # a room with no one talking in it. Both are zeroes as far as
-                # the model is concerned, and neither is worth 32 KB/s of a
-                # connection the user's next sentence has to fit through.
-                payload = batcher.add(
-                    frame,
-                    self._gate.last_was_silence or self._gate.last_was_quiet)
+                if gate.hears_speech:
+                    # Only a voice reaches the model; everything else is true
+                    # silence. While NOVA speaks the gate has already muted
+                    # the frame, and the raw audio is kept as pre-roll for a
+                    # barge-in.
+                    #
+                    # Extremely loud sounds are *not* sent: measured on this
+                    # laptop's mic, desk bangs and typing hit 10,000-26,000
+                    # RMS nineteen times in thirteen seconds -- forwarding
+                    # them is the "reacts to every sound" fault again. They
+                    # are reported as an event instead.
+                    send_real = not gate.last_was_silence and gate.last_is_voice
+                    pieces = self._uplink.push(samples.tobytes(), frame, send_real)
+                    if gate.last_is_loud_event and not self._loud_reported:
+                        self._loud_reported = True
+                        self._publish(LiveEvent("loud_sound", level=round(level, 4)))
+                    elif not gate.last_is_loud_event:
+                        self._loud_reported = False
+                else:
+                    # Two kinds of nothing: the gate muting NOVA's own voice,
+                    # and a room with no one talking in it. Both are zeroes as
+                    # far as the model is concerned.
+                    pieces = [(frame, gate.last_was_silence or gate.last_was_quiet)]
+                payloads = [p for p in (batcher.add(b, s) for b, s in pieces)
+                            if p is not None]
             except Exception:
                 return
-            if payload is None:
+            if not payloads:
                 return                      # still gathering, or throttled
             if loop is None or q is None or loop.is_closed():
                 return
 
-            def _post():
+            def _post(payload):
                 try:
                     q.put_nowait(payload)
                 except asyncio.QueueFull:
@@ -2073,7 +2143,8 @@ class LiveManager:
                         pass
 
             try:
-                loop.call_soon_threadsafe(_post)
+                for payload in payloads:
+                    loop.call_soon_threadsafe(_post, payload)
             except RuntimeError:
                 pass            # loop shutting down
 
@@ -2148,8 +2219,10 @@ class LiveManager:
             _log("[LIVE] mic opened (%s, 16 kHz mono, %d-frame blocks, "
                  "%.1fs queue, %s)", _device_label(opened, False), MIC_BLOCK,
                  MIC_QUEUE_FRAMES * MIC_BLOCK / MIC_RATE,
-                 "half-duplex: no voice barge-in" if self._gate.simple
-                 else "voice barge-in on")
+                 ("half-duplex: no voice barge-in" if self._gate.simple
+                  else "voice barge-in on")
+                 + (", speech detector on" if self._gate.hears_speech
+                    else ", speech detector UNAVAILABLE: reacting to loudness"))
         except Exception as e:
             # Same reasoning as above: a device that is missing, busy or
             # blocked by Windows privacy settings must surface, not vanish
@@ -2891,6 +2964,10 @@ class LiveManager:
                             self._publish(LiveEvent("nova_transcript", text=text))
 
                     if sc.interrupted:
+                        # Logged separately from a local barge-in: this is
+                        # Gemini deciding it heard the user, and an unexplained
+                        # half-sentence is one of the two.
+                        _log("[LIVE] the model reports its turn was interrupted")
                         # The model has acknowledged the cut and stopped
                         # generating. Anything of the old turn still queued is now
                         # stale, so drop it rather than playing a fragment of an

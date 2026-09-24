@@ -167,3 +167,11 @@ def test_the_bundle_records_which_commit_it_came_from():
         f"this bundle was built from a dirty tree, so it corresponds to no "
         f"commit. Uncommitted at build time: {stamp.get('dirty_files')}"
     )
+
+
+def test_the_bundle_carries_the_speech_detector_model():
+    """Without it the packaged voice gate reacts to loudness, not speech:
+    NOVA stops mid-sentence on a key press and answers room noise."""
+    model = INTERNAL / "faster_whisper" / "assets" / "silero_vad_v6.onnx"
+    assert model.is_file(), "the speech model is missing from the bundle"
+    assert model.stat().st_size > 100_000

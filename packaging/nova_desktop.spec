@@ -79,6 +79,20 @@ def _gmail_discovery():
     return []
 
 
+def _silero_vad():
+    """The speech detector's model. Required: without it the packaged voice
+    gate reacts to loudness instead of speech, so a missing file fails the
+    build rather than shipping that."""
+    import importlib.util
+    spec = importlib.util.find_spec("faster_whisper")
+    for loc in (spec.submodule_search_locations or []) if spec else []:
+        f = os.path.join(loc, "assets", "silero_vad_v6.onnx")
+        if os.path.isfile(f):
+            return [(f, "faster_whisper/assets")]
+    raise SystemExit("silero_vad_v6.onnx not found: install faster-whisper "
+                     "before building, or NOVA ships reacting to noise")
+
+
 _buildinfo = _build_stamp()
 
 # Auto-detect Python shared library
@@ -243,6 +257,9 @@ a = Analysis(
         # own -- see the a.datas filter below, which is what actually keeps
         # the other 579 out.
         *_gmail_discovery(),
+        # The speech detector's model (Silero VAD, ~2 MB, shipped inside
+        # faster-whisper). nova_voice._find_vad_model looks for it here.
+        *_silero_vad(),
         # NOTE: nova_embedder is deliberately NOT bundled. Loading it needs
         # sentence-transformers, which needs torch + transformers — all three
         # are excluded below to keep the installer near 200 MB rather than
