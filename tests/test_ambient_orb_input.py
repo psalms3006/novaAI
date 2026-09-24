@@ -1,0 +1,51 @@
+"""The ambient orb can be dragged out of the way, and clicked to open NOVA.
+
+Reproduced 2026-09-24 with a replica of the ambient window (the real page,
+the app's exact circle clip and window style) driven by the real mouse:
+
+* with the layered colour key the app applied: a drag left the window where
+  it was, a click did nothing, and the page received 0 pointer events;
+* without it: the same drag moved the window 120 px and did not open the
+  dashboard, and a click sent exactly one {"mode": "full"} to /api/ambient.
+
+The key was meant to make the black around the orb transparent. Under
+WebView2 it never did (DirectComposition paints past it); all it did was
+take the orb's input away. That test drives the physical mouse, so it is not
+part of the suite; these pin the structure it showed to matter.
+"""
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SHELL = (ROOT / "nova_desktop_app.py").read_text(encoding="utf-8")
+HUD = (ROOT / "desk" / "static" / "hud.js").read_text(encoding="utf-8")
+
+
+def _code(src: str) -> str:
+    """Source without comments, so an explanation cannot satisfy a test."""
+    return "\n".join(line.split("#", 1)[0] for line in src.splitlines())
+
+
+def test_the_ambient_window_is_not_colour_keyed():
+    code = _code(SHELL)
+    # A call, not a mention: _round_window's docstring explains the key.
+    assert not re.search(r"\.SetLayeredWindowAttributes\(", code), (
+        "a layered colour key on the ambient window blocks every drag and click")
+    assert not re.search(r"LWA_COLORKEY\s*=", code)
+
+
+def test_the_ambient_window_is_draggable_and_round():
+    code = _code(SHELL)
+    amb = code[code.index('"NOVA_AMBIENT"'):]
+    amb = amb[:amb.index("hidden=True")]
+    assert "easy_drag=True" in amb
+    assert "CreateEllipticRgn" in code, "the orb is shaped by a circular clip"
+
+
+def test_a_click_opens_the_full_dashboard_and_a_drag_does_not():
+    handler = HUD[HUD.index('addEventListener("pointerup"'):]
+    handler = handler[:handler.index("});")]
+    assert "if (wasDrag) return" in handler, "a drag would also open the dashboard"
+    assert "/api/ambient" in handler and re.search(r'mode:\s*"full"', handler)

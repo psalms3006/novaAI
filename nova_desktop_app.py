@@ -297,11 +297,11 @@ def main() -> int:
     # by real Win32 window state. Nothing else calls show()/hide() on it, so
     # "main visible => ambient off" cannot drift out of sync.
     #
-    # Transparency: pywebview's transparent=True throws inside
-    # InitCoreWebView2Async on this backend (verified in isolation), so instead
-    # the window is made layered and colour-keyed on pure black after creation.
-    # The page paints the orb additively on #000, and every black pixel is
-    # punched out by the compositor — a genuinely backgroundless orb.
+    # Shape: pywebview's transparent=True throws inside InitCoreWebView2Async
+    # on this backend (verified in isolation), and a layered colour key both
+    # fails to make WebView2 transparent and blocks all mouse input. The
+    # window is clipped to a circle instead (_round_window), so it stays
+    # round, draggable and clickable.
     #
     # desk.win_overlay.AmbientOverlay is NOT used: it creates a layered Win32
     # window with no WM_PAINT handler and never draws anything.
@@ -456,24 +456,14 @@ def main() -> int:
             _log(f"Ambient clip failed: {e}")
             return False
 
-    def _make_transparent(hwnd) -> bool:
-        """Punch the black background out of the ambient window."""
-        try:
-            import ctypes
-            u = ctypes.windll.user32
-            GWL_EXSTYLE, WS_EX_LAYERED, LWA_COLORKEY = -20, 0x00080000, 0x00000001
-            ex = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            u.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED)
-            # COLORREF is 0x00BBGGRR; pure black.
-            ok = u.SetLayeredWindowAttributes(hwnd, 0x000000, 255, LWA_COLORKEY)
-            # Colour-keyed pixels are also click-through: Windows routes
-            # hit-testing past them, so the invisible area around the orb
-            # does not block the app underneath.
-            _log(f"Ambient colour-key applied to hwnd={hwnd}: {bool(ok)}")
-            return bool(ok)
-        except Exception as e:
-            _log(f"Ambient colour-key failed: {e}")
-            return False
+    # No colour key. The ambient window used to be made layered and keyed on
+    # pure black "so only the orb shows". Under WebView2 that never made
+    # anything transparent (DirectComposition paints past it; see
+    # _round_window) -- but it did make the window swallow input: with the
+    # key applied, a real mouse drag left the orb where it was and a click
+    # reached the page not at all (0 pointer events). Without it the same
+    # drag moved it 120 px and the click opened the full dashboard. The
+    # circular clip alone gives the round shape.
 
     def _find_hwnd(title: str):
         try:
@@ -520,7 +510,6 @@ def main() -> int:
         u = ctypes.windll.user32
         main_hwnd = 0
         amb_hwnd = 0
-        keyed = False
         shown = None                       # tri-state so the first decision always applies
         main_was_foreground = False        # see below
         pending = None
@@ -534,8 +523,6 @@ def main() -> int:
                     main_hwnd = _find_hwnd("NOVA")
                 if not amb_hwnd:
                     amb_hwnd = _find_hwnd("NOVA_AMBIENT")
-                    if amb_hwnd and not keyed:
-                        keyed = _make_transparent(amb_hwnd)
                 if not main_hwnd:
                     continue
 
@@ -575,16 +562,14 @@ def main() -> int:
                         _log("Ambient ON (main minimised=%s foreground=%s)" % (minimised, nova_fg))
                         _set_screen_watching(True)
                         ambient_window.show()
-                        # Geometry and the layered style must be re-asserted
+                        # Geometry and the circular clip must be re-asserted
                         # AFTER show(): pywebview re-applies its own window size
-                        # on show, which overrode the 72px bounds and left the
-                        # colour-key stale (the orb came back as a black bar).
+                        # on show, which overrode the small bounds.
                         # Size/position go through pywebview's own API, not
                         # SetWindowPos: the WinForms backend re-lays-out the
                         # Form and silently overrode raw Win32 geometry (the
                         # window kept snapping back to 120x33 and clipped the
-                        # orb). The colour-key still has to be re-asserted on
-                        # the HWND after show().
+                        # orb).
                         try:
                             x, y = _ambient_target_xy()
                             time.sleep(0.12)
@@ -596,7 +581,6 @@ def main() -> int:
                         if amb_hwnd:
                             for _ in range(4):
                                 time.sleep(0.10)
-                                keyed = _make_transparent(amb_hwnd)
                                 _round_window(amb_hwnd, AMBIENT_PX)
                     else:
                         _log("Ambient OFF (main window is visible)")

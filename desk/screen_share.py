@@ -52,15 +52,17 @@ except Exception:
     HAS_PIL = False
 
 
-#: Never send frames faster than this. Two seconds is well inside
-#: conversational reaction time — by the time someone has asked "what is
-#: this?", the frame they are asking about has already been sent — and it caps
-#: the bandwidth cost at something the audio stream can live alongside.
-MIN_INTERVAL_S = 2.0
+#: Never send frames faster than this. One a second is the rate Gemini Live's
+#: realtime video channel is built for, and what "real time" in ambient mode
+#: asks of it. Measured on this 1366x768 display a frame is ~43 kB, so a
+#: constantly changing screen costs ~43 kB/s, an unchanged one nothing -- and
+#: the microphone now sends true silence while nobody speaks, which leaves
+#: the room. Frames still yield to queued speech (see _video_sender).
+MIN_INTERVAL_S = 1.0
 
 #: Send an unchanged screen at least this often anyway, so the model's view
-#: cannot quietly go stale while someone reads a long page.
-MAX_INTERVAL_S = 30.0
+#: is never more than this stale, whatever the change detector decided.
+MAX_INTERVAL_S = 10.0
 
 #: Longest edge of a transmitted frame. Text stays legible to the model well
 #: below native resolution, and every pixel is paid for on the uplink.
@@ -71,9 +73,10 @@ MAX_EDGE_PX = 1024
 JPEG_QUALITY = 55
 
 #: Mean absolute difference, on a 0-255 greyscale thumbnail, above which the
-#: screen counts as changed. Tuned to ignore a blinking cursor or a clock tick
-#: while catching a window switch or a new dialog.
-CHANGE_THRESHOLD = 2.0
+#: screen counts as changed. Low enough to catch typing, a scrolled page or a
+#: new notification, not only a window switch; a blinking cursor or a clock
+#: tick still stays under it on a 64 px thumbnail.
+CHANGE_THRESHOLD = 1.0
 
 #: Thumbnail edge used for that comparison. Small on purpose: this runs on a
 #: timer forever, so it has to be nearly free.

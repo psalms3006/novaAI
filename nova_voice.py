@@ -263,6 +263,10 @@ NOISE_MARGIN_WITH_VOICE = 1.5
 #: event, never sent to the model and never an interruption: on this laptop's
 #: mic, desk bangs and typing alone reach it many times a minute, and telling
 #: a *concerning* sound from those needs a sound-classification model.
+#: Display scale for the user's voice: any voiced frame shows at least the
+#: floor, and a voice this many dB above the room shows at full strength.
+VOICE_DISPLAY_FLOOR = 0.35
+VOICE_DISPLAY_RANGE_DB = 18.0
 LOUD_EVENT_FACTOR = 6.0
 LOUD_EVENT_MIN_RMS = 9000.0
 LOUD_EVENT_HOLD_S = 0.6
@@ -755,6 +759,7 @@ class VoiceGate:
         self.last_speech_prob = 0.0
         self.last_is_voice = False
         self.last_is_loud_event = False
+        self.last_voice_level = 0.0
         self._last_voice_at = 0.0
         self._last_loud_event_at = 0.0
         self._voice_window: list[bool] = []
@@ -1013,12 +1018,24 @@ class VoiceGate:
         if not self.hears_speech:
             self.last_speech_prob = 0.0
             self.last_is_voice = False
+            self.last_voice_level = 0.0
             return
         self.last_speech_prob = self._detector.probability(frame)
         if self.last_speech_prob >= VOICE_PROB:
             self._last_voice_at = now
         self.last_is_voice = (self._last_voice_at > 0.0 and
                               now - self._last_voice_at < VOICE_HANGOVER_S)
+        # For display: the user's voice relative to this room, on a scale the
+        # orb can show. Raw RMS/32768 put normal speech into a laptop mic at
+        # ~0.14, where the orb barely moves; room noise is not shown at all.
+        if self.last_is_voice:
+            room = max(self._room_floor, QUIET_FLOOR_MIN)
+            db = 20.0 * np.log10(max(level, 1.0) / room)
+            self.last_voice_level = float(
+                VOICE_DISPLAY_FLOOR + (1.0 - VOICE_DISPLAY_FLOOR)
+                * min(1.0, max(0.0, db / VOICE_DISPLAY_RANGE_DB)))
+        else:
+            self.last_voice_level = 0.0
 
     def _note_room(self, frame: np.ndarray) -> None:
         """Record whether this frame sounds like an empty room.

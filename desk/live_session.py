@@ -154,10 +154,9 @@ TOOL_TIMEOUT_S = 30.0
 #: slow REST call cannot hold the conversation open.
 VISION_TIMEOUT_S = 12.0
 
-#: Longest a screen frame may go unrefreshed inside one conversational turn.
-#: Within a turn the screen rarely matters more than once; across turns a
-#: fresh frame is sent as soon as one is captured.
-SCREEN_REFRESH_S = 10.0
+#: Shortest gap between two streamed screen frames: one a second, the rate
+#: the realtime video channel is built for.
+SCREEN_STREAM_MIN_S = 1.0
 
 #: Output buffer depth requested from the sound device, in seconds. See
 #: _start_playback for the measurements behind it.
@@ -2070,7 +2069,10 @@ class LiveManager:
                     self._on_stall()
 
                 gate = self._gate
-                level = gate.last_level
+                # The orb shows the user's voice on a visible scale, and room
+                # noise not at all; raw RMS put normal speech at ~0.14.
+                level = (gate.last_voice_level if gate.hears_speech
+                         else gate.last_level)
                 # "Hearing" means a voice when there is a speech model to say
                 # so -- the orb lighting up for a key press is the same
                 # mistake as NOVA answering one.
@@ -2097,7 +2099,8 @@ class LiveManager:
                     pieces = self._uplink.push(samples.tobytes(), frame, send_real)
                     if gate.last_is_loud_event and not self._loud_reported:
                         self._loud_reported = True
-                        self._publish(LiveEvent("loud_sound", level=round(level, 4)))
+                        self._publish(LiveEvent("loud_sound",
+                                                level=round(gate.last_level, 4)))
                     elif not gate.last_is_loud_event:
                         self._loud_reported = False
                 else:
@@ -2488,6 +2491,13 @@ class LiveManager:
             system_instruction=sys_prompt,
             tools=[{"function_declarations": tool_decls}] if tool_decls else [],
             session_resumption=gtypes.SessionResumptionConfig(),
+            # A sliding context window. Without it a Live session that
+            # carries video is capped at a couple of minutes, and an
+            # audio-only one fills its context within the hour; with it the
+            # oldest turns are summarised away and the session runs on.
+            # Accepted by gemini-3.1-flash-live-preview (measured 2026-09-24).
+            context_window_compression=gtypes.ContextWindowCompressionConfig(
+                sliding_window=gtypes.SlidingWindow()),
             speech_config=gtypes.SpeechConfig(
                 voice_config=gtypes.VoiceConfig(
                     prebuilt_voice_config=gtypes.PrebuiltVoiceConfig(
@@ -3353,24 +3363,22 @@ class LiveManager:
         return result
 
     async def _video_sender(self, session: Any) -> None:
-        """Put the screen in front of the model, as conversation context.
+        """Stream the screen to the model on the realtime video channel.
 
-        Not `send_realtime_input(video=...)`. That is the obvious call and it
-        silently does nothing useful — measured directly: capture a frame of
-        this desktop, send it that way, ask "what application is on my
-        screen", and the model answers "I can't see your screen". The same
-        frame sent as `inline_data` inside client content comes back with
-        "a terminal application, likely Windows PowerShell, displaying
-        command-line operations and errors related to a Python project",
-        which is exactly what was on it.
+        Real time, as ambient mode needs: up to one frame a second while the
+        screen is changing. Measured 2026-09-24 against
+        gemini-3.1-flash-live-preview, with frames sent this way and the
+        question asked by voice ("what can you see on my screen right now?")
+        the answer described the desktop correctly. (An older model ignored
+        this channel, which is why frames used to go as client content.)
 
-        `turn_complete=False` matters as much. The frame is *context*, not a
-        question — NOVA should not announce what she can see every two
-        seconds. Left pending, it is folded into whatever the user says next,
-        so "what am I looking at?" is answered from the screen as it was a
-        moment ago.
+        Client content was also the wrong vehicle for a stream: every frame
+        became a permanent piece of the conversation, so frames had to be
+        rationed to one per turn -- up to ten seconds stale -- or the context
+        would fill with pictures of the desktop. Realtime input is a stream,
+        opens no turn (she does not announce what she sees), and the session
+        slides its context window (see context_window_compression).
         """
-        last_sent_turn = -1
         last_sent_at = 0.0
         while True:
             try:
@@ -3379,13 +3387,11 @@ class LiveManager:
                     break
                 jpeg, mime = item
 
-                # One frame per conversational turn is the right granularity:
-                # enough that a question about the screen sees the screen,
-                # few enough that the context does not fill up with pictures
-                # of an unchanged desktop.
+                # At most one frame a second: the rate the realtime video
+                # channel is built for. (ScreenShare already paces capture;
+                # this holds even if something else offers frames.)
                 now = time.monotonic()
-                same_turn = self._turn_count == last_sent_turn
-                if same_turn and (now - last_sent_at) < SCREEN_REFRESH_S:
+                if now - last_sent_at < SCREEN_STREAM_MIN_S:
                     continue
 
                 # Never push a picture through a socket that is already
@@ -3406,12 +3412,8 @@ class LiveManager:
                          backlog)
                     continue
 
-                await session.send_client_content(
-                    turns={"role": "user",
-                           "parts": [{"inline_data": {"mime_type": mime,
-                                                      "data": jpeg}}]},
-                    turn_complete=False)
-                last_sent_turn = self._turn_count
+                await session.send_realtime_input(
+                    video=gtypes.Blob(data=jpeg, mime_type=mime))
                 last_sent_at = now
                 self._publish(LiveEvent("screen_frame", kb=round(len(jpeg) / 1024, 1)))
             except asyncio.CancelledError:

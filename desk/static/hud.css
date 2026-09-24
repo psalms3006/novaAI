@@ -582,12 +582,11 @@ body[data-mode="ambient"] .hud { padding: 0; }
    continuous entity that has stepped aside rather than a second widget. */
 /* ─────────────────────────────────────────────────────────────────────────
    AMBIENT WINDOW
-   A 96px frameless always-on-top window running this same page. The shell
-   makes it layered and colour-keys pure black, so EVERY #000 pixel is punched
-   out by the compositor and only the orb itself is visible — no panel, no
-   card, no rectangle. That means the ambient page must paint nothing but the
-   orb on an exactly-black ground: any non-black chrome would survive the key
-   and show up as a floating box.
+   A small frameless always-on-top window running this same page, clipped to
+   a circle by the shell. (It is no longer colour-keyed: under WebView2 the
+   key never made black transparent, and it stopped the orb receiving any
+   mouse input, so it could be neither dragged nor clicked.) The ambient page
+   must paint nothing but the orb on a black ground inside that circle.
    ───────────────────────────────────────────────────────────────────────── */
 
 body[data-mode="ambient"] {

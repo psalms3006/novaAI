@@ -252,3 +252,31 @@ def test_the_live_microphone_sends_silence_for_noise_and_audio_for_speech(monkey
         m._stop_mic()
         loop.call_soon_threadsafe(loop.stop)
         t.join(timeout=2)
+
+
+# ── the orb shows the user's voice, visibly, and nothing else ────────────────
+# Measured in WebView2 at the ambient orb's real 44 px: at amplitude 1.0 the
+# orb is ~35% brighter with 5x the motion, but the user's level was published
+# as raw RMS/32768 -- normal speech into this laptop mic is ~0.14, where the
+# orb barely moves -- and room noise animated it just the same.
+
+def test_the_users_voice_is_shown_at_a_visible_level():
+    g = _gate()
+    speech = _user_speech(4500)
+    shown = []
+    for f in _frames(speech + _room(len(speech))):
+        g.process(f)
+        if g.last_is_voice:
+            shown.append(g.last_voice_level)
+    # About half the "voice" frames are the pauses inside and after speech,
+    # which sit at room level; the syllables are what must show strongly.
+    assert shown, "speech was never shown"
+    assert np.percentile(shown, 75) >= 0.6, f"syllables shown at {np.percentile(shown, 75):.2f}"
+    assert min(shown) >= nova_voice.VOICE_DISPLAY_FLOOR - 1e-9
+
+
+def test_noise_is_not_shown_on_the_orb():
+    g = _gate()
+    for f in _frames(_room(16000 * 2) + _clicks(16000 * 2) + _bang(16000 * 2, 8000)):
+        g.process(f)
+        assert g.last_voice_level == 0.0

@@ -195,28 +195,39 @@ class SessionIntegrationTests(unittest.TestCase):
         self.assertNotIn("genai.Client", src, "a second Gemini connection "
                                               "just for vision")
 
-    def test_frames_are_delivered_the_way_the_model_actually_reads_them(self):
-        """send_realtime_input(video=...) is accepted and ignored.
+    def test_frames_are_streamed_on_the_realtime_video_channel(self):
+        """Real time, the way the current model reads it.
 
-        Measured against the API: the same frame sent that way produces "I
-        can't see your screen", and sent as inline_data inside client content
-        produces an accurate description of the desktop.
+        An older model ignored send_realtime_input(video=...) ("I can't see
+        your screen"), so frames went as client content -- one per turn, up
+        to ten seconds stale, because each became a permanent part of the
+        conversation. Measured 2026-09-24 on gemini-3.1-flash-live-preview:
+        frames streamed on the video channel, question asked by voice, and
+        the answer described the desktop correctly.
         """
         import inspect
         from desk.live_session import LiveManager
-        # The code, not the docstring — which necessarily names the call that
-        # does not work in order to explain why it is not used.
         body = inspect.getsource(LiveManager._video_sender).split('"""')[-1]
-        self.assertIn("inline_data", body)
-        self.assertNotIn("video=", body)
+        self.assertIn("send_realtime_input(", body)
+        self.assertIn("video=", body)
 
     def test_a_frame_does_not_demand_an_answer(self):
-        """A screen frame is context, not a question. turn_complete=False, or
-        NOVA announces what she can see every couple of seconds."""
+        """A screen frame is context, not a question: realtime input opens no
+        turn, so NOVA does not announce what she can see every second."""
         import inspect
         from desk.live_session import LiveManager
         body = inspect.getsource(LiveManager._video_sender).split('"""')[-1]
-        self.assertIn("turn_complete=False", body)
+        self.assertNotIn("send_client_content", body)
+        self.assertNotIn("turn_complete=True", body)
+
+    def test_a_video_session_can_outlast_the_short_video_cap(self):
+        """Without a sliding context window a Live session carrying video is
+        capped at a couple of minutes."""
+        import inspect
+        from desk.live_session import LiveManager
+        src = inspect.getsource(LiveManager._connect_and_run)
+        self.assertIn("context_window_compression", src)
+        self.assertIn("SlidingWindow", src)
 
     def test_a_stale_frame_is_dropped_rather_than_queued(self):
         from desk.live_session import LiveManager
