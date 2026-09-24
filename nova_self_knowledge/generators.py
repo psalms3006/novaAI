@@ -216,9 +216,11 @@ def generate_voice_loop() -> str:
         "",
         "Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by "
         "both paths. Full-duplex (real voice interruption, not just a "
-        "button) is forced on for offline; for the cloud path it is gated "
-        "behind `NOVA_VOICE_FULL_DUPLEX=1` and off by default -- see "
-        "`nova_voice.simple_voice_default()`.",
+        "button) is forced on for offline; for the desktop voice session "
+        "it is on by default, follows the `barge_in` setting, and runs on "
+        "the `nova-mic-gate` thread rather than the audio callback -- see "
+        "`desk.live_session._voice_barge_in_enabled()`. "
+        "`NOVA_VOICE_FULL_DUPLEX` overrides it either way.",
     ]
     return "\n".join(lines)
 

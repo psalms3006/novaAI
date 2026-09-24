@@ -107,14 +107,15 @@ Two independent voice paths, chosen at startup and switchable mid-session on net
 - **Cloud** (`desk/live_session.py`, class `LiveManager`): Gemini Live over a realtime WebSocket. Owns the microphone via a PortAudio callback stream, plays audio through a buffered output stream (`OUTPUT_LATENCY_S`), and reconnects with backoff on failure rather than giving up after one.
 - **Offline** (`offline_extra.py`, function `run_offline_loop_v2`): faster-whisper for STT, the intelligence router (`nova_intelligence.router`) for the reply -- Ollama-served Qwen, falling back to TinyLlama -- and pyttsx3/Piper for TTS, played through `_play_pcm_with_barge_in` with real voice-interrupt support via `nova_voice.VoiceGate`.
 
-Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-duplex (real voice interruption, not just a button) is forced on for offline; for the cloud path it is gated behind `NOVA_VOICE_FULL_DUPLEX=1` and off by default -- see `nova_voice.simple_voice_default()`.
+Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-duplex (real voice interruption, not just a button) is forced on for offline; for the desktop voice session it is on by default, follows the `barge_in` setting, and runs on the `nova-mic-gate` thread rather than the audio callback -- see `desk.live_session._voice_barge_in_enabled()`. `NOVA_VOICE_FULL_DUPLEX` overrides it either way.
 <!-- AUTO-END: voice_loop -->
 
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (109):
+Commits in the last 14 days (110):
 
+- 8d7ed20 2026-09-24 Make a stalled voice session actually reconnect, and keep tools off its path
 - 7a73928 2026-09-24 Keep the window attached to the voice session, and let Gmail sign-in finish
 - ae03887 2026-09-24 Show real task progress, and remember what research found
 - 25f0ce6 2026-09-23 Make the Concurrent Task Manager actually concurrent
@@ -154,16 +155,16 @@ Commits in the last 14 days (109):
 - 549eff8 2026-09-20 Let the orb show that it can hear you
 - 40a725b 2026-09-20 Stop pointing at Gemini models that no longer exist
 - 1f57253 2026-09-20 Tell the model the step shape the task manager actually reads
-- e520a8d 2026-09-20 Give NOVA something to say on her own initiative, and a reason to stay quiet
-- ...and 69 more
+- ...and 70 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns
 
-- No automated test currently proves the cloud voice path's barge-in
-  (`NOVA_VOICE_FULL_DUPLEX`) is safe to turn on by default — it remains
-  off because of a documented real-hardware microphone-overflow risk,
-  not because it was shown to be fine.
+- Voice barge-in is on by default for the desktop session (2026-09-24).
+  The overflow risk that kept it off is addressed by running the gate on
+  its own thread, and the gate measured 0.03 ms median / 8.7 ms worst per
+  64 ms frame here. Not yet proven on real hardware: whether NOVA's own
+  echo through laptop speakers causes false interruptions.
 - `data/maps/` holds a Wikipedia geography ZIM, not `.mbtiles` tile
   data — offline maps/navigation is not actually available until real
   map tile data is supplied.

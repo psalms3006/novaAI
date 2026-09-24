@@ -507,6 +507,62 @@ class VoiceSupervisor:
             return False
 
 
+#: Tools that are work rather than an action: they take seconds, and nothing
+#: the user asked depends on NOVA going quiet until they finish. Declared
+#: NON_BLOCKING to the live model so she keeps talking while they run; the
+#: result is delivered WHEN_IDLE, so it never cuts her off mid-sentence.
+#: Measured against gemini-3.1-flash-live-preview (2026-09-24): she spoke,
+#: called the tool, and spoke the result once it arrived.
+#:
+#: Everything else stays blocking on purpose -- a quick action, or one that
+#: needs the user's agreement, has an outcome she must not guess at.
+NON_BLOCKING_TOOLS = frozenset({
+    "web_search", "learn_resource", "file_processor", "generate_document",
+    "browser_control",
+})
+
+
+def _interrupt_preference() -> bool:
+    """The user's "interrupt NOVA's speech" preference (on by default)."""
+    try:
+        from desk import settings as desk_settings
+        return bool(desk_settings.get("barge_in", True))
+    except Exception:
+        return True
+
+
+def _voice_barge_in_enabled() -> bool:
+    """Can the user talk over NOVA to interrupt her?
+
+    Yes by default: the echo-cancelling gate is what lets "stop" reach the
+    model while she is speaking. It used to be off everywhere because it ran
+    inside the PortAudio callback, where a loaded CPU dropped microphone
+    blocks; it now runs on its own thread (see _start_mic), and costs 0.03 ms
+    per 64 ms frame. NOVA_VOICE_FULL_DUPLEX overrides the setting either way.
+    """
+    env = os.getenv("NOVA_VOICE_FULL_DUPLEX", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if env in ("0", "false", "no", "off"):
+        return False
+    return _interrupt_preference()
+
+
+def _live_tool_declarations(decls: list) -> list:
+    """The live session's copy of NOVA's tool list, with slow work async.
+
+    A copy: the same declarations serve the text chat, where there is no
+    such thing as talking while a tool runs.
+    """
+    out = []
+    for d in decls or []:
+        d = dict(d)
+        if d.get("name") in NON_BLOCKING_TOOLS:
+            d["behavior"] = "NON_BLOCKING"
+        out.append(d)
+    return out
+
+
 class ReconnectRequested(Exception):
     """Raised inside a session's TaskGroup to replace its connection.
 
@@ -1052,6 +1108,7 @@ class LiveManager:
         # One shared voice policy — identical rules to the terminal path.
         self._gate = nova_voice.VoiceGate(
             chunk_samples=MIC_BLOCK, on_barge_in=self._barge_in,
+            simple=not _voice_barge_in_enabled(),
         )
         # NOVA Core owns playback. The UI surfaces receive amplitude/state and
         # only visualise it, so the fullscreen window and the ambient orb can
@@ -1945,11 +2002,12 @@ class LiveManager:
         batcher = self._batcher
         batcher.reset()
 
-        def _cb(indata, frames, time_info, status):
+        def _handle(samples):
             # Every rule about what reaches the model lives in nova_voice:
             # mute-while-speaking, echo cancellation, barge-in detection.
+            # Runs on the nova-mic-gate thread, never the audio callback.
             try:
-                frame = self._gate.process(np.asarray(indata).reshape(-1))
+                frame = self._gate.process(samples)
                 # The gate has just measured this frame against the room floor
                 # in order to decide what to transmit. Pass the same number to
                 # the surface so the orb can show that someone is talking --
@@ -2019,6 +2077,38 @@ class LiveManager:
             except RuntimeError:
                 pass            # loop shutting down
 
+        # The PortAudio callback only hands the frame over. Echo cancellation,
+        # barge-in, the stall check and batching all run on nova-mic-gate:
+        # inside the callback they had a hard real-time budget, and on a busy
+        # machine blowing it meant Windows dropped microphone blocks -- which
+        # is why voice barge-in had been switched off altogether.
+        raw: queue.Queue = queue.Queue(maxsize=MIC_QUEUE_FRAMES)
+        self._mic_raw = raw
+
+        def _cb(indata, frames, time_info, status):
+            samples = np.array(indata, dtype=np.int16, copy=True).reshape(-1)
+            try:
+                raw.put_nowait(samples)
+            except queue.Full:
+                # Newest wins, as with the send queue: a live conversation.
+                try:
+                    raw.get_nowait()
+                    raw.put_nowait(samples)
+                    self._mic_dropped += 1
+                except Exception:
+                    pass
+
+        def _gate_worker():
+            while True:
+                samples = raw.get()
+                if samples is None:
+                    return
+                _handle(samples)
+
+        self._mic_worker = threading.Thread(
+            target=_gate_worker, name="nova-mic-gate", daemon=True)
+        self._mic_worker.start()
+
         # None is a *device*, not a failure — it means "the system default",
         # and it is the fallback that matters most. An earlier version used it
         # as the "nothing opened" sentinel, so a successful fallback open was
@@ -2056,13 +2146,16 @@ class LiveManager:
             self._mic_active = True
             self._mic_dropped = 0
             _log("[LIVE] mic opened (%s, 16 kHz mono, %d-frame blocks, "
-                 "%.1fs queue)", _device_label(opened, False), MIC_BLOCK,
-                 MIC_QUEUE_FRAMES * MIC_BLOCK / MIC_RATE)
+                 "%.1fs queue, %s)", _device_label(opened, False), MIC_BLOCK,
+                 MIC_QUEUE_FRAMES * MIC_BLOCK / MIC_RATE,
+                 "half-duplex: no voice barge-in" if self._gate.simple
+                 else "voice barge-in on")
         except Exception as e:
             # Same reasoning as above: a device that is missing, busy or
             # blocked by Windows privacy settings must surface, not vanish
             # into a log line nobody reads.
             _log("[LIVE] mic open failed: %s", e)
+            raw.put(None)               # nothing will feed the gate worker
             self._publish(LiveEvent(
                 "error", error="mic_open_failed",
                 message=("NOVA could not open your microphone (%s). Check it "
@@ -2090,6 +2183,16 @@ class LiveManager:
             except Exception:
                 pass
             self._mic_stream = None
+        raw, worker = getattr(self, "_mic_raw", None), getattr(self, "_mic_worker", None)
+        if raw is not None:
+            nova_voice.drain(raw)
+            try:
+                raw.put_nowait(None)
+            except Exception:
+                pass
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=1.0)
+        self._mic_raw = self._mic_worker = None
         if self._mic_queue is not None:
             nova_voice.drain(self._mic_queue)
 
@@ -2276,7 +2379,7 @@ class LiveManager:
             sys_prompt += f"\n\n{identity}"
         if mem_ctx:
             sys_prompt += f"\n\n[BACKGROUND MEMORY]\n{mem_ctx}"
-        tool_decls = _resolve("TOOL_DECLARATIONS", [])
+        tool_decls = _live_tool_declarations(_resolve("TOOL_DECLARATIONS", []))
 
         def _new_client():
             """A client per connection attempt, never a reused one.
@@ -3152,6 +3255,11 @@ class LiveManager:
         self._publish(LiveEvent("tool_result", tool=name,
                                 summary=str(result)[:200]))
         response = result if isinstance(result, dict) else {"output": str(result)}
+        if name in NON_BLOCKING_TOOLS:
+            # She kept talking while this ran; let her finish her sentence.
+            return gtypes.FunctionResponse(
+                id=fc.id, name=name, response=response,
+                scheduling=gtypes.FunctionResponseScheduling.WHEN_IDLE)
         return gtypes.FunctionResponse(id=fc.id, name=name, response=response)
 
     @staticmethod

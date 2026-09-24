@@ -23,6 +23,7 @@ import threading
 import time
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from desk import live_session as ls
@@ -242,3 +243,115 @@ def test_a_cancelled_tool_call_is_not_answered():
 
     asyncio.run(scenario())
     assert s.sent == []
+
+
+# ── slow work runs while she keeps talking ──────────────────────────────────
+# Measured against gemini-3.1-flash-live-preview on 2026-09-24: with a
+# NON_BLOCKING declaration the model spoke, called the tool, and spoke the
+# result once it arrived (scheduling WHEN_IDLE) without cutting itself off.
+
+def test_slow_work_tools_are_declared_non_blocking_to_the_live_model():
+    decls = ls._live_tool_declarations([
+        {"name": "web_search", "description": "d", "parameters": {}},
+        {"name": "open_app", "description": "d", "parameters": {}},
+        {"name": "computer_settings", "description": "d", "parameters": {}},
+    ])
+    by = {d["name"]: d for d in decls}
+    assert by["web_search"].get("behavior") == "NON_BLOCKING"
+    # Quick actions, and anything that needs the user's agreement, still wait
+    # for their outcome -- she must not claim a result she has not got.
+    assert "behavior" not in by["open_app"]
+    assert "behavior" not in by["computer_settings"]
+
+
+def test_the_shared_declarations_are_not_modified():
+    import copy
+    original = [{"name": "web_search", "description": "d", "parameters": {}}]
+    before = copy.deepcopy(original)
+    ls._live_tool_declarations(original)
+    assert original == before, "the text chat's tool list was changed too"
+
+
+def test_a_non_blocking_result_waits_for_her_to_finish_speaking():
+    m = _bare_manager()
+    m._execute_tool = lambda name, args: "found it"
+
+    async def run(name):
+        return await m._run_tool(SimpleNamespace(name=name, id="c", args={}))
+
+    slow = asyncio.run(run("web_search"))
+    quick = asyncio.run(run("open_app"))
+    assert str(slow.scheduling).endswith("WHEN_IDLE")
+    assert quick.scheduling is None
+
+
+# ── talking over her works, and a busy CPU cannot take the mic down ─────────
+# Barge-in had been switched off entirely: the gate ran half-duplex (mic muted
+# while NOVA speaks, no voice interruption) because the echo-cancelling
+# policy ran inside the PortAudio callback and a loaded machine dropped mic
+# blocks. Measured 2026-09-24 on this machine the full gate costs 0.03 ms per
+# 64 ms frame (median), 8.7 ms at worst -- the budget problem was running it
+# on the real-time thread at all, under 100% CPU.
+
+def test_the_desktop_voice_can_be_interrupted_by_voice_by_default(monkeypatch):
+    monkeypatch.delenv("NOVA_VOICE_FULL_DUPLEX", raising=False)
+    monkeypatch.setattr(ls, "_interrupt_preference", lambda: True)
+    assert ls._voice_barge_in_enabled() is True
+    assert ls.LiveManager()._gate.simple is False
+
+
+def test_barge_in_can_still_be_turned_off(monkeypatch):
+    monkeypatch.delenv("NOVA_VOICE_FULL_DUPLEX", raising=False)
+    monkeypatch.setattr(ls, "_interrupt_preference", lambda: False)
+    assert ls._voice_barge_in_enabled() is False
+    monkeypatch.setattr(ls, "_interrupt_preference", lambda: True)
+    monkeypatch.setenv("NOVA_VOICE_FULL_DUPLEX", "0")
+    assert ls._voice_barge_in_enabled() is False
+
+
+class FakeInputStream:
+    last = None
+
+    def __init__(self, callback=None, **kw):
+        self.callback = callback
+        FakeInputStream.last = self
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_the_audio_callback_does_no_processing(monkeypatch):
+    monkeypatch.setattr(ls, "HAS_SD", True)
+    monkeypatch.setattr(ls, "sd", SimpleNamespace(InputStream=FakeInputStream), raising=False)
+    monkeypatch.setattr(ls, "_mic_device_resolved", lambda: None)
+    monkeypatch.setattr(ls, "_mic_device", lambda: None)
+    m = ls.LiveManager()
+    seen = []
+
+    def slow_process(frame):
+        seen.append(threading.current_thread().name)
+        time.sleep(0.2)                 # a CPU-starved moment
+        return frame.tobytes()
+    m._gate.process = slow_process
+
+    loop = asyncio.new_event_loop()
+    try:
+        m._loop = loop
+        m._mic_queue = asyncio.Queue(maxsize=ls.MIC_QUEUE_FRAMES)
+        m._start_mic()
+        frame = np.zeros((ls.MIC_BLOCK, 1), dtype=np.int16)
+        t0 = time.monotonic()
+        FakeInputStream.last.callback(frame, ls.MIC_BLOCK, None, None)
+        assert time.monotonic() - t0 < 0.05, "the real-time callback did the work"
+        assert _wait(lambda: bool(seen), timeout=3)
+        assert seen[0] != threading.current_thread().name
+        assert "mic" in seen[0]
+    finally:
+        m._stop_mic()
+        loop.close()
