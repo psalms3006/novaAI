@@ -57,6 +57,9 @@ def session():
     m._vision_busy_at = 0.0
     m._published = []
     m._publish = lambda ev: m._published.append(ev)
+    m._watchdog = ls.ResponseWatchdog()
+    m._tool_tasks = set()
+    m._cancelled_tool_ids = set()
     return m
 
 

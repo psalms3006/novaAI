@@ -507,6 +507,24 @@ class VoiceSupervisor:
             return False
 
 
+class ReconnectRequested(Exception):
+    """Raised inside a session's TaskGroup to replace its connection.
+
+    Raising is the only thing that ends a TaskGroup early: a task that simply
+    returns cancels none of its siblings. The stall watchdog used to "drop the
+    connection" by ending the mic sender, which left the receiver waiting on
+    the dead socket for minutes while the user's speech piled up unsent.
+    """
+
+
+def _is_requested_reconnect(e: BaseException) -> bool:
+    if isinstance(e, ReconnectRequested):
+        return True
+    if isinstance(e, BaseExceptionGroup):
+        return all(_is_requested_reconnect(x) for x in e.exceptions)
+    return False
+
+
 class ResponseWatchdog:
     """Notices that speech went up and nothing came back.
 
@@ -536,6 +554,7 @@ class ResponseWatchdog:
         self.timeout_seconds = float(timeout_seconds)
         self._awaiting_since = 0.0
         self._reported = False
+        self._tools_running = 0
         self._now = time.time          # seam: tests drive this
 
     def user_spoke(self) -> None:
@@ -550,9 +569,24 @@ class ResponseWatchdog:
     def reset(self) -> None:
         self._awaiting_since = 0.0
         self._reported = False
+        self._tools_running = 0
+
+    def tool_started(self) -> None:
+        """The model answered with a tool call. Waiting on the tool is work,
+        not silence: a 60 s research call must not read as a dead socket."""
+        self._tools_running += 1
+        self._awaiting_since = 0.0
+        self._reported = False
+
+    def tool_finished(self) -> None:
+        """The result went back; now the model owes a reply to it."""
+        self._tools_running = max(0, self._tools_running - 1)
+        if not self._tools_running:
+            self._awaiting_since = self._now()
+            self._reported = False
 
     def waiting_for(self) -> float:
-        if not self._awaiting_since:
+        if not self._awaiting_since or self._tools_running:
             return 0.0
         return max(0.0, self._now() - self._awaiting_since)
 
@@ -1034,6 +1068,12 @@ class LiveManager:
         self._mic_level_throttle = MicLevelThrottle()
         #: Notices a session that has gone quiet without erroring.
         self._watchdog = ResponseWatchdog()
+        #: Set to tear the current connection down and open a new one.
+        self._drop_event: asyncio.Event | None = None
+        self._drop_reason = ""
+        #: Tool calls running beside the receiver, and ones Gemini withdrew.
+        self._tool_tasks: set = set()
+        self._cancelled_tool_ids: set = set()
         self._send_total = 0.0
         self._send_count = 0
         self._send_worst = 0.0
@@ -2069,11 +2109,30 @@ class LiveManager:
             self._publish(LiveEvent("error", message=message, recoverable=True))
         except Exception:
             pass
+        self._request_reconnect("no reply for %ds" % int(self._watchdog.waiting_for()))
+
+    def _request_reconnect(self, reason: str) -> bool:
+        """Replace the current connection. Safe from any thread; never blocks.
+
+        Ending the mic sender (the old way) ended only the mic sender: the
+        receiver kept waiting on the stuck socket and nothing drained the
+        mic queue, so NOVA stayed mute for minutes after saying she was
+        reconnecting.
+        """
+        self._drop_reason = reason
+        ev, loop = self._drop_event, self._loop
+        if ev is None or loop is None or loop.is_closed():
+            return False
         try:
-            # Same door the network-failure path uses.
-            self._post_to_loop(self._mic_queue, None)
-        except Exception:
-            pass
+            loop.call_soon_threadsafe(ev.set)
+            return True
+        except RuntimeError:
+            return False
+
+    async def _drop_watch(self) -> None:
+        """Ends the session's TaskGroup when a reconnect is requested."""
+        await self._drop_event.wait()
+        raise ReconnectRequested(self._drop_reason or "reconnect requested")
 
     def _publish(self, event: LiveEvent) -> None:
         with self._subs_lock:
@@ -2278,6 +2337,7 @@ class LiveManager:
         while self._should_reconnect():
             _log("[LIVE] connecting to %s voice=%s ...", self._model, self._voice)
             t0 = time.time()
+            requested_reconnect = False
             connected_ok = False
             try:
                 # Rebuilt per attempt; see _new_client. The first attempt reuses
@@ -2334,6 +2394,11 @@ class LiveManager:
                     self._vision_busy_at = 0.0
                     self._vision_last_at = 0.0
                     self._gate.reset()
+                    # A new connection owes nothing to the old one's clock.
+                    self._watchdog.reset()
+                    self._cancelled_tool_ids.clear()
+                    self._drop_event = asyncio.Event()
+                    tg.create_task(self._drop_watch())
 
                     # Consumers before producers.
                     #
@@ -2388,32 +2453,15 @@ class LiveManager:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                if not connected_ok:
-                    consecutive_failures += 1
-                _log(
-                    "[LIVE] connect/run error (failure %d/%d): %s",
-                    consecutive_failures, self.MAX_RECONNECT_ATTEMPTS, e,
-                )
-                self._last_error = str(e)
-                if self._is_auth_failure(str(e)):
-                    # Permanent: report it in the user's language and stop.
-                    self._auth_rejected = True
-                elif self._is_offline(str(e)):
-                    # Not a failure to count. Wait it out and say so plainly,
-                    # rather than exhausting the retry budget while the user
-                    # is on a train.
-                    consecutive_failures = 0
-                    if not self._offline:
-                        self._offline = True
-                        _log("[LIVE] no network; waiting for it to come back")
-                        self._publish(LiveEvent(
-                            "state", state="offline", error=str(e),
-                            message=("NOVA can't reach the network, so voice "
-                                     "is paused. She'll pick it up again as "
-                                     "soon as you're back online.")))
-                    self._publish(LiveEvent("state", state="offline"))
+                if _is_requested_reconnect(e):
+                    # Deliberate, not a failure: nothing to count, no red orb
+                    # for something NOVA chose to do, and no backoff -- the
+                    # user is waiting to be answered.
+                    _log("[LIVE] replacing the connection: %s", self._drop_reason)
+                    requested_reconnect = True
                 else:
-                    self._publish(LiveEvent("state", state="error", error=str(e)))
+                    consecutive_failures = self._on_connection_error(
+                        e, connected_ok, consecutive_failures)
             finally:
                 self._screen.stop()
                 self._stop_mic()
@@ -2457,10 +2505,43 @@ class LiveManager:
                 self.RECONNECT_BASE_DELAY * (2 ** max(0, consecutive_failures - 1)),
                 self.RECONNECT_MAX_DELAY,
             ))
+            if requested_reconnect:
+                delay = min(delay, 0.2)
             with self._state_lock:
                 self._state = LiveState.CONNECTING
             self._publish(LiveEvent("state", state="connecting", retry_in_s=round(delay, 1)))
             await asyncio.sleep(delay)
+
+    def _on_connection_error(self, e: BaseException, connected_ok: bool,
+                             failures: int) -> int:
+        """Log and report a connection that failed; returns the new count."""
+        if not connected_ok:
+            failures += 1
+        _log(
+            "[LIVE] connect/run error (failure %d/%d): %s",
+            failures, self.MAX_RECONNECT_ATTEMPTS, e,
+        )
+        self._last_error = str(e)
+        if self._is_auth_failure(str(e)):
+            # Permanent: report it in the user's language and stop.
+            self._auth_rejected = True
+        elif self._is_offline(str(e)):
+            # Not a failure to count. Wait it out and say so plainly,
+            # rather than exhausting the retry budget while the user
+            # is on a train.
+            failures = 0
+            if not self._offline:
+                self._offline = True
+                _log("[LIVE] no network; waiting for it to come back")
+                self._publish(LiveEvent(
+                    "state", state="offline", error=str(e),
+                    message=("NOVA can't reach the network, so voice "
+                             "is paused. She'll pick it up again as "
+                             "soon as you're back online.")))
+            self._publish(LiveEvent("state", state="offline"))
+        else:
+            self._publish(LiveEvent("state", state="error", error=str(e)))
+        return failures
 
     async def _send_greeting(self, session: Any, speaker_ok: bool = True) -> None:
         """Say something worth saying — or just say hello.
@@ -2659,7 +2740,12 @@ class LiveManager:
                         # Conversational replies still worked, which is why it
                         # looked intermittent: "hello" was answered and "what
                         # is the capital of Nigeria" was not.
-                        await self._handle_tool_calls(session, msg.tool_call)
+                        self._spawn_tool_calls(session, msg.tool_call)
+                        continue
+
+                    cancel = getattr(msg, "tool_call_cancellation", None)
+                    if cancel is not None:
+                        self._cancel_tool_calls(getattr(cancel, "ids", None))
                         continue
 
                     sc = msg.server_content
@@ -2716,6 +2802,8 @@ class LiveManager:
                         self._turn_count += 1
 
                     if sc.turn_complete:
+                        # A finished turn is an answer, even a silent one.
+                        self._watchdog.model_responded()
                         self._turn_done_flag = True
                         self._turn_count += 1
                         self._end_suppression("turn ended")
@@ -2799,8 +2887,35 @@ class LiveManager:
         finally:
             self._vision_busy = False
 
+    def _spawn_tool_calls(self, session: Any, tool_call: Any) -> None:
+        """Run a tool call beside the conversation instead of in front of it.
+
+        The receiver used to await every tool, so for as long as one ran --
+        a 9 s search, a confirmation waiting on the user -- nothing was read
+        from the connection: no audio, no transcript, no interruption. The
+        receiver must never wait on anything but the socket.
+        """
+        self._watchdog.tool_started()
+        task = asyncio.get_running_loop().create_task(
+            self._handle_tool_calls(session, tool_call))
+        self._tool_tasks.add(task)
+        task.add_done_callback(self._tool_tasks.discard)
+
+    def _cancel_tool_calls(self, ids: Any) -> None:
+        """Gemini withdrew these calls (usually: the user talked over them)."""
+        ids = [i for i in (ids or []) if i]
+        if ids:
+            self._cancelled_tool_ids.update(ids)
+            _log("[LIVE] tool call(s) withdrawn by the model: %s", ", ".join(ids))
+
     async def _handle_tool_calls(self, session: Any, tool_call: Any) -> None:
         """Run the tools the model asked for and send the results back."""
+        try:
+            await self._answer_tool_calls(session, tool_call)
+        finally:
+            self._watchdog.tool_finished()
+
+    async def _answer_tool_calls(self, session: Any, tool_call: Any) -> None:
         names = [fc.name for fc in tool_call.function_calls]
         _log("[LIVE] tool call: %s", ", ".join(names))
         self._publish(LiveEvent("tool_call", tools=names))
@@ -2808,6 +2923,12 @@ class LiveManager:
         responses = []
         for fc in tool_call.function_calls:
             responses.append(await self._run_tool(fc))
+
+        def _rid(r):
+            return r.get("id") if isinstance(r, dict) else getattr(r, "id", None)
+        responses = [r for r in responses if _rid(r) not in self._cancelled_tool_ids]
+        if not responses:
+            return
 
         try:
             await session.send_tool_response(function_responses=responses)

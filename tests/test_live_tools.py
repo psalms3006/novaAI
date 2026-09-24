@@ -51,6 +51,9 @@ def manager():
     m._subs_lock = threading.Lock()
     m._published = []
     m._publish = lambda ev: m._published.append(ev)
+    m._watchdog = ls.ResponseWatchdog()
+    m._tool_tasks = set()
+    m._cancelled_tool_ids = set()
     return m
 
 
@@ -165,7 +168,8 @@ class WiringTests(unittest.TestCase):
         src = inspect.getsource(ls.LiveManager._receiver)
         self.assertIn("msg.tool_call", src,
                       "tool calls are declared to the model but never handled")
-        self.assertIn("_handle_tool_calls", src)
+        # Spawned, not awaited: see test_voice_never_stops.
+        self.assertIn("_spawn_tool_calls", src)
 
     def test_tools_run_off_the_event_loop(self):
         """They open apps and drive browsers; blocking here stops the audio."""

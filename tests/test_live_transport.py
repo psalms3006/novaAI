@@ -178,8 +178,13 @@ class OfflineTests(unittest.TestCase):
         self.assertGreaterEqual(self.LiveManager.OFFLINE_RETRY_DELAY, 1.0)
 
     def test_being_offline_does_not_consume_the_retry_budget(self):
-        import inspect
-        src = inspect.getsource(self.LiveManager._connect_and_run)
-        offline_branch = src[src.index("elif self._is_offline"):]
-        self.assertIn("consecutive_failures = 0", offline_branch.split("else:")[0],
-                      "offline attempts still count toward giving up")
+        m = self.LiveManager.__new__(self.LiveManager)
+        m._offline = False
+        m._auth_rejected = False
+        m._publish = lambda ev: None
+        err = OSError("[Errno 11001] getaddrinfo failed")
+        self.assertTrue(self.LiveManager._is_offline(str(err)))
+        self.assertEqual(m._on_connection_error(err, False, 3), 0,
+                         "offline attempts still count toward giving up")
+        self.assertEqual(
+            m._on_connection_error(RuntimeError("500 internal"), False, 3), 4)
