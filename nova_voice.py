@@ -230,6 +230,10 @@ QUIET_FLOOR_MIN = 120.0
 #: their mind -- none of which should truncate a turn.
 QUIET_HOLDOVER_S = 1.2
 
+#: Frames (~1 s) of the room heard with NOVA silent before its level is
+#: trusted as the no-echo barge-in baseline.
+ROOM_FRAMES_TO_TRUST = 16
+
 
 def frame_rms(frame: np.ndarray) -> float:
     """RMS amplitude of an int16 frame."""
@@ -651,6 +655,13 @@ class VoiceGate:
         #: frame is worth the uplink.
         self._room_floor = 0.0
         self._last_loud_at = 0.0
+        #: Frames of room heard while NOVA was silent, and the room level as
+        #: it stood when she last started speaking -- the no-echo barge-in
+        #: baseline. Snapshotted only once enough silence has been heard, so
+        #: a gate that has only ever heard the user talking cannot mistake
+        #: their voice for the room and become uninterruptible.
+        self._room_frames = 0
+        self._turn_room_floor = 0.0
         #: True when this frame is room tone rather than anyone talking.
         self.last_was_quiet = False
         #: Amplitude of the most recent mic frame, 0..1. Read by the desktop
@@ -738,6 +749,9 @@ class VoiceGate:
                 self._last_loud_ref_at = 0.0
             else:
                 self._speech_runs = 0
+                self._turn_room_floor = (self._room_floor
+                                         if self._room_frames >= ROOM_FRAMES_TO_TRUST
+                                         else 0.0)
                 # Begin every turn deaf to interruption and earn hearing back
                 # as the echo path is learned. Failing in this direction means
                 # a late barge-in; failing the other way means NOVA cutting
@@ -866,6 +880,8 @@ class VoiceGate:
         mid-sentence, and the gap before "...actually, no" all still arrive.
         """
         level = frame_rms(frame)
+        if not self._speaking:
+            self._room_frames += 1
         # Normalised for anyone drawing it. The gate measures this on every
         # frame anyway to decide what is worth transmitting; the orb needs the
         # same number to show that someone is talking, and computing it twice
@@ -913,7 +929,13 @@ class VoiceGate:
             floor = self._residual_floor
             self._speaking_frames += 1
             frames = self._speaking_frames
-            noise = self._noise_floor
+            # The room's level, from whichever source knows it. _noise_floor
+            # only learns from frames under the fixed barge-in floor, so in a
+            # room louder than that (this laptop's mic: 1,300-1,700 RMS empty)
+            # it stayed 0 and all room tone counted as the user talking.
+            # _room_floor is learned from quiet frames all the time; its
+            # value as she began this turn is the room with her silent.
+            noise = max(self._noise_floor, self._turn_room_floor)
         self.last_smoothed = smoothed
 
         now = time.time()
