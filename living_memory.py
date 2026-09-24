@@ -299,6 +299,83 @@ class LivingMemory:
                             explicit=True, subject_id=subject_id,
                             author_id=author_id)
 
+    #: Subject NOVA's own world-knowledge research is filed under -- it is
+    #: not a fact about a person, so it does not belong under any real
+    #: subject_id, and giving it a fixed one keeps every researched topic
+    #: queryable together regardless of who asked for it.
+    RESEARCH_SUBJECT = "nova:research"
+
+    def remember_research(self, topic: str, findings: str,
+                          sources: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Store the outcome of researching *topic* as durable, retrievable
+        knowledge -- what NOVA learned about the world, not a fact about
+        the user, so this bypasses remember()'s transient/sensitive
+        checks. Those exist for personal facts ("the user is at the
+        airport right now" should not be stored as durable) and would
+        incorrectly reject research text that happens to describe a
+        current event, a person, or a topic that just sounds personal.
+
+        Calling this twice for the same topic updates the existing
+        record (via _upsert's own exact/near-duplicate matching) rather
+        than piling up near-identical entries -- researching the same
+        topic again should refresh what NOVA knows, not fork it.
+        """
+        topic = (topic or "").strip()
+        findings = (findings or "").strip()
+        if not findings:
+            raise ValueError("no findings to remember")
+        rec = self._upsert(findings, type="research", source="research",
+                           confirmed=True, project="", importance=0.7,
+                           explicit=True, subject_id=self.RESEARCH_SUBJECT,
+                           author_id="nova")
+        with self._lock:
+            rec.setdefault("meta", {})
+            rec["meta"]["topic"] = topic
+            rec["meta"]["sources"] = list(sources or [])
+            self._save()
+        return rec
+
+    #: Jaccard word-overlap between the asked-about topic and a stored
+    #: research record's own topic, below which they are not considered
+    #: the same research even though search() surfaced the record.
+    RESEARCH_MATCH_THRESHOLD = 0.4
+
+    def recall_research(self, topic: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        """Research NOVA has already done on *topic*, best first -- checked
+        before starting a new research task so the same ground is not
+        covered twice. Empty if nothing matches; the caller (the research
+        workflow) then actually researches it and calls
+        remember_research() when it's done.
+
+        search() itself is not enough here: every record gets a nonzero
+        score just from importance/recency (score += importance * 0.3,
+        and the only filter is score > 0), which is the right behaviour
+        for "give me loose context even with no real match" but the
+        wrong one for "have I already researched THIS topic" -- searching
+        an empty-of-relevance query against a single stored research
+        record for a completely unrelated topic still returned it.
+        Filtered here by comparing the asked topic's words against each
+        candidate's own stored topic (recorded verbatim in meta['topic']
+        by remember_research), not the free-text search score.
+        """
+        topic = (topic or "").strip()
+        if not topic:
+            return []
+        topic_words = set(re.findall(r"\w+", topic.lower()))
+        if not topic_words:
+            return []
+        candidates = self.search(topic, top_k=max(top_k * 3, 10), types=["research"])
+        matches = []
+        for rec in candidates:
+            stored_topic = (rec.get("meta") or {}).get("topic", "")
+            stored_words = set(re.findall(r"\w+", stored_topic.lower()))
+            if not stored_words:
+                continue
+            overlap = len(topic_words & stored_words) / len(topic_words | stored_words)
+            if overlap >= self.RESEARCH_MATCH_THRESHOLD:
+                matches.append(rec)
+        return matches[:top_k]
+
     def _upsert(self, text: str, type: str, source: str, confirmed: bool,
                 project: str, importance: float, explicit: bool,
                 subject_id: str = DEFAULT_SUBJECT,

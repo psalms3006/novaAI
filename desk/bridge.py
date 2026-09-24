@@ -1748,10 +1748,12 @@ def api_system():
             for t in tm.list()[:12]:
                 d = t.to_dict() if hasattr(t, "to_dict") else {}
                 tasks.append({
-                    "id": d.get("task_id", ""),
+                    "id": d.get("id", ""),
                     "title": d.get("title", ""),
                     "status": d.get("status", ""),
                     "steps": len(d.get("steps", []) or []),
+                    "progress": d.get("progress", 0),
+                    "seconds_remaining": d.get("seconds_remaining"),
                 })
     except Exception as e:
         log.debug("task listing failed: %s", e)
@@ -1807,7 +1809,10 @@ def api_tasks():
     try:
         raw = getattr(tm, "list", None)
         if callable(raw):
-            tasks = raw()
+            # to_dict(), not the Task objects themselves: jsonify would
+            # serialise the raw dataclass fields and skip the computed
+            # progress and countdown.
+            tasks = [t.to_dict() if hasattr(t, "to_dict") else t for t in raw()]
     except Exception:
         tasks = []
     if not tasks and callable(getattr(tm, "exec_command", None)):

@@ -1204,13 +1204,15 @@ TOOL_DECLARATIONS = [
             "Steps may name any tool you can call directly, such as "
             "'web_search', 'file_processor' or 'generate_document'. "
             "The user is told when the task finishes, so do not promise to "
-            "report back yourself."
+            "report back yourself. If you tell the user roughly how long it "
+            "will take, pass the same figure in seconds as "
+            "estimated_duration_s so the progress they see matches what you said."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "cmd": {"type": "STRING", "description": "submit | status | pause | resume | cancel | list"},
-                "args": {"type": "OBJECT", "description": "For submit: {title, steps, project}; for others: {task_id}"}
+                "args": {"type": "OBJECT", "description": "For submit: {title, steps, project, estimated_duration_s}; for others: {task_id}"}
             },
             "required": ["cmd"]
         }
@@ -1868,12 +1870,17 @@ def _execute_tool_sync(tool_name: str, args: dict, meta: dict) -> str:
             if not tm:
                 return "Task manager not initialized."
             _a = args.get("args") or {}
+            try:
+                _est = float(_a.get("estimated_duration_s") or 0)
+            except (TypeError, ValueError):
+                _est = 0.0
             return tm.exec_command(
                 args.get("cmd", "status"),
                 task_id=str(_a.get("task_id") or _a.get("id") or ""),
                 title=str(_a.get("title") or _a.get("name") or "Untitled task"),
                 steps=_a.get("steps") or [],
                 meta=_a,
+                estimated_duration_s=_est,
             )
         except Exception as _tm:
             return f"nova_task error: {_tm}"

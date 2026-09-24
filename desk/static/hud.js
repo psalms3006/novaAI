@@ -260,8 +260,16 @@
       // objective = the running task, else idle
       const obj = $("hud-objective");
       if (obj) {
-        const running = (d.tasks || []).find((t) => t.status === "running" || t.status === "in_progress");
-        obj.textContent = running ? running.title.toUpperCase().slice(0, 54) : "AWAITING INSTRUCTION";
+        const running = (d.tasks || []).find((t) => String(t.status).toUpperCase() === "RUNNING");
+        let label = "AWAITING INSTRUCTION";
+        if (running) {
+          label = String(running.title || "TASK").toUpperCase().slice(0, 40) + " · " + (running.progress || 0) + "%";
+          // Only an estimate the model actually gave gets a countdown.
+          if (typeof running.seconds_remaining === "number") {
+            label += " · ~" + Math.max(1, Math.ceil(running.seconds_remaining / 60)) + " MIN";
+          }
+        }
+        obj.textContent = label;
       }
 
       const sess = $("hud-session");

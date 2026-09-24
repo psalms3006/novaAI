@@ -24,7 +24,7 @@ so it can be unit-tested standalone.
 """
 from __future__ import annotations
 import json, logging, os, re, threading, time, uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Callable, Dict, List, Optional
 
 import nova_paths
@@ -99,6 +99,12 @@ class Task:
     dependencies: List[str] = field(default_factory=list)
     artifacts: List[Dict[str, Any]] = field(default_factory=list)
     priority: str = "NORMAL"
+    #: Seconds the submitter (typically NOVA herself, having just told the
+    #: user "give me about ten minutes") expects this to take. 0 means no
+    #: estimate was given -- progress() then falls back to a step-count
+    #: ratio instead of a time-based one, since there is nothing to
+    #: measure time against.
+    estimated_duration_s: float = 0.0
     progress: int = 0
     current_step: int = -1
     created: float = field(default_factory=time.time)
@@ -115,28 +121,71 @@ class Task:
             "steps": [s.to_dict() for s in self.steps],
             "dependencies": list(self.dependencies),
             "artifacts": list(self.artifacts), "priority": self.priority,
-            "progress": self.progress, "current_step": self.current_step,
+            "progress": self.progress_percent(), "current_step": self.current_step,
             "created": self.created, "updated": self.updated,
             "started": self.started, "finished": self.finished,
             "errors": list(self.errors), "reason_for_stop": self.reason_for_stop,
             "notify_done": self.notify_done,
+            "estimated_duration_s": self.estimated_duration_s,
+            "seconds_remaining": self.seconds_remaining(),
         }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Task":
         steps = [TaskStep.from_dict(s) for s in d.get("steps", [])]
         t = cls(title=d.get("title", "Task"), steps=steps)
+        # Only real dataclass fields: to_dict() also writes computed values
+        # (seconds_remaining), and a hasattr() check would let those
+        # overwrite the method of the same name with a plain value.
+        settable = {f.name for f in fields(cls)} - {"steps"}
         for k, v in d.items():
-            if k == "steps":
-                continue
-            if hasattr(t, k):
+            if k in settable:
                 setattr(t, k, v)
         return t
+
+    def progress_percent(self) -> int:
+        """0-100, computed fresh every time it's asked rather than read
+        off a field nothing ever updated (self.progress used to be set
+        exactly once, to 100, at COMPLETED -- 0% for the entire time a
+        task was actually running, whatever it was doing).
+
+        Time-based while RUNNING with an estimate (nova_task can be given
+        one when the model told the user "give me about ten minutes"),
+        capped at 95 until the task actually finishes -- an estimate is a
+        guess, and claiming 100% before real completion would be a
+        second, smaller version of the exact "false completion" problem
+        this whole module exists to prevent for step verification. Falls
+        back to a step-count ratio when there is no time estimate to
+        measure against, and to whatever was last recorded once the task
+        has actually stopped.
+        """
+        if self.status == "COMPLETED":
+            return 100
+        if self.status in ("FAILED", "CANCELLED", "PARTIALLY_COMPLETED", "UNVERIFIED"):
+            return self.progress
+        if self.status == "RUNNING" and self.started:
+            if self.estimated_duration_s > 0:
+                elapsed = time.time() - self.started
+                return max(0, min(95, int(100 * elapsed / self.estimated_duration_s)))
+            if self.steps:
+                done = sum(1 for s in self.steps if s.status in
+                          ("VERIFIED", "SKIPPED", "FAILED"))
+                return max(0, min(95, int(100 * done / len(self.steps))))
+        return self.progress
+
+    def seconds_remaining(self) -> Optional[float]:
+        """None when there is nothing to count down -- no estimate was
+        given, or the task is not (yet, or any longer) running. The UI's
+        progress bar/countdown is meant to be honest about not knowing,
+        not show a bar frozen at some arbitrary point."""
+        if self.status != "RUNNING" or self.estimated_duration_s <= 0 or not self.started:
+            return None
+        return max(0.0, self.estimated_duration_s - (time.time() - self.started))
 
     def summary(self, detail: bool = False) -> str:
         done = sum(1 for s in self.steps if s.status in ("VERIFIED", "SKIPPED"))
         total = len(self.steps)
-        lines = [f"{self.id} · {self.title} · {self.status} ({self.progress}%)"]
+        lines = [f"{self.id} · {self.title} · {self.status} ({self.progress_percent()}%)"]
         if detail and self.steps:
             lines.append("  Steps:")
             for s in self.steps:
@@ -271,7 +320,8 @@ class TaskManager:
     # ── task CRUD ───────────────────────────────────────────────────────────
     def submit(self, title: str, steps: List[Dict[str, Any]], meta: Optional[dict] = None,
                dependencies: Optional[List[str]] = None, priority: str = "NORMAL",
-               task_id: Optional[str] = None) -> Task:
+               task_id: Optional[str] = None,
+               estimated_duration_s: float = 0.0) -> Task:
         """steps: list of {"tool": ..., "args": {...}}. Returns the created Task.
 
         A task with no steps used to become a single step naming a tool called
@@ -279,6 +329,13 @@ class TaskManager:
         fail-closed on it, and the task was reported to the user as unverified
         rather than as the empty submission it was. A task with nothing to run
         is a caller error, so say so.
+
+        estimated_duration_s: how long the submitter (typically NOVA
+        herself, having just told the user roughly how long this would
+        take) expects it to run. Purely descriptive -- nothing here
+        enforces it as a deadline -- and drives Task.progress_percent()'s
+        time-based estimate and the UI's countdown; omit it for a task
+        with no meaningful duration to estimate.
         """
         if not steps:
             raise ValueError(
@@ -288,7 +345,8 @@ class TaskManager:
         with self._lock:
             t = Task(title=title, steps=[TaskStep(tool=s["tool"], args=s.get("args", {}))
                                         for s in steps],
-                     dependencies=list(dependencies or []), priority=priority.upper())
+                     dependencies=list(dependencies or []), priority=priority.upper(),
+                     estimated_duration_s=max(0.0, estimated_duration_s))
             if task_id:
                 t.id = task_id
             t.status = "QUEUED"
@@ -377,6 +435,8 @@ class TaskManager:
             except Exception:
                 pass
         low = text.lower()
+        if step.tool in self.RESEARCH_TOOLS:
+            return self._verify_search(low)
         # "refused:" is how nova.py reports an authorisation denial. Without it
         # a categorically refused step verified as UNKNOWN, and the task was
         # reported as "steps ran but success could not be verified" — when in
@@ -395,6 +455,25 @@ class TaskManager:
             if s in low:
                 return "CONFIRMED_SUCCESS"
         return "UNKNOWN"
+
+    #: How actions/web_search.py words a search that produced nothing. Its
+    #: successful output is the findings themselves, so the generic keyword
+    #: scan can't judge it: results about a failed launch contain "failed",
+    #: and "No results found" contains the success keyword "found ".
+    SEARCH_FAILURES = ("no results found for", "couldn't search",
+                       "please provide a search query", "comparison failed")
+
+    #: Prefixes nova.py's dispatcher puts on a tool that raised or was refused.
+    DISPATCH_FAILURES = ("error", "web_search error", "refused:")
+
+    @classmethod
+    def _verify_search(cls, low: str) -> str:
+        if low.startswith(cls.DISPATCH_FAILURES):
+            return "FAILURE"
+        # Only the opening: the rest is findings, which may quote anything.
+        if any(f in low[:200] for f in cls.SEARCH_FAILURES):
+            return "FAILURE"
+        return "LIKELY_SUCCESS"
 
     def _validate_artifacts(self, task: Task) -> int:
         """Check that files claimed to be created actually exist & are non-empty."""
@@ -559,7 +638,45 @@ class TaskManager:
             t.finished = time.time()
             t.updated = time.time()
             self._save()
+        self._remember_research(t)
         self._notify_done(t)
+
+    #: Tools whose output is findings about the world, worth keeping so the
+    #: same topic is not researched from scratch next time.
+    RESEARCH_TOOLS = ("web_search",)
+
+    def _remember_research(self, t: Task) -> None:
+        """File what a task's verified searches found under its title."""
+        found = [s.result for s in t.steps
+                 if s.tool in self.RESEARCH_TOOLS and s.status == "VERIFIED" and s.result]
+        if not found:
+            return
+        try:
+            from living_memory import get_living_memory
+            mem = get_living_memory()
+            if mem is None:
+                return
+            text = "\n\n".join(found)
+            sources = list(dict.fromkeys(re.findall(r"https?://[^\s)\]>\"']+", text)))
+            mem.remember_research(t.title, text, sources=sources[:20])
+        except Exception as e:
+            log.debug("could not file research for %s: %s", t.id, e)
+
+    @staticmethod
+    def _prior_research(title: str) -> str:
+        """What is already known about *title*, as a note for the model."""
+        try:
+            from living_memory import get_living_memory
+            mem = get_living_memory()
+            hits = mem.recall_research(title, top_k=1) if mem is not None else []
+        except Exception:
+            return ""
+        if not hits:
+            return ""
+        when = time.strftime("%Y-%m-%d", time.localtime(
+            hits[0].get("updated") or hits[0].get("created") or time.time()))
+        return (f" You already researched this on {when}; what you found then: "
+                f"{hits[0]['text'][:600]}")
 
     def _notify_done(self, t: Task) -> None:
         if not t.notify_done:
@@ -590,16 +707,21 @@ class TaskManager:
     # ── command handling for the model/REPL ─────────────────────────────────
     def exec_command(self, cmd: str, task_id: str = "", title: str = "",
                      steps: Optional[List[Dict[str, Any]]] = None,
-                     meta: Optional[dict] = None) -> str:
+                     meta: Optional[dict] = None,
+                     estimated_duration_s: float = 0.0) -> str:
         c = (cmd or "").strip().lower()
         if c in ("create", "add", "submit", "run"):
             if not steps:
                 return ("nova_task submit needs a 'steps' list, e.g. "
                         '{"steps": [{"tool": "web_search", '
                         '"args": {"query": "..."}}]}. Nothing was started.')
-            t = self.submit(title or "Untitled task", steps, meta=meta)
+            t = self.submit(title or "Untitled task", steps, meta=meta,
+                            estimated_duration_s=estimated_duration_s)
+            prior = (self._prior_research(t.title)
+                     if any(s.tool in self.RESEARCH_TOOLS for s in t.steps) else "")
             return (f"Task {t.id} queued: '{t.title}' "
-                    f"({len(t.steps)} step(s)). You'll be notified when it finishes.")
+                    f"({len(t.steps)} step(s)). You'll be notified when it finishes."
+                    + prior)
         if c in ("status", "progress", "what"):
             return self.progress_text()
         if c in ("list", "all"):
