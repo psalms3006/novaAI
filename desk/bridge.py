@@ -1084,6 +1084,27 @@ def api_live_status():
     return jsonify(mgr.status())
 
 
+def _block_on_accept(server) -> None:
+    """Accepted connections block on reads, whatever the process default.
+
+    Python gives an accepted socket the process-wide default timeout. The
+    browser sends nothing on the voice and event WebSockets, so a default
+    (nova.is_online() used to set 4 s) made their reader thread treat four
+    quiet seconds as a close; the handler ended mid-stream and the window
+    silently stopped receiving the voice session. This has to happen at
+    accept: by the time a route runs, the reader is already waiting with
+    the old timeout.
+    """
+    accept = server.get_request
+
+    def get_request():
+        conn, addr = accept()
+        conn.settimeout(None)
+        return conn, addr
+
+    server.get_request = get_request
+
+
 @sock.route("/api/live/ws")
 def api_live_ws(ws):
     """WebSocket for Live audio events.
@@ -1158,7 +1179,10 @@ def api_live_ws(ws):
                         "closed": "offline",
                     }
                     orb_state = orb_map.get(state_val, "idle")
-                    publish_event({"type": "voice_state", "state": state_val, "ts": time.time()})
+                    # publish_voice_state, not a bare voice_state event: it
+                    # also records the state /api/system reports, and the
+                    # HUD's VOICE pill showed "idle" for whole conversations.
+                    publish_voice_state(state_val)
                     publish_event({"type": "orb_state", "state": orb_state, "ts": time.time()})
                 elif ev_dict.get("type") == "user_transcript":
                     publish_event({"type": "transcript", "text": ev_dict.get("text", ""), "role": "user", "ts": time.time()})
@@ -1771,6 +1795,19 @@ def api_system():
     except Exception:
         pass
 
+    # A voice conversation does not go through the router, so while one is
+    # running the engine and latency are the live session's own -- otherwise
+    # the HUD showed ENGINE ---- and LATENCY -- throughout a conversation.
+    turn_ms = _last_turn_ms
+    try:
+        live = desk_live.get_live_manager().status()
+        if live.get("state") not in (None, "idle", "closed", "error", "offline"):
+            model = str(live.get("model") or model).replace("models/", "")
+            provider = live.get("engine") or provider
+            turn_ms = live.get("last_turn_ms") or turn_ms
+    except Exception:
+        pass
+
     conn = "unknown"
     try:
         r = getattr(nova, "_nova_router", None)
@@ -1790,7 +1827,7 @@ def api_system():
             "model": model,
             "connectivity": conn,
             "brain_ready": _brain_ready,
-            "last_turn_ms": _last_turn_ms,
+            "last_turn_ms": turn_ms,
         },
         "voice": {
             "state": _last_voice_state,
@@ -2495,6 +2532,7 @@ def run_desk_server(meta, port: int | None = None) -> None:
 
     host = os.getenv("NOVA_DESK_HOST", "127.0.0.1")
     _server = make_server(host, port, app, threaded=True)
+    _block_on_accept(_server)
     print(f"[NOVA] 🖥  NOVA Desktop backend ready at http://{host}:{port}")
 
     # ── Unified event bus (voice state + agent lifecycle + transcripts) ────────

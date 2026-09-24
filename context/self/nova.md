@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (107):
+Commits in the last 14 days (108):
 
+- ae03887 2026-09-24 Show real task progress, and remember what research found
 - 25f0ce6 2026-09-23 Make the Concurrent Task Manager actually concurrent
 - 1354510 2026-09-23 Make the nebula the whole app's background, and give core surfaces clay
 - 2545bf0 2026-09-23 Stop losing typed messages after one failed send, and clean up the tree
@@ -154,8 +155,7 @@ Commits in the last 14 days (107):
 - 1f57253 2026-09-20 Tell the model the step shape the task manager actually reads
 - e520a8d 2026-09-20 Give NOVA something to say on her own initiative, and a reason to stay quiet
 - 086a989 2026-09-20 Fix the build stamp reporting a clean tree as dirty
-- 398c746 2026-09-20 Record the multi-agent investigation instructions
-- ...and 67 more
+- ...and 68 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

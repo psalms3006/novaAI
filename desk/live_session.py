@@ -212,7 +212,8 @@ class VoiceTrace:
     "why was that slow" actually needs.
     """
 
-    __slots__ = ("session_id", "t0", "stages", "_lock", "_turn", "_turn_t0")
+    __slots__ = ("session_id", "t0", "stages", "_lock", "_turn", "_turn_t0",
+                 "last_turn_ms")
 
     def __init__(self, session_id: str):
         self.session_id = session_id
@@ -221,6 +222,7 @@ class VoiceTrace:
         self._lock = threading.Lock()
         self._turn = 0
         self._turn_t0 = 0.0
+        self.last_turn_ms = 0
 
     def mark(self, stage: str, **detail) -> float:
         """Record a stage and return milliseconds since the session began."""
@@ -244,9 +246,12 @@ class VoiceTrace:
         """Latency within the current turn, which is what the user feels."""
         if not self._turn_t0:
             return
+        ms = (time.time() - self._turn_t0) * 1000
+        if label == "playback started":
+            # Speech to first sound: the LATENCY the HUD shows.
+            self.last_turn_ms = round(ms)
         _log("[VOICE %s] turn %d: %-18s +%6.0f ms since speech",
-             self.session_id, self._turn, label,
-             (time.time() - self._turn_t0) * 1000)
+             self.session_id, self._turn, label, ms)
 
     def gap(self, a: str, b: str) -> float | None:
         with self._lock:
@@ -1242,6 +1247,7 @@ class LiveManager:
             "native_audio": True,
             "engine": "gemini-live",
             "t_first_audio_ms": t_first,
+            "last_turn_ms": self._trace.last_turn_ms if self._trace else 0,
             "uptime_s": uptime,
             "turns": self._turn_count,
             "audio_out_kb": round(self._audio_bytes_out / 1024, 1),

@@ -270,6 +270,7 @@ async function liveStart() {
 
 function liveConnect() {
   if (state.liveWs) return;
+  state.liveDetached = false;
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const url = `${proto}//${location.host}/api/live/ws?token=${TOKEN}`;
   try {
@@ -283,8 +284,17 @@ function liveConnect() {
       handleLiveEvent(ev);
     } catch (e) { /* noop */ }
   };
-  state.liveWs.onclose = () => { state.liveWs = null; };
-  state.liveWs.onerror = () => { state.liveWs = null; };
+  // A dropped socket is reopened while voice is on. Without this, one hiccup
+  // left the window deaf to the session for the rest of the run: the voice
+  // kept working while the orb, conversation panel and HUD all froze.
+  const ws = state.liveWs;
+  const dropped = () => {
+    if (state.liveWs !== ws) return;
+    state.liveWs = null;
+    if (state.voiceMode && !state.liveDetached) setTimeout(liveConnect, 1000);
+  };
+  ws.onclose = dropped;
+  ws.onerror = dropped;
 }
 
 /* If the backend never reports a working session, say so rather than sitting
@@ -532,6 +542,7 @@ window.novaSetScreenWatching = setScreenWatching;
 
 /* Stop listening on this surface. The session keeps running for the others. */
 function liveDetach() {
+  state.liveDetached = true;
   if (state.liveWs) {
     state.liveWs.close();
     state.liveWs = null;

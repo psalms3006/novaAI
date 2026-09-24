@@ -220,6 +220,77 @@ class GmailConnector:
 
 # ── consent ─────────────────────────────────────────────────────────────────
 
+#: How long the consent page may stay open before the attempt is abandoned.
+CONSENT_TIMEOUT_S = 300
+
+
+def _consent_via_local_server(flow, port: int = 0,
+                              timeout_s: float = CONSENT_TIMEOUT_S,
+                              open_browser: bool = True):
+    """Open Google's consent page and wait for its redirect to localhost.
+
+    Replaces InstalledAppFlow.run_local_server, which serves exactly one
+    connection: a browser's speculative preconnect to the redirect port
+    (opened, nothing sent, closed) used that up and the flow failed with
+    "Timed out waiting for response from authorization server" seconds
+    after the page opened. This keeps serving until a request actually
+    carries Google's answer -- ``code`` or ``error`` -- or the deadline passes.
+    """
+    import webbrowser
+    import wsgiref.simple_server
+    import wsgiref.util
+    from urllib.parse import parse_qs, urlparse
+
+    answer: dict[str, str] = {}
+
+    def app(environ, start_response):
+        uri = wsgiref.util.request_uri(environ)
+        query = parse_qs(urlparse(uri).query)
+        if "code" in query or "error" in query:
+            answer["uri"] = uri
+            answer["error"] = (query.get("error") or [""])[0]
+            body = (b"NOVA received Google's answer. You can close this tab."
+                    if not answer["error"] else
+                    b"Google did not grant access. You can close this tab.")
+        else:
+            body = b""
+        start_response("200 OK", [("Content-Type", "text/plain; charset=utf-8")])
+        return [body]
+
+    class _Quiet(wsgiref.simple_server.WSGIRequestHandler):
+        def log_message(self, *args):   # stderr is None in the windowed EXE
+            pass
+
+    server = wsgiref.simple_server.make_server("localhost", port, app,
+                                               handler_class=_Quiet)
+    try:
+        flow.redirect_uri = f"http://localhost:{server.server_port}/"
+        auth_url, _ = flow.authorization_url(prompt="consent")
+        log.info("[GMAIL] waiting for consent on port %s", server.server_port)
+        if open_browser:
+            webbrowser.open(auth_url, new=1, autoraise=True)
+        server.timeout = 0.5
+        deadline = time.time() + timeout_s
+        while "uri" not in answer and time.time() < deadline:
+            server.handle_request()
+    finally:
+        server.server_close()
+
+    if "uri" not in answer:
+        raise GmailUnavailable(
+            f"Google sign-in was not finished within {int(timeout_s)} seconds.")
+    if answer["error"] == "access_denied":
+        raise GmailUnavailable(
+            "Google refused access (access_denied). If the page said the app "
+            "has not completed verification, add this Google account as a "
+            "test user on the OAuth consent screen in Google Cloud Console.")
+    if answer["error"]:
+        raise GmailUnavailable(f"Google refused access ({answer['error']}).")
+    # oauthlib insists on https even for the loopback redirect.
+    flow.fetch_token(authorization_response=answer["uri"].replace("http", "https", 1))
+    return flow.credentials
+
+
 def authorise(accounts: Optional[AccountStore] = None,
               port: int = 0) -> dict[str, Any]:
     """Run Google's consent flow and store the result. Opens a browser.
@@ -251,8 +322,7 @@ def authorise(accounts: Optional[AccountStore] = None,
     }
 
     flow = InstalledAppFlow.from_client_config(config, SCOPES)
-    creds = flow.run_local_server(port=port, prompt="consent",
-                                  open_browser=True)
+    creds = _consent_via_local_server(flow, port=port)
 
     store = accounts or get_account_store()
     payload = json.dumps({

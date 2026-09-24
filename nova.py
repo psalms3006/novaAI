@@ -2062,11 +2062,14 @@ def _task_desc(task: Any) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def is_online(timeout: float = 4.0) -> bool:
+    # The timeout goes on this connection only. This used to also call
+    # socket.setdefaulttimeout(), which is process-wide: every connection the
+    # desk server accepted afterwards timed out after four quiet seconds,
+    # which silently cut the window off from the voice session.
     for host in ("8.8.8.8", "1.1.1.1"):
         try:
-            socket.setdefaulttimeout(timeout)
-            socket.create_connection((host, 53), timeout=timeout)
-            return True
+            with socket.create_connection((host, 53), timeout=timeout):
+                return True
         except OSError:
             continue
     return False

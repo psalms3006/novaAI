@@ -244,7 +244,8 @@
               tls.applied ? "TLS " + (tls.method || "").toUpperCase() : "TLS CERTIFI");
 
       const vs = (d.voice || {}).state || "idle";
-      setPill("pill-voice", vs === "streaming" || vs === "connected" ? "ok"
+      const voiceUp = ["streaming", "connected", "ready", "listening", "speaking"];
+      setPill("pill-voice", voiceUp.includes(vs) ? "ok"
               : (vs === "error" ? "bad" : ""), "VOICE " + vs.toUpperCase());
 
       const eng = $("hud-engine");
