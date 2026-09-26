@@ -198,3 +198,11 @@ nova_tasks_aios.json
 nova_cost.json
 # Ad-hoc captures from vision testing.
 screenshot_*.png
+
+# NOVA UI (React, desk/ui): dependencies are installed, never committed.
+# Its build output (desk/static/ui) IS committed, so a source checkout and the
+# PyInstaller bundle run without Node.
+desk/ui/node_modules/
+
+# Browser-automation screenshots and snapshots from local UI testing.
+.playwright-mcp/

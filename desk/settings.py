@@ -96,7 +96,52 @@ _DEFAULTS = {
     "auth_mode": "",                # "" | "cloud" | "byok" | "offline" | "env"
     "cloud_url": "",                # NOVA backend/gateway base URL (empty = disabled)
     "onboarded": False,             # first-run onboarding completed
+    # ── interface (desk/ui) ─────────────────────────────────────
+    # The window's look: theme, glass, motion, start screen. Kept here, not in
+    # the page's localStorage, because the desktop window runs in pywebview's
+    # private mode, which wipes browser storage at every launch. Merged key
+    # by key and validated against _UI_PREFS below.
+    "ui_prefs": {},
 }
+
+# Every interface preference the window may store, and what counts as valid.
+# A tuple is the allowed set; a (min, max) pair of numbers is an inclusive
+# range; `bool` is a flag. Anything else in an update is dropped.
+_UI_PREFS = {
+    "theme_id": ("obsidian", "titanium", "warm-graphite", "deep-ocean", "pearl"),
+    "glass_opacity": (30, 95),
+    "glass_blur": (8, 40),
+    "specular": (0, 100),
+    "ui_scale": ("90", "100", "110"),
+    "corner_radius": ("sharp", "soft", "round"),
+    "ambient_motion": bool,
+    "quality": ("quality", "balanced", "performance"),
+    "landing_view": ("substrate", "synaptic", "runtime"),
+    "time_format": ("12h", "24h"),
+    "presence": ("orb", "humanoid"),
+    "show_transcript": bool,
+}
+
+
+def _clean_ui_prefs(update: dict) -> dict:
+    """The valid subset of an interface-preferences update."""
+    clean = {}
+    for key, value in update.items():
+        rule = _UI_PREFS.get(key)
+        if rule is None:
+            continue
+        if rule is bool:
+            if isinstance(value, bool):
+                clean[key] = value
+        # (This module's own all() shadows the builtin, hence no all() here.)
+        elif (isinstance(rule, tuple) and len(rule) == 2
+              and isinstance(rule[0], (int, float)) and isinstance(rule[1], (int, float))):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if rule[0] <= value <= rule[1]:
+                    clean[key] = value
+        elif value in rule:
+            clean[key] = value
+    return clean
 
 # Keys the SPA is allowed to persist (everything user-facint is persisted server-side;
 # nothing here is a secret).
@@ -138,11 +183,24 @@ def set_many(updates: dict) -> dict:
         data = _load()
         for k, v in updates.items():
             if k == "permissions" and isinstance(v, dict):
-                merged = dict(get("permissions", {}))
+                # From `data`, never get(): get() takes _LOCK, which this
+                # function already holds, and threading.Lock is not
+                # re-entrant -- saving a permission deadlocked every later
+                # settings read and write in the process.
+                current = data.get("permissions")
+                merged = dict(_DEFAULTS["permissions"])
+                if isinstance(current, dict):
+                    merged.update(current)
                 for cat, val in v.items():
                     if cat in _PERMISSION_CATEGORIES and val in ("allow", "ask", "deny"):
                         merged[cat] = val
                 data["permissions"] = merged
+            elif k == "ui_prefs":
+                if isinstance(v, dict):
+                    current = data.get("ui_prefs")
+                    merged = dict(current) if isinstance(current, dict) else {}
+                    merged.update(_clean_ui_prefs(v))
+                    data["ui_prefs"] = merged
             elif k in _SAFE_KEYS:
                 data[k] = v
         try:
@@ -160,6 +218,8 @@ def all() -> dict:
         merged.update(data)
         if not isinstance(merged.get("permissions"), dict):
             merged["permissions"] = dict(_DEFAULTS["permissions"])
+        prefs = merged.get("ui_prefs")
+        merged["ui_prefs"] = _clean_ui_prefs(prefs) if isinstance(prefs, dict) else {}
         return merged
 
 
@@ -182,4 +242,5 @@ def toggles() -> dict:
         "developer_mode": True,      # gates the advanced settings section
         "confirm_policy": True,      # prompt vs auto-safe confirmation
         "permissions": True,         # per-category allow/ask/deny (safety gate)
+        "ui_prefs": True,            # desk/ui theme, glass, motion, start screen
     }

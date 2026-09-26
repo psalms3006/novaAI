@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (105):
+Commits in the last 14 days (96):
 
+- 92c9d07 2026-09-25 Make the ambient orb react to the voice, move and click, and see in real time
 - 5a6c02c 2026-09-24 React to the user's voice, not to sound
 - 90b390c 2026-09-24 Stop room noise from cutting NOVA off mid-sentence
 - 5892f11 2026-09-24 Let NOVA talk while she works, and let the user talk over her
@@ -154,8 +155,7 @@ Commits in the last 14 days (105):
 - 81900ed 2026-09-20 Fix a race in my own activity tests, and stop blaming the build for it
 - 75b05f0 2026-09-20 Check that single-file nova_ modules reach the bundle too
 - 5bad8bc 2026-09-20 Show background work, and show being interrupted
-- de59eaf 2026-09-20 Tell NOVA she is allowed to go away and work on something
-- ...and 65 more
+- ...and 56 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

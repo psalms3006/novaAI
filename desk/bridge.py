@@ -303,12 +303,25 @@ publish_agent_done = _noop_agent_done
 publish_orb_state = _noop_orb
 
 
+UI_INDEX = STATIC_DIR / "ui" / "index.html"
+
+
 @app.get("/")
 def index():
-    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    """The desktop interface: desk/ui's build, with this run's token in it.
+
+    Serves the same page for the main window and the ambient strip
+    (`/?mode=ambient`); the page picks its layout from the query string.
+    """
+    page = UI_INDEX if UI_INDEX.is_file() else STATIC_DIR / "index.html"
+    html = page.read_text(encoding="utf-8")
     html = html.replace("__DESK_TOKEN__", run_token)
     html = html.replace("__DESK_VERSION__", APP_VERSION)
-    return Response(html, mimetype="text/html")
+    resp = Response(html, mimetype="text/html")
+    # The page carries a per-run token: never let the webview reuse a copy
+    # from an earlier run.
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 # ── status / meta ─────────────────────────────────────────────────────────────
@@ -1084,6 +1097,43 @@ def api_live_status():
     return jsonify(mgr.status())
 
 
+@app.get("/api/audio/devices")
+@require_token
+def api_audio_devices():
+    """The microphones this machine has, for the `mic_device` setting.
+
+    PortAudio lists each device once per Windows audio API, so names are
+    de-duplicated, keeping the entry on the host API the voice session itself
+    prefers. The setting stores the name, which is what live_session matches.
+    """
+    try:
+        import sounddevice as sd
+    except Exception as e:
+        return jsonify({"ok": False, "inputs": [], "error": f"audio unavailable: {e}"})
+    try:
+        preferred = desk_live._preferred_host_api()
+    except Exception:
+        preferred = None
+    try:
+        default_in = sd.default.device[0] if sd.default.device else None
+        seen: dict[str, dict] = {}
+        for i, d in enumerate(sd.query_devices()):
+            if int(d.get("max_input_channels", 0) or 0) <= 0:
+                continue
+            name = str(d.get("name", "")).strip()
+            if not name:
+                continue
+            entry = {"index": i, "name": name, "default": i == default_in}
+            prior = seen.get(name)
+            if prior is None or (preferred is not None and d.get("hostapi") == preferred):
+                if prior is not None:
+                    entry["default"] = entry["default"] or prior["default"]
+                seen[name] = entry
+        return jsonify({"ok": True, "inputs": list(seen.values())})
+    except Exception as e:
+        return jsonify({"ok": False, "inputs": [], "error": str(e)})
+
+
 def _block_on_accept(server) -> None:
     """Accepted connections block on reads, whatever the process default.
 
@@ -1558,13 +1608,17 @@ def _mcp_status() -> dict:
     if has_mcp and bridge is not None:
         try:
             servers = list(getattr(bridge, "servers", lambda: [])() or []) or []
-            servers = [getattr(s, "name", None) or s if isinstance(s, str) else
-                       {"name": getattr(s, "name", None) or str(s)} for s in servers]
+            # One shape for every server: a bare name and an object with
+            # .name used to come back as a string and a dict respectively.
+            servers = [{"name": s if isinstance(s, str) else (getattr(s, "name", None) or str(s))}
+                       for s in servers]
         except Exception:
             servers = []
         try:
             decls = list(getattr(bridge, "gemini_declarations", lambda: [])() or []) or []
-            tools = [{"name": d.get("name") if isinstance(d, dict) else d for d in decls}]
+            # One entry per declaration. (This was a dict comprehension inside
+            # a list, which collapsed every tool into a single {"name": last}.)
+            tools = [{"name": d.get("name") if isinstance(d, dict) else str(d)} for d in decls]
         except Exception:
             tools = []
     return {
@@ -2215,37 +2269,42 @@ def _collect_mind_map_nodes():
     })
     nid += 1
 
-    # Memory nodes
-    try:
-        mem_path = Path(__file__).parent.parent / "nova_memory_store" / "records.json"
-        if mem_path.exists():
-            records = json.loads(mem_path.read_text(encoding="utf-8"))
-            for rec in records[:30]:
+    # Memory nodes -- from the running memory system, the same source as
+    # /api/memory. (These used to be read from files beside the source code,
+    # which in the packaged app is inside the bundle: the map showed no
+    # memories, or stale ones, while the Memory page showed the real ones.)
+    # `updated` travels with each node so the page can forget exactly that
+    # record through DELETE /api/memory/records.
+    lm = _ns("_living_memory")
+    if lm is not None:
+        try:
+            live = [r for r in lm.all_records() if not r.get("superseded_by")]
+            live.sort(key=lambda r: r.get("importance", 0.0), reverse=True)
+            for rec in live[:40]:
+                text = str(rec.get("text", ""))
                 nodes.append({
                     "id": f"n{nid}", "region": "memory", "type": "memory",
-                    "label": rec.get("text", rec.get("fact", ""))[:60],
-                    "detail": rec.get("text", rec.get("fact", "")),
-                    "size": 0.5, "accent": REGION_COLORS["memory"],
+                    "label": text[:60], "detail": text,
+                    "size": 0.4 + 0.3 * min(1.0, float(rec.get("importance", 0.0) or 0.0)),
+                    "accent": REGION_COLORS["memory"],
                     "source_type": rec.get("type", "unknown"),
                     "source_id": rec.get("id", ""),
+                    "updated": rec.get("updated", 0.0),
+                    "confirmed": bool(rec.get("confirmed", True)),
                 })
                 nid += 1
-    except Exception:
-        pass
+        except Exception as e:
+            log.warning("mind map: living memory listing failed: %s", e)
 
-    # Facts from memory_texts.json
     try:
-        facts_path = Path(__file__).parent.parent / "memory_texts.json"
-        if facts_path.exists():
-            facts = json.loads(facts_path.read_text(encoding="utf-8"))
-            for fact in (facts if isinstance(facts, list) else []):
-                text = fact if isinstance(fact, str) else fact.get("text", str(fact))
-                nodes.append({
-                    "id": f"n{nid}", "region": "memory", "type": "fact",
-                    "label": text[:60], "detail": text,
-                    "size": 0.4, "accent": REGION_COLORS["memory"],
-                })
-                nid += 1
+        for text in list(_ns("_memory_texts", []) or [])[-30:]:
+            text = text if isinstance(text, str) else str(text)
+            nodes.append({
+                "id": f"n{nid}", "region": "memory", "type": "fact",
+                "label": text[:60], "detail": text,
+                "size": 0.4, "accent": REGION_COLORS["memory"],
+            })
+            nid += 1
     except Exception:
         pass
 
@@ -2301,41 +2360,65 @@ def _collect_mind_map_nodes():
     return nodes
 
 
+_mind_map_edge_cache: dict = {"key": None, "edges": None}
+_mind_map_edge_lock = threading.Lock()
+
+
 def _collect_mind_map_edges(nodes):
-    """Compute semantic edges between nodes using FAISS embeddings if available."""
-    edges = []
+    """Edges between nodes: semantic when NOVA's embedder is loaded, else regional.
+
+    Uses the embedder NOVA already holds (nova_state._embedder). This used to
+    load a fresh SentenceTransformer from a folder beside the source on every
+    request -- seconds and hundreds of MB per map view, and again for every
+    node clicked -- and that folder does not exist in the packaged app. The
+    result is cached against the node texts, so a click reuses it.
+    """
     if len(nodes) < 2:
-        return edges
+        return []
+    key = tuple((n["id"], n.get("detail", n.get("label", ""))) for n in nodes)
+    with _mind_map_edge_lock:
+        if _mind_map_edge_cache["key"] == key:
+            return list(_mind_map_edge_cache["edges"])
+    edges = _compute_mind_map_edges(nodes)
+    with _mind_map_edge_lock:
+        _mind_map_edge_cache["key"] = key
+        _mind_map_edge_cache["edges"] = list(edges)
+    return edges
 
-    # Try FAISS-based cosine similarity
-    try:
-        import faiss
-        import numpy as np
-        embedder_path = Path(__file__).parent.parent / "nova_embedder"
-        if embedder_path.exists():
-            from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer(str(embedder_path))
-            texts = [n.get("detail", n.get("label", "")) for n in nodes]
-            embeddings = model.encode(texts, show_progress_bar=False)
-            embeddings = np.array(embeddings, dtype="float32")
-            faiss.normalize_L2(embeddings)
-            index = faiss.IndexFlatIP(embeddings.shape[1])
-            index.add(embeddings)
-            D, I = index.search(embeddings, min(4, len(nodes)))
-            for i, (dists, neighbors) in enumerate(zip(D, I)):
-                for j, (dist, neighbor) in enumerate(zip(dists, neighbors)):
-                    if i != neighbor and dist > 0.35 and j < 3:
-                        edge_id = tuple(sorted([nodes[i]["id"], nodes[neighbor]["id"]]))
-                        if not any(e["source"] == edge_id[0] and e["target"] == edge_id[1] for e in edges):
-                            edges.append({
-                                "source": edge_id[0], "target": edge_id[1],
-                                "weight": float(dist), "type": "semantic",
-                            })
-            return edges
-    except Exception:
-        pass
 
-    # Fallback: region-based edges
+def _compute_mind_map_edges(nodes):
+    model = _ns("_embedder")
+    if model is not None:
+        try:
+            return _semantic_edges(model, nodes)
+        except Exception as e:
+            log.warning("mind map: semantic edges failed, using regional: %s", e)
+    return _regional_edges(nodes)
+
+
+def _semantic_edges(model, nodes):
+    import faiss
+    import numpy as np
+    edges, seen = [], set()
+    texts = [n.get("detail", n.get("label", "")) for n in nodes]
+    embeddings = np.array(model.encode(texts, show_progress_bar=False), dtype="float32")
+    faiss.normalize_L2(embeddings)
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings)
+    D, I = index.search(embeddings, min(4, len(nodes)))
+    for i, (dists, neighbors) in enumerate(zip(D, I)):
+        for j, (dist, neighbor) in enumerate(zip(dists, neighbors)):
+            if i != neighbor and dist > 0.35 and j < 3:
+                pair = tuple(sorted([nodes[i]["id"], nodes[neighbor]["id"]]))
+                if pair not in seen:
+                    seen.add(pair)
+                    edges.append({"source": pair[0], "target": pair[1],
+                                  "weight": float(dist), "type": "semantic"})
+    return edges
+
+
+def _regional_edges(nodes):
+    edges = []
     region_groups = {}
     for n in nodes:
         region_groups.setdefault(n["region"], []).append(n["id"])

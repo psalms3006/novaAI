@@ -1,0 +1,31 @@
+{
+  "name": "nova-desk-ui",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "description": "NOVA's desktop interface. Built into desk/static/ui and served by desk/bridge.py.",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 3000",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@fontsource/inter": "^5.1.0",
+    "@fontsource/jetbrains-mono": "^5.1.0",
+    "@fontsource/space-grotesk": "^5.1.0",
+    "@fortawesome/fontawesome-free": "^6.5.1",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "three": "^0.186.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/three": "^0.186.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "tailwindcss": "^4.1.0",
+    "typescript": "^5.6.0",
+    "vite": "^7.0.0"
+  }
+}

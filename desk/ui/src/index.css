@@ -1,0 +1,93 @@
+@import "tailwindcss";
+
+@theme {
+  --color-obsidian: #08090c;
+  --color-obsidian-deep: #050608;
+  --font-sans: "Space Grotesk", -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+  --font-mono: "JetBrains Mono", SFMono-Regular, monospace;
+  --font-body: "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+/* Subtle organic breathing animation */
+@keyframes floatSlow {
+  0%, 100% { transform: translateY(0px) scale(1); }
+  50% { transform: translateY(-5px) scale(1.008); }
+}
+
+@keyframes pulseSubtle {
+  0%, 100% { opacity: 0.18; }
+  50% { opacity: 0.30; }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: scale(0.985); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.entity-float {
+  animation: floatSlow 8s ease-in-out infinite;
+}
+
+.ambient-glow {
+  animation: pulseSubtle 7s ease-in-out infinite;
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.22s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-slide-up {
+  animation: slideUp 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* ================= LIQUID GLASS ================= */
+/* The glass itself is Tailwind's backdrop-blur-* utilities, whose radii read
+   --blur-xl/2xl/3xl. NovaStateContext sets those from the user's blur
+   setting scaled by the quality preset, so one setting reaches every panel. */
+
+/* Performance preset: drop the saturation boost and heavy shadows that make
+   every translucent layer expensive to composite on weak GPUs. */
+[data-quality="performance"] .shadow-2xl,
+[data-quality="performance"] .shadow-xl {
+  box-shadow: none !important;
+}
+
+/* Ambient motion off (Settings > Appearance), or the system asks for reduced
+   motion: decorative animation stops. State indicators (pulses on a live
+   microphone, a running task) keep moving -- they carry information. */
+.nova-still .entity-float,
+.nova-still .ambient-glow,
+.nova-still [class*="animate-[spin"] {
+  animation: none !important;
+}
+.nova-still * {
+  transition-duration: 0.01ms !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  .entity-float,
+  .ambient-glow,
+  [class*="animate-[spin"] {
+    animation: none !important;
+  }
+}
+
+/* Smooth macOS style custom scrollbar */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.2);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.38);
+}
