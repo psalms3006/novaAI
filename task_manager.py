@@ -705,15 +705,49 @@ class TaskManager:
             pass
 
     # ── command handling for the model/REPL ─────────────────────────────────
+    #: Turns a goal into steps when the caller gave none. Replaceable (tests).
+    planner: Optional[Callable[[str], List[Dict[str, Any]]]] = None
+
+    def plan_steps(self, goal: str) -> List[Dict[str, Any]]:
+        """Steps for a goal: NOVA's planner, else its keyword fallback, else []."""
+        if self.planner is not None:
+            try:
+                return list(self.planner(goal) or [])
+            except Exception as e:
+                log.warning("task planner failed for %r: %s", goal, e)
+                return []
+        try:
+            from agent import planner as _planner
+            try:
+                plan = _planner.create_plan(goal)
+            except Exception as e:
+                log.warning("planning %r failed (%s); using the fallback plan", goal, e)
+                plan = _planner._fallback_plan(goal)
+        except Exception as e:
+            log.warning("no planner available for %r: %s", goal, e)
+            return []
+        steps = []
+        for st in (plan or {}).get("steps") or []:
+            tool = st.get("tool")
+            if tool:
+                steps.append({"tool": tool, "args": dict(st.get("parameters") or st.get("args") or {})})
+        return steps
+
     def exec_command(self, cmd: str, task_id: str = "", title: str = "",
                      steps: Optional[List[Dict[str, Any]]] = None,
                      meta: Optional[dict] = None,
                      estimated_duration_s: float = 0.0) -> str:
         c = (cmd or "").strip().lower()
         if c in ("create", "add", "submit", "run"):
+            if not steps and (title or "").strip():
+                # The model often names the goal and leaves the steps to us
+                # ("research exoplanets"). Refusing that -- as this used to --
+                # meant nothing was started while NOVA told the user it had
+                # been. Plan it instead.
+                steps = self.plan_steps(title.strip())
             if not steps:
-                return ("nova_task submit needs a 'steps' list, e.g. "
-                        '{"steps": [{"tool": "web_search", '
+                return ("nova_task submit needs a title (a goal NOVA can plan) or a 'steps' "
+                        'list, e.g. {"steps": [{"tool": "web_search", '
                         '"args": {"query": "..."}}]}. Nothing was started.')
             t = self.submit(title or "Untitled task", steps, meta=meta,
                             estimated_duration_s=estimated_duration_s)

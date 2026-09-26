@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (93):
+Commits in the last 14 days (94):
 
+- 59c1134 2026-09-26 Honour Gemini's GoAway and resume the session instead of being cut off
 - 0ed5309 2026-09-26 Stop the window saying "Working" after a tool call that never answers
 - ae5a4ef 2026-09-26 Port setup, account, library and ambient into the new UI; retire desk/static
 - 191901e 2026-09-26 Replace NOVA's desktop UI with the new design, wired to the real backend
@@ -154,8 +155,7 @@ Commits in the last 14 days (93):
 - 21c6dd6 2026-09-20 Actually run the scheduler, instead of shipping a third orphan
 - 35446bc 2026-09-20 Let a month-long commitment outlive the process that heard it
 - 5bdb550 2026-09-20 Separate connecting an account from being allowed to use it
-- cf7bb33 2026-09-20 Stop offering a tool that could never work
-- ...and 53 more
+- ...and 54 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns
