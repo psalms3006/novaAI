@@ -108,7 +108,7 @@ def test_reading_the_screen_is_shown_in_both_windows():
     canvas = _read("components/three/SpatialCanvas.tsx")
     assert "p?.vision" in canvas, "the orb ignores the vision state"
     # The ambient window takes every bus event, including vision_capture.
-    assert "opts.liveSocket ? (t: string) => BUS_TYPES.has(t) : () => true" in _read("nova/events.ts")
+    assert "opts.liveSocket ? isBusType : () => true" in _read("nova/events.ts")
 
 
 def test_running_tasks_are_recognised_by_their_real_status():

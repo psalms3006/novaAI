@@ -2,15 +2,18 @@ import React from 'react';
 import { useNova } from '../context/NovaStateContext';
 import { useRuntime } from '../nova/runtime';
 
-const RUNNING = new Set(['RUNNING', 'QUEUED', 'PLANNED', 'WAITING', 'VERIFYING']);
+const RUNNING = new Set(['RUNNING', 'QUEUED', 'PLANNED', 'PLANNING', 'WAITING', 'REVIEWING', 'VERIFYING']);
 
 export const NavRail: React.FC = () => {
   const { currentScreen, setCurrentScreen, theme, setThemeModalOpen, setCommandPaletteOpen } = useNova();
   const { system } = useRuntime();
   // What NOVA is actually doing: background tasks in flight plus agents at work.
+  // An agent working for a task is that task's work, not a second thing.
+  const tasks = (system?.tasks || []).filter((t) => RUNNING.has(String(t.status).toUpperCase()));
+  const taskIds = new Set(tasks.map((t) => t.id));
   const working =
-    (system?.tasks || []).filter((t) => RUNNING.has(String(t.status).toUpperCase())).length +
-    (system?.agents || []).filter((a) => a.state === 'active').length;
+    tasks.length +
+    (system?.agents || []).filter((a) => a.state === 'running' && !(a.task_id && taskIds.has(a.task_id))).length;
 
   return (
     <div

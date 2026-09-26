@@ -24,6 +24,7 @@ import functools
 import json
 import logging
 import queue
+import re
 import os
 import secrets
 import tempfile
@@ -35,6 +36,7 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, request
 from flask_sock import Sock
 
+import agent_activity
 import nova as _nova
 import nova_state
 import nova_safety
@@ -60,7 +62,8 @@ _brain_ready: bool = False  # Set by nova_desktop_app after nova.main() complete
 
 # Live command-centre state, maintained by the event-bus publishers below so
 # /api/system reports what actually happened rather than a plausible guess.
-_active_agents: dict = {}      # agent_id -> {state, action, task_id}
+# Which agent is working is kept by agent_activity -- one registry that the
+# voice session, the chat path and the task manager all report to.
 _last_voice_state: str = 'idle'
 _last_turn_ms: float = 0.0
 
@@ -1714,30 +1717,15 @@ def api_ambient_get():
 
 
 def _agent_key(agent_id: str, tool: str = "", name: str = "") -> str:
-    """Map a runtime agent/tool id onto one of the roster ids in _AGENT_ROSTER.
+    """The roster agent that owns a runtime agent/tool id.
 
-    The chat path names agents after the tool they are running
-    ("agent-web_search-3f9c"), so the HUD lights the specialist that actually
-    owns that capability instead of inventing a separate row per tool call.
+    The chat path names agents after the tool they run ("agent-web_search-3f9c")
+    and its own thinking "thinking-<turn>", which is NOVA herself.
     """
-    blob = f"{agent_id} {tool} {name}".lower()
-    for key, patterns in _TOOL_TO_AGENT.items():
-        if any(pat in blob for pat in patterns):
-            return key
-    return "orchestrator"
-
-
-_TOOL_TO_AGENT = {
-    "research": ("web_search", "research", "search"),
-    "browser":  ("browser_control", "browser"),
-    "vision":   ("vision", "screen", "ocr"),
-    "code":     ("self_editor", "code", "file_processor"),
-    "memory":   ("remember_fact", "nova_memory", "memory"),
-    "creative":  ("creative", "write", "document"),
-    "meeting":  ("meeting",),
-    "surveillance": ("surveil", "monitor"),
-    "spawn":    ("spawn", "nova_task", "planner"),
-}
+    if tool:
+        return agent_activity.agent_for_tool(tool)
+    m = re.match(r"agent-(.+)-[^-]+$", agent_id or "")
+    return agent_activity.agent_for_tool(m.group(1) if m else (name or ""))
 
 
 # ── command-centre telemetry ──────────────────────────────────────────────────
@@ -1747,18 +1735,7 @@ _TOOL_TO_AGENT = {
 # would be worse than no UI, so nothing below is synthesised — if a value is
 # unavailable the field is omitted and the panel renders it as "--".
 
-_AGENT_ROSTER = [
-    ("orchestrator", "NOVA",    "Manager"),
-    ("research",     "RESEARCH", "Web + sources"),
-    ("code",         "CODE",     "Code + analysis"),
-    ("vision",       "VISION",   "Screen + images"),
-    ("browser",      "BROWSER",  "Browser control"),
-    ("memory",       "MEMORY",   "Recall + storage"),
-    ("creative",     "CREATIVE", "Writing + media"),
-    ("meeting",      "MEETING",  "Meetings"),
-    ("surveillance", "SURVEIL",  "Monitoring"),
-    ("spawn",        "SPAWN",    "Sub-agents"),
-]
+_AGENT_ROSTER = [tuple(a) for a in agent_activity.AGENTS]
 
 _net_last = {"t": 0.0, "sent": 0, "recv": 0}
 
@@ -1811,35 +1788,20 @@ def api_system():
     """Live telemetry for the command-centre HUD."""
     import nova
 
-    # ── agents: real roster, real live status from the event bus ─────────────
-    active = dict(_active_agents)
-    agents = []
-    for key, label, role in _AGENT_ROSTER:
-        live = active.get(key)
-        agents.append({
-            "id": key,
-            "label": label,
-            "role": role,
-            "state": (live or {}).get("state", "standby"),
-            "action": (live or {}).get("action", ""),
-            "task_id": (live or {}).get("task_id", ""),
-        })
+    # ── agents: every executor reports to one registry ──────────────────────
+    agents = [{k: a[k] for k in ("id", "label", "role", "state", "action", "task_id")}
+              | {"since": a.get("since"), "busy": len(a.get("work") or [])}
+              for a in agent_activity.snapshot()]
 
-    # ── tasks: real task manager state ──────────────────────────────────────
+    # ── tasks: real task manager state, active first ────────────────────────
     tasks = []
     try:
         tm = _ns("_task_manager")
         if tm is not None:
-            for t in tm.list()[:12]:
+            listing = tm.recent(12) if hasattr(tm, "recent") else tm.list()[-12:][::-1]
+            for t in listing:
                 d = t.to_dict() if hasattr(t, "to_dict") else {}
-                tasks.append({
-                    "id": d.get("id", ""),
-                    "title": d.get("title", ""),
-                    "status": d.get("status", ""),
-                    "steps": len(d.get("steps", []) or []),
-                    "progress": d.get("progress", 0),
-                    "seconds_remaining": d.get("seconds_remaining"),
-                })
+                tasks.append(_task_brief(d))
     except Exception as e:
         log.debug("task listing failed: %s", e)
 
@@ -1895,6 +1857,64 @@ def api_system():
         },
         "tls": _tls_status(),
     })
+
+
+def _task_brief(d: dict) -> dict:
+    """What the task list shows for one task. Every figure is counted."""
+    msgs = d.get("agent_messages") or []
+    review = (d.get("reviews") or [None])[-1]
+    return {
+        "id": d.get("id", ""),
+        "title": d.get("title", ""),
+        "status": d.get("status", ""),
+        "phase": d.get("phase", ""),
+        "steps": len(d.get("steps", []) or []),
+        "steps_done": d.get("steps_done", 0),
+        "progress": d.get("progress", 0),
+        "seconds_remaining": d.get("seconds_remaining"),
+        "estimated_duration_s": d.get("estimated_duration_s", 0),
+        "elapsed_s": d.get("elapsed_s", 0),
+        "current": d.get("current", ""),
+        "next": d.get("next", ""),
+        "agents": d.get("agents", []),
+        "reason": d.get("reason_for_stop", ""),
+        "artifacts": [a.get("path", "") for a in d.get("artifacts") or []][:5],
+        "messages": msgs[-4:],
+        "review": ({"round": review.get("round"), "passed": review.get("passed"),
+                    "issues": [i.get("problem", "") for i in review.get("issues") or []]}
+                   if review else None),
+        "updated": d.get("updated", 0),
+    }
+
+
+@app.get("/api/tasks/<task_id>")
+@require_token
+def api_task(task_id: str):
+    """One task in full: steps, agent messages, reviews, history."""
+    tm = _ns("_task_manager")
+    t = tm.get(task_id) if tm is not None else None
+    if t is None:
+        return jsonify({"ok": False, "error": "no such task"}), 404
+    return jsonify({"ok": True, "task": t.to_dict()})
+
+
+@app.post("/api/tasks/<task_id>/cancel")
+@require_token
+def api_task_cancel(task_id: str):
+    tm = _ns("_task_manager")
+    ok = bool(tm is not None and tm.cancel(task_id, force=True))
+    return jsonify({"ok": ok, **({} if ok else {"error": "that task is not running"})})
+
+
+@app.post("/api/tasks/<task_id>/retry")
+@require_token
+def api_task_retry(task_id: str):
+    """Run a finished task again, as a new task that remembers its parent."""
+    tm = _ns("_task_manager")
+    t = tm.retry(task_id) if tm is not None and hasattr(tm, "retry") else None
+    if t is None:
+        return jsonify({"ok": False, "error": "only a task that has stopped can be retried"}), 400
+    return jsonify({"ok": True, "task_id": t.id})
 
 
 @app.get("/api/tasks")
@@ -2656,20 +2676,20 @@ def run_desk_server(meta, port: int | None = None) -> None:
         publish_event({"type": "task_done", "task_id": task_id, "ok": ok, "summary": summary, "ts": time.time()})
 
     def publish_agent_start(agent_id: str, task_id: str, name: str, action: str = "", tool: str = ""):
-        _active_agents[_agent_key(agent_id, tool, name)] = {
-            "state": "active", "action": action or name, "task_id": task_id,
-        }
+        agent_activity.begin(_agent_key(agent_id, tool, name), action or name,
+                             source="chat", task_id=task_id, key=f"chat:{agent_id}")
         publish_event({"type": "agent_start", "agent_id": agent_id, "task_id": task_id, "name": name, "action": action, "tool": tool, "ts": time.time()})
 
     def publish_agent_progress(agent_id: str, action: str = "", tool: str = ""):
-        key = _agent_key(agent_id, tool)
-        if key in _active_agents:
-            _active_agents[key]["action"] = action
+        # The registry's row says what the agent started on; progress is
+        # the event below, not a rewrite of that row.
         publish_event({"type": "agent_progress", "agent_id": agent_id, "action": action, "tool": tool, "ts": time.time()})
 
     def publish_agent_done(agent_id: str, ok: bool = True, summary: str = ""):
-        for k in [k for k, v in _active_agents.items() if agent_id.endswith(k) or k in agent_id]:
-            _active_agents.pop(k, None)
+        # By the exact id it started under. Matching by substring left
+        # "research" lit forever: it is not a substring of
+        # "agent-web_search-3f9c".
+        agent_activity.end(f"chat:{agent_id}")
         publish_event({"type": "agent_done", "agent_id": agent_id, "ok": ok, "summary": summary, "ts": time.time()})
 
     def publish_orb_state(state: str):

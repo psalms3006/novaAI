@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNova } from '../context/NovaStateContext';
-import { useRuntime, fmtAgo, type ActivityKind } from '../nova/runtime';
+import { useRuntime, fmtAgo, type ActivityKind, type SystemTask } from '../nova/runtime';
 import { SpatialCanvas } from '../components/three/SpatialCanvas';
 import { phaseColor } from '../components/TopHud';
 
@@ -10,6 +10,8 @@ const AGENT_ICON: Record<string, string> = {
   code: 'fa-code',
   vision: 'fa-eye',
   browser: 'fa-window-maximize',
+  computer: 'fa-desktop',
+  reviewer: 'fa-clipboard-check',
   memory: 'fa-brain',
   creative: 'fa-wand-magic-sparkles',
   meeting: 'fa-users',
@@ -27,9 +29,12 @@ const FILTERS: { id: string; label: string; kinds: ActivityKind[] | null }[] = [
 
 const TASK_DOT: Record<string, string> = {
   RUNNING: '#f59e0b',
+  PLANNING: '#f59e0b',
+  REVIEWING: '#8b5cf6',
   VERIFYING: '#f59e0b',
   QUEUED: '#94a3b8',
   PLANNED: '#94a3b8',
+  PAUSED: '#94a3b8',
   WAITING: '#94a3b8',
   COMPLETED: '#10b981',
   FAILED: '#ef4444',
@@ -38,10 +43,130 @@ const TASK_DOT: Record<string, string> = {
   UNVERIFIED: '#f59e0b',
 };
 
+/** Being worked on right now (as opposed to queued or finished). */
+const TASK_ACTIVE = new Set(['PLANNING', 'RUNNING', 'WAITING', 'REVIEWING', 'VERIFYING']);
+const TASK_DONE = new Set(['COMPLETED', 'FAILED', 'CANCELLED', 'PARTIALLY_COMPLETED', 'UNVERIFIED']);
+
+function fmtDuration(s?: number): string {
+  if (s == null || !isFinite(s)) return '';
+  const n = Math.max(0, Math.round(s));
+  if (n < 60) return `${n}s`;
+  const m = Math.floor(n / 60);
+  return m < 60 ? `${m}m ${n % 60}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+/** One task: a line at rest, the whole story when opened. Every figure in it
+ *  is counted by the task manager -- steps finished, time elapsed -- and the
+ *  only estimate shown is NOVA's own, labelled as hers. */
+const TaskRow: React.FC<{ t: SystemTask; open: boolean; onToggle: () => void }> = ({ t, open, onToggle }) => {
+  const { theme } = useNova();
+  const rt = useRuntime();
+  const s = String(t.status).toUpperCase();
+  const active = TASK_ACTIVE.has(s);
+  const done = TASK_DONE.has(s);
+  const total = t.steps || 0;
+  const finished = t.steps_done ?? 0;
+  const muted = { color: theme.palette.textMuted };
+  return (
+    <div className="text-xs p-1 rounded-lg" style={{ color: theme.palette.textSecondary, backgroundColor: open ? theme.palette.bgElevated : 'transparent' }}>
+      <button onClick={onToggle} className="w-full text-left cursor-pointer" aria-expanded={open}>
+        <div className="flex items-center space-x-2">
+          <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${active ? 'animate-pulse' : ''}`} style={{ backgroundColor: TASK_DOT[s] || theme.palette.textMuted }} />
+          <span className="truncate flex-1" style={{ color: theme.palette.textPrimary }} title={t.title}>
+            {t.title}
+          </span>
+          <span className="text-[9px] font-mono opacity-60 shrink-0">{s.toLowerCase().replace(/_/g, ' ')}</span>
+        </div>
+        {(active || s === 'QUEUED') && (
+          <div className="ml-3.5 mt-0.5 flex items-center justify-between gap-2 text-[10px]" style={muted}>
+            <span className="truncate" title={t.phase}>{t.phase || (s === 'PLANNING' ? 'Planning' : 'Waiting to start')}</span>
+            <span className="font-mono shrink-0">
+              {total ? `${finished}/${total}` : ''}
+              {t.elapsed_s ? ` · ${fmtDuration(t.elapsed_s)}` : ''}
+            </span>
+          </div>
+        )}
+        {active && total > 0 && (
+          <div className="mt-1 ml-3.5 h-0.5 rounded-full overflow-hidden" style={{ backgroundColor: theme.palette.glassBorder }}>
+            <div className="h-full transition-all" style={{ width: `${Math.min(100, Math.max(0, t.progress ?? 0))}%`, backgroundColor: theme.palette.accent }} />
+          </div>
+        )}
+        {done && t.reason && !open && (
+          <div className="ml-3.5 mt-0.5 text-[10px] truncate" style={muted} title={t.reason}>{t.reason}</div>
+        )}
+      </button>
+      {open && (
+        <div className="ml-3.5 mt-1.5 pt-1.5 border-t space-y-1.5 text-[10px] leading-relaxed animate-fade-in" style={{ borderColor: theme.palette.glassBorder }}>
+          {t.current && <div><span style={muted}>Now </span>{t.current}</div>}
+          {t.next && <div><span style={muted}>Next </span>{t.next}</div>}
+          {total > 0 && (
+            <div style={muted}>
+              {finished} of {total} step{total === 1 ? '' : 's'} finished
+              {t.elapsed_s ? ` · ${fmtDuration(t.elapsed_s)} elapsed` : ''}
+              {t.estimated_duration_s ? ` · NOVA estimated ${fmtDuration(t.estimated_duration_s)}` : ''}
+            </div>
+          )}
+          {!!t.agents?.length && (
+            <div className="flex flex-wrap gap-1">
+              {t.agents.map((a) => (
+                <span key={a} className="px-1.5 py-px rounded border font-mono text-[9px] uppercase" style={{ borderColor: theme.palette.glassBorder }}>
+                  <i className={`fa-solid ${AGENT_ICON[a] || 'fa-circle'} mr-1 opacity-60`} />
+                  {a === 'orchestrator' ? 'nova' : a}
+                </span>
+              ))}
+            </div>
+          )}
+          {!!t.messages?.length && (
+            <div className="space-y-0.5">
+              {t.messages.map((m) => (
+                <div key={m.id} className="truncate" title={m.text}>
+                  <span className="font-mono uppercase text-[9px]" style={muted}>
+                    {m.from === 'orchestrator' ? 'nova' : m.from} → {m.to === 'orchestrator' ? 'nova' : m.to}
+                  </span>{' '}
+                  {m.text}
+                </div>
+              ))}
+            </div>
+          )}
+          {t.review && (
+            <div style={{ color: t.review.passed ? '#10b981' : '#f59e0b' }}>
+              Review{t.review.round > 1 ? ` (round ${t.review.round})` : ''}: {t.review.passed ? 'passed' : t.review.issues.join('; ')}
+            </div>
+          )}
+          {!!t.artifacts?.length && (
+            <div className="space-y-0.5">
+              {t.artifacts.map((p) => (
+                <div key={p} className="truncate font-mono text-[9px]" title={p}>
+                  <i className="fa-solid fa-file-lines mr-1 opacity-60" />
+                  {p.split(/[\\/]/).pop()}
+                </div>
+              ))}
+            </div>
+          )}
+          {done && t.reason && <div style={muted}>{t.reason}</div>}
+          <div className="flex gap-2 pt-0.5">
+            {!done && (
+              <button onClick={() => rt.cancelTask(t.id)} className="px-2 py-0.5 rounded border text-[10px] cursor-pointer hover:opacity-100 opacity-80" style={{ borderColor: theme.palette.glassBorder }}>
+                Stop
+              </button>
+            )}
+            {done && s !== 'COMPLETED' && (
+              <button onClick={() => rt.retryTask(t.id)} className="px-2 py-0.5 rounded border text-[10px] cursor-pointer hover:opacity-100 opacity-80" style={{ borderColor: theme.palette.accentBorder, color: theme.palette.accent }}>
+                Try again
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 export const PresenceScreen: React.FC = () => {
   const { presenceType, setPresenceType, theme, prefs, setCurrentScreen, quality } = useNova();
   const rt = useRuntime();
   const [openAgent, setOpenAgent] = useState<string | null>(null);
+  const [openTask, setOpenTask] = useState<string | null>(null);
   const [filter, setFilter] = useState('all');
   const [asking, setAsking] = useState(false);
   const [ask, setAsk] = useState('');
@@ -136,7 +261,7 @@ export const PresenceScreen: React.FC = () => {
             <span className="uppercase tracking-wider text-[9px] font-semibold flex items-center gap-1.5" style={{ color: theme.palette.textPrimary }}>
               <i className="fa-solid fa-microchip text-[10px] opacity-70" /> Agents
             </span>
-            <span className="text-[10px] opacity-60 font-mono">{agents.filter((a) => a.state === 'active').length} active</span>
+            <span className="text-[10px] opacity-60 font-mono">{agents.filter((a) => a.state === 'running').length} running</span>
           </div>
 
           <div className="space-y-1.5 overflow-y-auto pr-0.5 flex-1">
@@ -147,7 +272,7 @@ export const PresenceScreen: React.FC = () => {
             )}
             {agents.map((a) => {
               const open = openAgent === a.id;
-              const active = a.state === 'active';
+              const active = a.state === 'running';
               return (
                 <button
                   key={a.id}
@@ -164,7 +289,8 @@ export const PresenceScreen: React.FC = () => {
                     <span className={`w-1.5 h-1.5 rounded-full ${active ? 'animate-pulse' : ''}`} style={{ backgroundColor: active ? '#10b981' : theme.palette.textMuted }} />
                   </div>
                   <div className="flex items-center justify-between mt-1 text-[10px] font-sans" style={{ color: theme.palette.textMuted }}>
-                    <span className="truncate">{active ? a.action || 'working' : 'standby'}</span>
+                    <span className="truncate" title={active ? a.action : undefined}>{active ? a.action || 'running' : 'standby'}</span>
+                    {active && a.since ? <span className="font-mono shrink-0 ml-1">{fmtDuration(Date.now() / 1000 - a.since)}</span> : null}
                   </div>
                   {open && (
                     <div className="mt-2 pt-1.5 border-t text-[10px] leading-relaxed animate-fade-in font-sans" style={{ borderColor: theme.palette.glassBorder, color: theme.palette.textSecondary }}>
@@ -266,7 +392,10 @@ export const PresenceScreen: React.FC = () => {
             </span>
             <div className="flex items-center gap-2">
               <span className="text-[10px] opacity-60 font-mono" style={{ color: theme.palette.textSecondary }}>
-                {rt.taskBusy ? 'working' : tasks.length ? `${tasks.length} recent` : 'idle'}
+                {(() => {
+                  const n = tasks.filter((t) => TASK_ACTIVE.has(String(t.status).toUpperCase())).length;
+                  return n ? `${n} running` : rt.taskBusy ? 'working' : tasks.length ? `${tasks.length} recent` : 'idle';
+                })()}
               </span>
               <button
                 onClick={() => setAsking(true)}
@@ -313,32 +442,15 @@ export const PresenceScreen: React.FC = () => {
             </form>
           )}
 
-          <div className="space-y-2 max-h-[180px] overflow-y-auto">
+          <div className="space-y-2 max-h-[260px] overflow-y-auto">
             {tasks.length === 0 ? (
               <div className="text-[11px]" style={{ color: theme.palette.textMuted }}>
                 No tasks. Ask NOVA to do something that takes several steps and it will appear here.
               </div>
             ) : (
-              tasks.map((t) => {
-                const s = String(t.status).toUpperCase();
-                const running = s === 'RUNNING' || s === 'VERIFYING';
-                return (
-                  <div key={t.id} className="text-xs p-1 rounded-lg" style={{ color: theme.palette.textSecondary }}>
-                    <div className="flex items-center space-x-2">
-                      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${running ? 'animate-pulse' : ''}`} style={{ backgroundColor: TASK_DOT[s] || theme.palette.textMuted }} />
-                      <span className="truncate flex-1" style={{ color: theme.palette.textPrimary }} title={t.title}>
-                        {t.title}
-                      </span>
-                      <span className="text-[9px] font-mono opacity-60 shrink-0">{s.toLowerCase().replace('_', ' ')}</span>
-                    </div>
-                    {running && t.progress != null && (
-                      <div className="mt-1 ml-3.5 h-0.5 rounded-full overflow-hidden" style={{ backgroundColor: theme.palette.glassBorder }}>
-                        <div className="h-full transition-all" style={{ width: `${Math.round(t.progress * 100)}%`, backgroundColor: theme.palette.accent }} />
-                      </div>
-                    )}
-                  </div>
-                );
-              })
+              tasks.map((t) => (
+                <TaskRow key={t.id} t={t} open={openTask === t.id} onToggle={() => setOpenTask(openTask === t.id ? null : t.id)} />
+              ))
             )}
           </div>
         </div>

@@ -36,6 +36,11 @@ const BUS_TYPES = new Set([
   'ambient',
 ]);
 
+/** The orchestration's own events: task.*, agent.*, artifact.*, review.* --
+ *  published by the task manager and the agent registry, bus-only. */
+const BUS_PREFIXES = ['task.', 'agent.', 'artifact.', 'review.'];
+export const isBusType = (t: string) => BUS_TYPES.has(t) || BUS_PREFIXES.some((p) => t.startsWith(p));
+
 class Channel {
   private ws: WebSocket | null = null;
   private retry = 0;
@@ -138,7 +143,7 @@ export class NovaEventHub {
     };
     const status = () => this.statusListeners.forEach((l) => l());
     this.live = new Channel('/api/live/ws', 'live', () => true, emit, status);
-    const busAccepts = opts.liveSocket ? (t: string) => BUS_TYPES.has(t) : () => true;
+    const busAccepts = opts.liveSocket ? isBusType : () => true;
     this.bus = new Channel('/ws/events', 'bus', busAccepts, emit, status);
   }
 

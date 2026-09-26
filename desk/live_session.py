@@ -25,8 +25,10 @@ from typing import Any
 
 import numpy as np
 
+import agent_activity
 import nova_voice
 from desk.screen_share import ScreenShare, capture_once
+from task_manager import describe_step as _tool_action
 
 try:
     import sounddevice as sd
@@ -3390,6 +3392,10 @@ class LiveManager:
                 return await self._look(fc, args)
         t0 = time.time()
         budget = VISION_TIMEOUT_S if name == "vision" else TOOL_TIMEOUT_S
+        # The agent that owns this tool is working until it answers -- the
+        # Agents panel reads this, whichever path (voice, chat, task) ran it.
+        work = agent_activity.begin(agent_activity.agent_for_tool(name),
+                                    _tool_action(name, args), source="voice")
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(self._execute_tool, name, args),
@@ -3410,6 +3416,8 @@ class LiveManager:
         except Exception as e:
             result = f"Tool '{name}' encountered an error: {str(e)[:200]}"
             _log("[LIVE] tool %s failed: %s", name, e)
+        finally:
+            agent_activity.end(work)
         _log("[LIVE] tool %s finished in %.1fs", name, time.time() - t0)
         self._publish(LiveEvent("tool_result", tool=name,
                                 summary=str(result)[:200]))

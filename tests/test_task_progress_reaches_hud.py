@@ -60,9 +60,20 @@ def test_a_manager_restarted_mid_task_can_still_list_it(tmp_path):
     assert "Research" in second.exec_command("list")
 
 
-def test_time_based_progress_never_claims_completion_early():
-    assert 45 <= _running(100, 50).progress_percent() <= 55
-    assert _running(10, 500).progress_percent() == 95
+def test_progress_is_counted_not_guessed():
+    """Progress used to run off the clock against NOVA's spoken estimate: a
+    bar filling at the rate of a guess, parked at 95% on a stalled task. It is
+    now the share of planned steps that have finished. The estimate is still
+    reported, as her figure counted down, never as progress."""
+    t = _running(100, 50)
+    assert t.progress_percent() == 0, "nothing has finished, whatever the clock says"
+    t.steps.append(TaskStep(tool="web_search", args={}))
+    t.steps[0].status = "VERIFIED"
+    assert t.progress_percent() == 50
+    t.steps[1].status = "VERIFIED"
+    assert t.progress_percent() == 99, "only a COMPLETED task is 100"
+    t.status = "COMPLETED"
+    assert t.progress_percent() == 100
     assert _running(10, 500).seconds_remaining() == 0.0
 
 
@@ -110,7 +121,7 @@ def test_the_hud_snapshot_carries_id_progress_and_countdown(monkeypatch, tmp_pat
     [entry] = _get(monkeypatch, manager, "/api/system")["tasks"]
     assert entry["id"] == task.id
     assert entry["status"] == "RUNNING"
-    assert 45 <= entry["progress"] <= 55
+    assert entry["progress"] == 0 and entry["steps_done"] == 0 and entry["steps"] == 1
     assert 45 <= entry["seconds_remaining"] <= 55
 
 
@@ -118,7 +129,7 @@ def test_the_task_list_endpoint_returns_computed_progress(monkeypatch, tmp_path)
     manager, _ = _running_in_manager(tmp_path)
 
     [entry] = _get(monkeypatch, manager, "/api/tasks")["tasks"]
-    assert 45 <= entry["progress"] <= 55
+    assert entry["progress"] == 0 and entry["steps_total"] == 1
     assert entry["seconds_remaining"] is not None
 
 

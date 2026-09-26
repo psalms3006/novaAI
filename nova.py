@@ -1200,9 +1200,13 @@ TOOL_DECLARATIONS = [
             '{"query": "significant AI developments this month"}}, '
             '{"tool": "web_search", "args": {"query": "AI research papers '
             'this month"}}, {"tool": "generate_document", "args": '
-            '{"title": "AI developments", "content": "..."}}]}}. '
+            '{"title": "AI developments", "format": "docx"}}]}}. '
             "Steps may name any tool you can call directly, such as "
             "'web_search', 'file_processor' or 'generate_document'. "
+            "Leave out the 'content' of a document step that should hold what "
+            "the searches before it find: it is written from their findings. "
+            "You may also give just a title and no steps; the task is then "
+            "planned for you. "
             "The user is told when the task finishes, so do not promise to "
             "report back yourself. If you tell the user roughly how long it "
             "will take, pass the same figure in seconds as "
@@ -1768,6 +1772,27 @@ def _execute_file_processor(args: dict) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _execute_tool_sync(tool_name: str, args: dict, meta: dict) -> str:
+    # ── One user of the desktop / browser at a time ──────────────────────────
+    # The voice session and up to three background tasks all dispatch here.
+    # Two of them moving the mouse or typing into the same window at once
+    # would ruin both. Re-entrant: a task step already holding the lock
+    # passes straight through.
+    try:
+        import agent_activity as _aa
+        _res = _aa.resource_for_tool(tool_name)
+    except ImportError:
+        _res = ""
+    if _res and not (isinstance(meta, dict) and meta.get("_holding") == _res):
+        _rl = _aa.resource_lock(_res)
+        if not _rl.acquire(timeout=20):
+            return (f"The {_res} is being used by a background task right now, so "
+                    f"'{tool_name}' did not run. Tell the user, and try again when "
+                    f"that task finishes.")
+        try:
+            return _execute_tool_sync(tool_name, args, {**(meta or {}), "_holding": _res})
+        finally:
+            _rl.release()
+
     print(f"🔧 Tool: {tool_name}({json.dumps(args, ensure_ascii=False)[:120]})")
 
     # ── Authorisation: may this caller use this tool at all? ─────────────────
@@ -2311,6 +2336,23 @@ def _start_ambient_intelligence(meta: dict):
                     log.debug("[TASK] could not publish activity", exc_info=True)
 
             nova_state._task_manager.set_on_activity(_task_activity)
+
+            def _task_event(ev: dict) -> None:
+                """task.*, agent.*, artifact.*, review.* -- for the window
+                only. None of it is spoken: a finished task is announced
+                once, through the proactive agent above."""
+                try:
+                    import desk.bridge as _br
+                    _br.publish_event(ev)
+                except Exception:
+                    log.debug("[TASK] could not publish %s", ev.get("type"), exc_info=True)
+
+            nova_state._task_manager.set_on_event(_task_event)
+            try:
+                import agent_activity as _aa
+                _aa.set_observer(_task_event)
+            except ImportError:
+                pass
             log.info("[DESK] task notices routed through the proactive agent")
     except Exception as e:
         log.warning("Task notification wiring failed: %s", e)

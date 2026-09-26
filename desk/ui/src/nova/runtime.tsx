@@ -29,18 +29,47 @@ export interface SystemAgent {
   id: string;
   label: string;
   role: string;
-  state: 'standby' | 'active';
+  /** 'running' exactly while real work this agent owns is open (agent_activity.py). */
+  state: 'standby' | 'running';
   action?: string;
   task_id?: string;
+  since?: number | null;
+  /** How many pieces of work it has open. */
+  busy?: number;
+}
+
+export interface TaskMessage {
+  id: string;
+  ts: number;
+  from: string;
+  to: string;
+  kind: 'assign' | 'result' | 'failure' | 'handoff' | 'review_feedback' | string;
+  text: string;
+  step: number;
 }
 
 export interface SystemTask {
   id: string;
   title: string;
   status: string;
+  /** What is happening now, in words. Empty once the task has stopped. */
+  phase?: string;
   steps: number;
+  steps_done?: number;
+  /** Steps finished out of steps planned, 0-100. Counted, never estimated. */
   progress?: number;
+  /** NOVA's own spoken estimate counted down -- shown as hers, never as progress. */
   seconds_remaining?: number | null;
+  estimated_duration_s?: number;
+  elapsed_s?: number;
+  current?: string;
+  next?: string;
+  agents?: string[];
+  reason?: string;
+  artifacts?: string[];
+  messages?: TaskMessage[];
+  review?: { round: number; passed: boolean; issues: string[] } | null;
+  updated?: number;
 }
 
 export interface SystemSnapshot {
@@ -209,6 +238,10 @@ interface Runtime {
   conversationId: string;
   halt: () => Promise<void>;
   decide: (id: string, yes: boolean) => Promise<void>;
+  /** Stop a background task at its next step. */
+  cancelTask: (id: string) => Promise<void>;
+  /** Run a stopped task again, as a new task. */
+  retryTask: (id: string) => Promise<void>;
   refreshStatus: () => Promise<void>;
   clearActivity: () => void;
 }
@@ -242,6 +275,9 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
   const [chatBusy, setChatBusy] = useState(false);
   const conversationId = useRef('');
   const failures = useRef(0);
+  // Task and agent events ask for a fresh snapshot instead of waiting for the
+  // next poll, so a step starting shows now, not up to 2.5 s later.
+  const pokeSystem = useRef<() => void>(() => {});
   // Voice watchdog: /api/live/start answers when a thread spawns, which
   // proves nothing. If the session never reports itself up, say so rather
   // than showing "Connecting" forever.
@@ -388,6 +424,50 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
         case 'task_activity':
           setTaskBusy(Boolean(ev.busy));
           break;
+        case 'task.created':
+          log('task', `Queued: ${String((ev.task as { title?: string })?.title || '')}`);
+          pokeSystem.current();
+          break;
+        case 'task.planned':
+          log('task', `Planned — ${String(ev.detail || '')}`);
+          pokeSystem.current();
+          break;
+        case 'task.waiting':
+          log('task', String(ev.detail || 'Waiting for a shared resource'));
+          pokeSystem.current();
+          break;
+        case 'task.completed':
+        case 'task.failed':
+        case 'task.finished':
+        case 'task.cancelled': {
+          const title = String((ev.task as { title?: string })?.title || 'Task');
+          const word = ev.type === 'task.completed' ? 'Completed' : ev.type === 'task.cancelled' ? 'Cancelled' : 'Stopped';
+          log(ev.type === 'task.failed' ? 'error' : 'task', `${word}: ${title}${ev.type !== 'task.completed' && ev.detail ? ` — ${String(ev.detail)}` : ''}`);
+          pokeSystem.current();
+          break;
+        }
+        case 'agent.message': {
+          // Only the hand-offs worth reading; assignments and results are
+          // already visible as the task's own steps.
+          const m = ev.message as { kind?: string; from?: string; to?: string; text?: string } | undefined;
+          if (m && (m.kind === 'handoff' || m.kind === 'review_feedback')) {
+            log('agent', `${String(m.from).toUpperCase()} → ${String(m.to).toUpperCase()}: ${String(m.text || '')}`);
+          }
+          pokeSystem.current();
+          break;
+        }
+        case 'review.completed':
+          log('task', `Review: ${String(ev.detail || '')}`);
+          pokeSystem.current();
+          break;
+        case 'task.step':
+        case 'task.progress':
+        case 'task.status':
+        case 'task.started':
+        case 'artifact.created':
+        case 'agent.state':
+          pokeSystem.current();
+          break;
         case 'vision_capture':
           log('vision', 'Looking at the screen');
           break;
@@ -450,6 +530,14 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
         /* next tick */
       }
     };
+    let poked: ReturnType<typeof setTimeout> | null = null;
+    pokeSystem.current = () => {
+      if (poked) return;
+      poked = setTimeout(() => {
+        poked = null;
+        pollSystem();
+      }, 200);
+    };
     pollSystem();
     refreshStatus();
     const a = setInterval(pollSystem, ambient ? 5000 : 2500);
@@ -465,6 +553,8 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
     }
     return () => {
       alive = false;
+      if (poked) clearTimeout(poked);
+      pokeSystem.current = () => {};
       clearInterval(a);
       clearInterval(b);
       if (c) clearInterval(c);
@@ -673,6 +763,22 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
     log('system', 'Stopped speaking and replying; microphone muted');
   }, [interrupt, stopReply, setMuted, voiceRunning, log]);
 
+  const taskAction = useCallback(
+    async (id: string, action: 'cancel' | 'retry') => {
+      try {
+        const j = await postJSON<{ ok: boolean; error?: string; task_id?: string }>(`/api/tasks/${encodeURIComponent(id)}/${action}`, {});
+        if (!j.ok) log('error', j.error || `Could not ${action} the task`);
+        else log('task', action === 'cancel' ? 'Stopping the task after its current step' : `Retrying as ${j.task_id}`);
+      } catch (e) {
+        log('error', `Could not ${action} the task: ${(e as Error).message}`);
+      }
+      pokeSystem.current();
+    },
+    [log],
+  );
+  const cancelTask = useCallback((id: string) => taskAction(id, 'cancel'), [taskAction]);
+  const retryTask = useCallback((id: string) => taskAction(id, 'retry'), [taskAction]);
+
   const decide = useCallback(
     async (id: string, yes: boolean) => {
       setPendingConfirm(null);
@@ -764,6 +870,8 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
     conversationId: conversationId.current,
     halt,
     decide,
+    cancelTask,
+    retryTask,
     refreshStatus,
     clearActivity: () => setActivity([]),
   };
