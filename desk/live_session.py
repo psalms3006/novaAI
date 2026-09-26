@@ -609,6 +609,21 @@ class ReconnectRequested(Exception):
     """
 
 
+def _duration_s(value: Any) -> float | None:
+    """Seconds in a protobuf Duration, as the SDK may give it: timedelta, number or "50s"."""
+    if value is None:
+        return None
+    try:
+        if hasattr(value, "total_seconds"):
+            return float(value.total_seconds())
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip().lower()
+        return float(text[:-1]) if text.endswith("s") else float(text)
+    except (TypeError, ValueError):
+        return None
+
+
 def _is_requested_reconnect(e: BaseException) -> bool:
     if isinstance(e, ReconnectRequested):
         return True
@@ -1169,6 +1184,13 @@ class LiveManager:
         #: Set to tear the current connection down and open a new one.
         self._drop_event: asyncio.Event | None = None
         self._drop_reason = ""
+        #: Session resumption. Gemini ends every Live connection after a few
+        #: minutes (GoAway, then a hard 1008 close). The newest resumable
+        #: handle lets the next connection continue the same conversation
+        #: instead of starting a stranger with no memory of it.
+        self._resume_handle: str | None = None
+        #: Set by GoAway: reconnect at the next quiet moment, before this.
+        self._go_away_deadline: float | None = None
         #: Tool calls running beside the receiver, and ones Gemini withdrew.
         self._tool_tasks: set = set()
         self._cancelled_tool_ids: set = set()
@@ -2308,6 +2330,41 @@ class LiveManager:
         except RuntimeError:
             return False
 
+    #: Reconnect this long before GoAway's deadline even if a turn is still going.
+    GO_AWAY_MARGIN_S = 3.0
+
+    def _on_go_away(self, go_away: Any) -> None:
+        """Gemini will close this connection soon: plan a graceful swap."""
+        left = _duration_s(getattr(go_away, "time_left", None))
+        if left is None:
+            left = 10.0
+        self._go_away_deadline = time.monotonic() + max(0.5, left - self.GO_AWAY_MARGIN_S)
+        _log("[LIVE] GoAway: connection ends in %.1fs; reconnecting at the next quiet moment%s",
+             left, " (resumable)" if self._resume_handle else "")
+        self._publish(LiveEvent("go_away", time_left_s=round(left, 1)))
+
+    def _quiet(self) -> bool:
+        """Nothing would be cut off by swapping the connection now."""
+        return not self._tool_tasks and not self.speaking
+
+    async def _go_away_watch(self) -> None:
+        """After GoAway, swap connections between turns -- never mid-tool if avoidable."""
+        while True:
+            await asyncio.sleep(0.25)
+            deadline = self._go_away_deadline
+            if deadline is None:
+                continue
+            now = time.monotonic()
+            if self._quiet():
+                self._request_reconnect("GoAway: session time limit; resuming on a new connection")
+                return
+            if now >= deadline:
+                if self._tool_tasks:
+                    _log("[LIVE] GoAway deadline reached with %d tool call(s) running; their results may not reach the model",
+                         len(self._tool_tasks))
+                self._request_reconnect("GoAway deadline")
+                return
+
     async def _drop_watch(self) -> None:
         """Ends the session's TaskGroup when a reconnect is requested."""
         await self._drop_event.wait()
@@ -2530,6 +2587,11 @@ class LiveManager:
                 # the one already made above, so a normal start costs nothing.
                 if consecutive_failures or self._offline:
                     client = _new_client()
+                # Resume the conversation the last connection was having.
+                config.session_resumption = gtypes.SessionResumptionConfig(handle=self._resume_handle)
+                if self._resume_handle:
+                    _log("[LIVE] resuming the previous session")
+                self._go_away_deadline = None
                 async with (client.aio.live.connect(model=self._model, config=config) as session,
                             asyncio.TaskGroup() as tg):
                     self._session = session
@@ -2585,6 +2647,7 @@ class LiveManager:
                     self._cancelled_tool_ids.clear()
                     self._drop_event = asyncio.Event()
                     tg.create_task(self._drop_watch())
+                    tg.create_task(self._go_away_watch())
 
                     # Consumers before producers.
                     #
@@ -2915,6 +2978,18 @@ class LiveManager:
                 async for msg in session.receive():
                     got_turn = True
 
+                    # Checked first: neither carries server_content, and the
+                    # `if sc is None: continue` below used to skip them both.
+                    # GoAway went unanswered until Gemini closed the socket
+                    # itself (1008), mid-sentence or mid-tool -- a finished
+                    # browser_control result was lost that way -- and every
+                    # reconnect began a new session with no memory.
+                    upd = getattr(msg, "session_resumption_update", None)
+                    if upd is not None and getattr(upd, "resumable", False)                             and getattr(upd, "new_handle", None):
+                        self._resume_handle = upd.new_handle
+                    if getattr(msg, "go_away", None) is not None:
+                        self._on_go_away(msg.go_away)
+
                     if msg.tool_call and msg.tool_call.function_calls:
                         # Answer it, or the model simply stops.
                         #
@@ -3021,9 +3096,6 @@ class LiveManager:
                                 target=_remember_turn, args=(turn_user, turn_nova),
                                 name="nova-memory", daemon=True).start()
 
-                    if msg.go_away:
-                        self._publish(LiveEvent("go_away"))
-                        raise ConnectionError("gemini live go_away")
 
                 if not got_turn:
                     # receive() ended without yielding anything: the socket
