@@ -209,6 +209,7 @@ export class VisualEngine {
   private hearingEndedAt = -10;
   private turnComplete = false;
   private toolsInFlight = 0;
+  private lastEventAt = 0;
   private kind: ToolKind = 'other';
   private toolLabel = '';
   private listeners = new Set<(s: VisualState) => void>();
@@ -247,6 +248,7 @@ export class VisualEngine {
 
   /** Real NOVA events -> what is happening. */
   interpret(ev: NovaEvent): void {
+    if (ev.type !== 'audio_level' && ev.type !== 'mic_level') this.lastEventAt = this.clock;
     switch (ev.type) {
       case 'state': {
         const s = String(ev.state || '');
@@ -317,6 +319,12 @@ export class VisualEngine {
       case 'task_done':
         this.impulse(ev.ok === false ? 'error' : 'success');
         break;
+      case 'vision_failed':
+      case 'vision_refused':
+        // A look that never happened ends the vision call.
+        this.toolsInFlight = Math.max(0, this.toolsInFlight - 1);
+        if (this.toolsInFlight === 0) this.settle();
+        break;
       case 'vision_capture':
       case 'vision_captured':
       case 'vision_sent':
@@ -341,12 +349,19 @@ export class VisualEngine {
         break;
       }
       case 'interrupted':
+        // A cut-off turn takes its tool calls with it: the model withdraws
+        // them and no result ever arrives.
+        this.toolsInFlight = 0;
         this.impulse('ripple', { strength: 0.6 });
         this.novaAudioTarget = 0;
         this.go('LISTENING');
         break;
       case 'turn_complete':
+        // Voice tool calls are answered inside the turn; once it is over none
+        // is still running. Without this, one call the model withdrew (or a
+        // look that was refused) left the window saying "Working" for good.
         this.turnComplete = true;
+        this.toolsInFlight = 0;
         break;
       case 'playback_complete':
         if (this.state === 'SPEAKING') this.settle();
@@ -413,6 +428,11 @@ export class VisualEngine {
     } else if (this.state === 'SUCCESS' && inState > 1.2) {
       this.settle();
     } else if (this.state === 'ERROR' && inState > 3.0) {
+      this.settle();
+    } else if (this.toolsInFlight > 0 && this.clock - this.lastEventAt > 45) {
+      // Nothing has happened for 45 s: whatever was in flight is not coming
+      // back. Stop claiming she is working on it.
+      this.toolsInFlight = 0;
       this.settle();
     } else if (this.state === 'THINKING' && inState > 25) {
       this.settle(); // nothing came back; do not sit "thinking" forever

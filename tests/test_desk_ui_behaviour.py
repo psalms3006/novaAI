@@ -130,6 +130,48 @@ def test_every_voice_state_the_backend_publishes_is_handled():
     assert not states - handled, f"voice states the window does not account for: {sorted(states - handled)}"
 
 
+def _engine_states(script: str) -> dict:
+    """Run the real visual engine (nova/visual.ts) under Node and report its state."""
+    path = (SRC / "nova" / "visual.ts").as_uri()
+    js = (f"const {{ VisualEngine }} = await import({json.dumps(path)});"
+          "const e = new VisualEngine(); const ev = (type, x = {}) => e.interpret({ source: 'live', type, ts: 0, ...x });"
+          "const run = (s) => { for (let i = 0; i < s * 10; i++) e.tick(0.1); return e.current; };"
+          "const out = {};" + script + "process.stdout.write(JSON.stringify(out));")
+    r = subprocess.run(["node", "--input-type=module", "-e", js], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout)
+
+
+BUSY = {"TOOL_SELECTION", "TOOL_EXECUTION", "VISION", "SEARCHING", "MEMORY_RETRIEVAL"}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runs the real visual engine")
+def test_a_refused_look_does_not_leave_her_working():
+    """Seen in the real app: a look refused as too soon after the last one
+    produced no tool_result, and the window said "Working" indefinitely."""
+    out = _engine_states("ev('state', {state:'ready'}); run(3);"
+                         "ev('tool_call', {tools:['vision']}); run(1); out.during = e.current;"
+                         "ev('vision_refused', {since_s: 3.5}); out.after = run(3);")
+    assert out["during"] in BUSY
+    assert out["after"] not in BUSY, out
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runs the real visual engine")
+def test_a_withdrawn_tool_call_ends_with_the_turn():
+    out = _engine_states("ev('state', {state:'ready'}); run(3);"
+                         "ev('tool_call', {tools:['vision']}); run(1);"
+                         "ev('interrupted'); ev('turn_complete'); out.after = run(4);")
+    assert out["after"] not in BUSY, out
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node runs the real visual engine")
+def test_a_tool_that_never_answers_stops_showing_as_work():
+    out = _engine_states("ev('state', {state:'ready'}); run(3);"
+                         "ev('tool_call', {tools:['web_search']}); out.soon = run(10); out.later = run(40);")
+    assert out["soon"] in BUSY, "a real tool call must show as work while it runs"
+    assert out["later"] not in BUSY, out
+
+
 # ── ambient ─────────────────────────────────────────────────────────────────
 
 def test_a_click_opens_the_full_window_and_a_drag_does_not():
