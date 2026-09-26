@@ -78,6 +78,23 @@ export const NavRail: React.FC = () => {
         )}
       </button>
 
+      {/* Library: conversations, documents, projects, files */}
+      <button
+        onClick={() => setCurrentScreen('library')}
+        className={`w-7 h-7 rounded-xl flex items-center justify-center transition-all relative group cursor-pointer ${
+          currentScreen === 'library' ? 'shadow-sm' : 'opacity-60 hover:opacity-100'
+        }`}
+        style={{
+          backgroundColor: currentScreen === 'library' ? theme.palette.bgElevated : 'transparent',
+          color: currentScreen === 'library' ? theme.palette.textPrimary : theme.palette.textSecondary,
+        }}
+        title="Library (4)"
+        aria-label="Library"
+      >
+        <i className="fa-solid fa-book-open text-xs" />
+        {currentScreen === 'library' && <span className="absolute -right-0.5 top-1 w-1 h-1 rounded-full" style={{ backgroundColor: theme.palette.accent }} />}
+      </button>
+
       {/* 3. System Architecture & Settings */}
       <button
         onClick={() => setCurrentScreen('runtime')}

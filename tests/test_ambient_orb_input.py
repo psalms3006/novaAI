@@ -18,9 +18,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+# The checks on the previous window (desk/static) that lived here moved to
+# tests/test_desk_ui_behaviour.py when the interface became desk/ui.
+
 ROOT = Path(__file__).resolve().parent.parent
 SHELL = (ROOT / "nova_desktop_app.py").read_text(encoding="utf-8")
-HUD = (ROOT / "desk" / "static" / "hud.js").read_text(encoding="utf-8")
 
 
 def _code(src: str) -> str:
@@ -44,8 +46,3 @@ def test_the_ambient_window_is_draggable_and_round():
     assert "CreateEllipticRgn" in code, "the orb is shaped by a circular clip"
 
 
-def test_a_click_opens_the_full_dashboard_and_a_drag_does_not():
-    handler = HUD[HUD.index('addEventListener("pointerup"'):]
-    handler = handler[:handler.index("});")]
-    assert "if (wasDrag) return" in handler, "a drag would also open the dashboard"
-    assert "/api/ambient" in handler and re.search(r'mode:\s*"full"', handler)

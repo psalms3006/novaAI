@@ -22,6 +22,9 @@ import time
 
 import pytest
 
+# The checks on the previous window (desk/static) that lived here moved to
+# tests/test_desk_ui_behaviour.py when the interface became desk/ui.
+
 
 def test_the_connectivity_probe_leaves_the_process_timeout_alone(monkeypatch):
     import nova
@@ -125,17 +128,6 @@ def test_the_hud_poll_reports_the_voice_state_the_session_published(running_brid
         assert body["voice"]["state"] == "speaking"
     finally:
         ws.close()
-
-
-def test_the_window_reconnects_its_voice_socket():
-    from pathlib import Path
-    app = (Path(__file__).resolve().parents[1] / "desk" / "static" / "app.js").read_text(
-        encoding="utf-8")
-    start = app.index("function liveConnect()")
-    body = app[start:app.index("\n}\n", start)]
-    assert "setTimeout(liveConnect" in body, (
-        "a dropped voice socket is never reopened, so one hiccup leaves the "
-        "window deaf to the session for the rest of the run")
 
 
 def test_the_hud_shows_the_voice_engine_and_its_latency(running_bridge, monkeypatch):

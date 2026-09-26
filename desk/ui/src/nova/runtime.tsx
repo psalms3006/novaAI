@@ -11,6 +11,7 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useR
 import { ApiError, getJSON, postJSON, streamChat } from './api';
 import { NovaEventHub, type NovaEvent } from './events';
 import { STATE_LABEL, VisualEngine, type VisualFrame, type VisualState } from './visual';
+import type { AuthStatus } from './onboarding';
 
 // ── backend shapes (desk/bridge.py) ──────────────────────────────────────────
 
@@ -66,7 +67,7 @@ export interface StatusSnapshot {
   local_intelligence: { available: boolean; ollama_running: boolean; model: string; installed: string[]; runtime_state: string };
   brain_ready: boolean;
   user: string;
-  auth?: { mode?: string; onboarded?: boolean; has_credential?: boolean };
+  auth?: AuthStatus;
   uptime: number;
   version: string;
 }
@@ -113,6 +114,7 @@ export type Phase =
   | 'speaking'
   | 'interrupted'
   | 'executing'
+  | 'looking' // reading the screen or the camera
   | 'researching'
   | 'awaiting-permission'
   | 'error';
@@ -125,11 +127,12 @@ export const PHASE_LABEL: Record<Phase, string> = {
   'voice-off': 'Voice is off',
   muted: 'Microphone muted',
   idle: 'Ready',
-  listening: 'Listening',
+  listening: 'Hearing you',
   thinking: 'Thinking',
   speaking: 'Speaking',
   interrupted: 'Interrupted',
   executing: 'Working',
+  looking: 'Looking at the screen',
   researching: 'Researching',
   'awaiting-permission': 'Waiting for your permission',
   error: 'Something went wrong',
@@ -137,6 +140,12 @@ export const PHASE_LABEL: Record<Phase, string> = {
 
 /** Live-session states in which a session exists (desk/live_session.py LiveState + UI states). */
 const VOICE_RUNNING = new Set(['connecting', 'connected', 'ready', 'streaming', 'listening', 'speaking', 'muted']);
+
+/** States that prove the session actually came up (not merely that a start was requested). */
+const VOICE_UP = new Set(['connected', 'ready', 'streaming', 'listening', 'speaking', 'muted']);
+
+/** How long a start may go without the session reporting itself up. */
+const VOICE_READY_TIMEOUT_MS = 20000;
 
 const TOOL_WORDS: Record<string, string> = {
   web_search: 'Searching the web',
@@ -194,6 +203,10 @@ interface Runtime {
   interrupt: () => Promise<void>;
   sendText: (text: string) => Promise<void>;
   stopReply: () => Promise<void>;
+  openConversation: (cid: string) => Promise<void>;
+  newConversation: () => void;
+  /** The conversation typed turns go to, or '' before the first one. */
+  conversationId: string;
   halt: () => Promise<void>;
   decide: (id: string, yes: boolean) => Promise<void>;
   refreshStatus: () => Promise<void>;
@@ -229,6 +242,11 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
   const [chatBusy, setChatBusy] = useState(false);
   const conversationId = useRef('');
   const failures = useRef(0);
+  // Voice watchdog: /api/live/start answers when a thread spawns, which
+  // proves nothing. If the session never reports itself up, say so rather
+  // than showing "Connecting" forever.
+  const voiceStateRef = useRef('connecting');
+  const readyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const log = useCallback((kind: ActivityKind, text: string) => {
     if (!text) return;
@@ -283,7 +301,9 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
       if (!st) return;
       const muted = Boolean(s.mic?.muted);
       setMutedState(muted);
-      setVoiceState(muted && st !== 'closed' && st !== 'idle' ? 'muted' : st === 'idle' ? 'closed' : st);
+      const next = muted && st !== 'closed' && st !== 'idle' ? 'muted' : st === 'idle' ? 'closed' : st;
+      setVoiceState(next);
+      voiceStateRef.current = next;
       if (st === 'error' || st === 'closed' || st === 'idle') engine.interpret({ source: 'live', type: 'state', state: st, ts: Date.now() / 1000 });
     } catch {
       /* the next event will tell us */
@@ -315,6 +335,11 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
         case 'state': {
           const s = String(ev.state || '');
           setVoiceState(s);
+          voiceStateRef.current = s;
+          if (VOICE_UP.has(s) && readyTimer.current) {
+            clearTimeout(readyTimer.current);
+            readyTimer.current = null;
+          }
           if (s === 'muted') setMutedState(true);
           else if (s === 'listening' || s === 'ready' || s === 'connected') setMutedState(false);
           if (s === 'error') {
@@ -382,6 +407,7 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
     });
     hub.start();
     return () => {
+      if (readyTimer.current) clearTimeout(readyTimer.current);
       off();
       offState();
       offStatus();
@@ -457,6 +483,19 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
       } else if (j.message === 'already running') {
         // No state event follows for a session that is already up.
         await syncVoice();
+      } else {
+        if (readyTimer.current) clearTimeout(readyTimer.current);
+        readyTimer.current = setTimeout(async () => {
+          readyTimer.current = null;
+          await syncVoice();
+          if (!VOICE_UP.has(voiceStateRef.current)) {
+            const why = 'Voice did not come up. Check your key in Settings → Account & Access, and the microphone in Voice Session.';
+            setVoiceError(why);
+            setVoiceState('error');
+            voiceStateRef.current = 'error';
+            log('error', why);
+          }
+        }, VOICE_READY_TIMEOUT_MS);
       }
     } catch (e) {
       log('error', `Voice could not start: ${(e as Error).message}`);
@@ -590,6 +629,30 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
     [hub, engine, voiceRunning, voiceState, speak, settleTurns, log],
   );
 
+  /**
+   * Pick up a saved conversation: its messages become the transcript, and
+   * what the user types next continues it (the text model gets its history).
+   */
+  const openConversation = useCallback(
+    async (cid: string) => {
+      const c = await getJSON<{ id: string; messages: { role: string; content: string; ts: number }[] }>(`/api/conversations/${encodeURIComponent(cid)}`, 15000);
+      conversationId.current = c.id;
+      setTurns(
+        (c.messages || [])
+          .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content)
+          .slice(-60)
+          .map((m) => ({ id: ++seq, role: m.role === 'user' ? ('user' as const) : ('nova' as const), text: m.content, live: false, at: (m.ts || 0) * 1000 })),
+      );
+    },
+    [],
+  );
+
+  /** Start afresh: the next typed message opens a new conversation. */
+  const newConversation = useCallback(() => {
+    conversationId.current = '';
+    setTurns([]);
+  }, []);
+
   const stopReply = useCallback(async () => {
     if (!conversationId.current) return;
     try {
@@ -648,9 +711,10 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
         return 'listening';
       case 'SEARCHING':
         return 'researching';
+      case 'VISION':
+        return 'looking';
       case 'TOOL_SELECTION':
       case 'TOOL_EXECUTION':
-      case 'VISION':
         return 'executing';
       case 'UNDERSTANDING':
       case 'THINKING':
@@ -695,6 +759,9 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
     interrupt,
     sendText,
     stopReply,
+    openConversation,
+    newConversation,
+    conversationId: conversationId.current,
     halt,
     decide,
     refreshStatus,

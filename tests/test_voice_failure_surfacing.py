@@ -109,49 +109,38 @@ class TestActionableMessage:
 
 class TestInterfaceHonesty:
     @pytest.fixture(scope="class")
-    def app_js(self):
-        return (ROOT / "desk" / "static" / "app.js").read_text(encoding="utf-8")
+    def runtime(self):
+        return (ROOT / "desk" / "ui" / "src" / "nova" / "runtime.tsx").read_text(encoding="utf-8")
 
-    def test_start_does_not_assert_listening(self, app_js):
+    def test_start_does_not_assert_listening(self, runtime):
         """/api/live/start returns when a thread spawns, which proves nothing.
 
         This is the line that made a dead session look like a live one.
         """
-        block = app_js.split("const liveOk = await liveStart();", 1)[1][:700]
-        assert 'setOrb("listening")' not in block, \
-            "the orb must not claim 'listening' before the backend confirms it"
-        assert "watchForVoiceReady" in block, \
+        start = runtime.split("const startVoice = useCallback", 1)[1].split("const stopVoice", 1)[0]
+        for claimed in ("'listening'", "'ready'", "'connected'"):
+            assert f"setVoiceState({claimed})" not in start, \
+                "the window must not claim the session is up before the backend says so"
+        assert "VOICE_READY_TIMEOUT_MS" in start, \
             "a session that never reports ready must time out visibly"
 
-    def test_backend_state_still_drives_the_orb(self, app_js):
+    def test_backend_state_still_drives_the_orb(self, runtime):
         """Fixing the above must not disconnect the real state events."""
-        handler = app_js.split("function handleLiveEvent", 1)[1]
-        assert 'ev.state === "listening"' in handler
-        assert 'setOrb("listening")' in handler, \
-            "a genuinely connected session must still show 'listening'"
+        handler = runtime.split("case 'state': {", 1)[1][:600]
+        assert "setVoiceState(s)" in handler, "the backend's own state must reach the window"
 
-    def test_error_state_reaches_the_transcript(self, app_js):
-        handler = app_js.split("function handleLiveEvent", 1)[1]
-        err = handler.split('ev.state === "error"', 1)[1][:800]
-        assert "addTranscript_nova" in err, \
+    def test_error_state_is_said_not_just_coloured(self, runtime):
+        handler = runtime.split("case 'state': {", 1)[1][:1400]
+        err = handler.split("if (s === 'error')", 1)[1][:400]
+        assert "ev.message" in err and "setVoiceError" in err, \
             "a fatal voice error must be said, not just coloured red"
-        assert "ev.message" in err
+        assert "phase === 'error' && voiceError ? voiceError" in runtime, \
+            "the error text must reach what the window shows"
 
-    def test_transcript_helper_exists(self, app_js):
-        """Guard against calling a function that does not exist.
-
-        An earlier revision called addMessage(), which is not defined in this
-        file -- the error handler would itself have thrown, hiding the very
-        failure it was added to report.
-        """
-        assert re.search(r"function addTranscript_nova\s*\(", app_js)
-        assert re.search(r"function addTranscript\s*\(", app_js), \
-            "addTranscript_nova delegates to addTranscript, which must exist"
-
-    def test_ready_watchdog_is_cleared_on_success(self, app_js):
-        handler = app_js.split("function handleLiveEvent", 1)[1][:900]
-        assert "voiceReadyConfirmed = true" in handler
-        assert "clearTimeout(state.voiceReadyTimer)" in handler, \
+    def test_ready_watchdog_is_cleared_on_success(self, runtime):
+        handler = runtime.split("case 'state': {", 1)[1][:700]
+        assert "VOICE_UP.has(s) && readyTimer.current" in handler
+        assert "clearTimeout(readyTimer.current)" in handler, \
             "a healthy session must cancel the watchdog or it fires anyway"
 
 

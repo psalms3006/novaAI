@@ -17,10 +17,12 @@ import re
 import sys
 from pathlib import Path
 
+# The checks on the previous window (desk/static) that lived here moved to
+# tests/test_desk_ui_behaviour.py when the interface became desk/ui.
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 ROOT = Path(__file__).resolve().parent.parent
-APP_JS = (ROOT / "desk" / "static" / "app.js").read_text(encoding="utf-8")
 
 
 def test_there_is_one_live_manager_for_the_process():
@@ -36,48 +38,6 @@ def test_the_ambient_window_is_the_same_page_not_another_app():
     desktop = (ROOT / "nova_desktop_app.py").read_text(encoding="utf-8")
     assert "?mode=ambient" in desktop, (
         "the ambient orb is no longer a view of the same interface")
-
-
-def test_playback_is_owned_by_the_backend_not_the_windows():
-    """Two surfaces playing the same PCM is the same audio twice."""
-    assert 'case "audio":' in APP_JS
-    audio_case = APP_JS.split('case "audio":')[1].split("break;")[0]
-    assert "playAudioChunk" not in audio_case, (
-        "a browser surface plays audio again; with the full window and the "
-        "ambient orb both open that is NOVA speaking twice")
-
-
-def test_no_window_stops_the_session_when_it_is_hidden_or_closed():
-    """Switching modes hides a window. Hiding must not end the conversation."""
-    for event in ("beforeunload", "pagehide", "visibilitychange", "unload"):
-        assert event not in APP_JS, (
-            f"a {event} handler exists; switching modes or minimising would "
-            "tear down the shared voice session")
-
-
-def test_the_session_is_only_stopped_by_a_deliberate_act():
-    """Stopping ends voice for *every* surface, so it must be explicit.
-
-    Detaching a single surface is a different act with its own function.
-    Conflating the two means one window failing to start voice tears down a
-    conversation happening in another.
-    """
-    calls = [m for m in re.finditer(r"^\s*(?:await\s+)?liveDisconnect\(\)",
-                                    APP_JS, re.MULTILINE)]
-    assert calls, "liveDisconnect is gone; check this test still means anything"
-    for m in calls:
-        window = APP_JS[max(0, m.start() - 400):m.start()]
-        assert "addEventListener" in window and "click" in window, (
-            "liveDisconnect is called from something other than a user "
-            "action; mode switching or a failed start must not reach it")
-
-
-def test_a_failed_start_detaches_without_ending_the_conversation():
-    assert "function liveDetach" in APP_JS, "no way to leave without stopping"
-    body = APP_JS[APP_JS.index("async function liveStart"):]
-    body = body[:body.index("\n}")]
-    assert "liveDetach()" in body
-    assert "liveDisconnect()" not in body
 
 
 def test_screen_awareness_uses_the_conversation_already_in_progress():
@@ -108,8 +68,3 @@ def test_every_surface_sees_the_same_state():
     assert "for q in subs" in src
 
 
-def test_the_microphone_is_opened_once_by_the_backend():
-    """Browser-side capture would mean one microphone per open window."""
-    assert "getUserMedia" not in APP_JS, (
-        "a surface captures the microphone itself; two windows would mean two "
-        "microphones feeding one conversation")

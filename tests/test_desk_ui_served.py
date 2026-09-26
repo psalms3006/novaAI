@@ -39,6 +39,20 @@ def test_root_serves_the_new_ui_with_this_runs_token(client):
     assert r.headers.get("Cache-Control") == "no-store"
 
 
+def test_a_missing_build_says_so_instead_of_crashing(client, monkeypatch, tmp_path):
+    c, bridge = client
+    monkeypatch.setattr(bridge, "UI_INDEX", tmp_path / "nope" / "index.html")
+    r = c.get("/")
+    assert r.status_code == 503
+    assert "not built" in r.get_data(as_text=True)
+
+
+def test_the_old_interface_is_gone():
+    """One interface: nothing may route a window back to the retired desk/static page."""
+    static = ROOT / "desk" / "static"
+    assert sorted(p.name for p in static.iterdir()) == ["ui"], "files other than the desk/ui build in desk/static"
+
+
 def test_ambient_mode_is_the_same_page(client):
     c, _ = client
     assert '<div id="root"></div>' in c.get("/?mode=ambient").get_data(as_text=True)

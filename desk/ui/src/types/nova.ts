@@ -1,4 +1,4 @@
-export type ScreenMode = 'substrate' | 'runtime' | 'synaptic';
+export type ScreenMode = 'substrate' | 'runtime' | 'synaptic' | 'library';
 
 export type PresenceType = 'orb' | 'humanoid';
 

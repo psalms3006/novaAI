@@ -17,6 +17,7 @@ export function phaseColor(phase: Phase, accent: string): string {
     case 'listening':
     case 'speaking':
     case 'executing':
+    case 'looking':
     case 'researching':
       return '#10b981';
     default:
@@ -24,7 +25,7 @@ export function phaseColor(phase: Phase, accent: string): string {
   }
 }
 
-const ACTIVE: Phase[] = ['listening', 'speaking', 'thinking', 'executing', 'researching', 'connecting', 'recovering'];
+const ACTIVE: Phase[] = ['listening', 'speaking', 'thinking', 'executing', 'looking', 'researching', 'connecting', 'recovering'];
 
 export const TopHud: React.FC = () => {
   const { currentScreen, theme, setThemeModalOpen, prefs } = useNova();
@@ -109,6 +110,7 @@ export const TopHud: React.FC = () => {
           {currentScreen === 'substrate' && 'Presence'}
           {currentScreen === 'runtime' && 'Settings'}
           {currentScreen === 'synaptic' && 'Memory map'}
+          {currentScreen === 'library' && 'Library'}
         </span>
       </div>
 

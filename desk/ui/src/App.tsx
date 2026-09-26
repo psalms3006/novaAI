@@ -11,9 +11,12 @@ import { ThemeSelectorModal } from './components/ThemeSelectorModal';
 import { NotificationToasts } from './components/NotificationToasts';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { AmbientView } from './components/AmbientView';
+import { Onboarding } from './components/Onboarding';
+import { AccountGate } from './components/AccountGate';
 import { PresenceScreen } from './screens/PresenceScreen';
 import { SettingsScreen } from './screens/settings/SettingsScreen';
 import { SynapticMapScreen } from './screens/SynapticMapScreen';
+import { LibraryScreen } from './screens/LibraryScreen';
 
 /** The desktop launcher opens a second, 44 px window at /?mode=ambient. */
 const AMBIENT = new URLSearchParams(window.location.search).get('mode') === 'ambient';
@@ -28,7 +31,7 @@ function AppContent() {
   const { currentScreen, setCurrentScreen, theme, setCommandPaletteOpen, commandPaletteOpen, themeModalOpen } = useNova();
   const rt = useRuntime();
 
-  // Keyboard: Ctrl+K commands · 1/2/3 screens · Ctrl+, settings ·
+  // Keyboard: Ctrl+K commands · 1/2/3/4 screens · Ctrl+, settings ·
   // Space microphone (start voice, or mute/unmute) · Esc interrupt her.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -49,6 +52,7 @@ function AppContent() {
       } else if (e.key === '1') setCurrentScreen('substrate');
       else if (e.key === '2') setCurrentScreen('synaptic');
       else if (e.key === '3') setCurrentScreen('runtime');
+      else if (e.key === '4') setCurrentScreen('library');
       else if (e.code === 'Space' && !e.repeat && rt.backendReachable) {
         e.preventDefault();
         if (rt.voiceRunning) rt.setMuted(!rt.muted);
@@ -97,6 +101,7 @@ function AppContent() {
         {currentScreen === 'substrate' && <PresenceScreen />}
         {currentScreen === 'runtime' && <SettingsScreen />}
         {currentScreen === 'synaptic' && <SynapticMapScreen />}
+        {currentScreen === 'library' && <LibraryScreen />}
         {currentScreen === 'substrate' && <VoicePill />}
       </main>
 
@@ -114,6 +119,8 @@ function AppContent() {
       <ThemeSelectorModal />
       <NotificationToasts />
       <ConfirmDialog />
+      <Onboarding />
+      <AccountGate />
     </div>
   );
 }

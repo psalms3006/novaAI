@@ -20,6 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from desk import creds
 
+# The checks on the previous window (desk/static) that lived here moved to
+# tests/test_desk_ui_behaviour.py when the interface became desk/ui.
+
 
 @pytest.fixture
 def clean_settings():
@@ -87,17 +90,3 @@ def test_an_environment_key_is_still_used_when_offline_was_not_chosen(
     assert status["has_credential"] is True
 
 
-def test_the_interface_cannot_reopen_the_screen_by_itself():
-    """Belt and braces: the client latches once a choice is made, so no amount
-    of status polling can put the first-run screen back."""
-    app_js = (Path(__file__).resolve().parent.parent
-              / "desk" / "static" / "app.js").read_text(encoding="utf-8")
-    close = app_js[app_js.index("function closeOnboarding"):]
-    close = close[:close.index("\n}")]
-    assert "onboardingDone = true" in close
-    assert "maybeShowOnboarding" not in close, (
-        "closing the first-run screen re-runs the check that opens it")
-
-    show = app_js[app_js.index("function maybeShowOnboarding"):]
-    show = show[:show.index("\n}")]
-    assert "state.onboardingDone" in show

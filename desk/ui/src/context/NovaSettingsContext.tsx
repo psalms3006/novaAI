@@ -39,6 +39,7 @@ export const SETTINGS_GROUPS: SettingsGroup[] = [
     sections: [
       { id: 'permissions', label: 'Permissions', icon: 'fa-shield-halved', description: 'What NOVA may do on her own, and stopping her', keywords: 'halt stop permission allow ask deny safety confirm' },
       { id: 'tools', label: 'Tools & Tasks', icon: 'fa-toolbox', description: 'Her tools, MCP connectors and background tasks', keywords: 'tools mcp tasks automation capabilities' },
+      { id: 'account', label: 'Account & Access', icon: 'fa-key', description: 'Your Gemini key, offline mode and NOVA Cloud account', keywords: 'key api gemini byok cloud sign in account offline devices' },
       { id: 'connections', label: 'Connections', icon: 'fa-plug', description: 'Network, sign-in mode and connected accounts', keywords: 'network gmail account integrations cloud byok offline knowledge' },
     ],
   },

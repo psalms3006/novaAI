@@ -212,6 +212,7 @@ export const SpatialCanvas: React.FC<SpatialCanvasProps> = ({ presenceType, them
       const error = p?.error ?? 0;
       const sleep = p?.sleep ?? 0;
       const offline = p?.offline ?? 0;
+      const vision = p?.vision ?? 0;
 
       const isOrb = presenceRef.current === 'orb';
       orbGroup.visible = isOrb;
@@ -219,15 +220,17 @@ export const SpatialCanvas: React.FC<SpatialCanvasProps> = ({ presenceType, them
 
       // Colour: the theme's particles, warmed toward the accent while she
       // works, and toward red on an error.
-      tint.copy(primary).lerp(accent, Math.min(1, think * 0.35 + tool * 0.5)).lerp(ERROR_COLOR, error * 0.6);
+      tint.copy(primary).lerp(accent, Math.min(1, think * 0.35 + tool * 0.5 + vision * 0.7)).lerp(ERROR_COLOR, error * 0.6);
 
       if (isOrb) {
         orbGroup.rotation.y = t * (0.06 + energy * 0.12 + think * 0.1) + mouse.x * 0.4;
         orbGroup.rotation.x = Math.sin(t * 0.08) * 0.08 + mouse.y * 0.3;
-        ring.rotation.z = t * (0.05 + tool * 0.3);
+        // Reading the screen: the ring tilts upright and sweeps, like a scan.
+        ring.rotation.z = t * (0.05 + tool * 0.3 + vision * 1.2);
+        ring.rotation.x = Math.PI * (0.42 - vision * 0.3);
         const ringScale = 1 - (p?.listenRings ?? 0) * 0.06 + (p?.speakRings ?? 0) * 0.08 * (0.5 + novaAudio);
         ring.scale.setScalar(ringScale);
-        ringMat.opacity = 0.1 + (p?.listenRings ?? 0) * 0.12 + (p?.speakRings ?? 0) * 0.1;
+        ringMat.opacity = 0.1 + (p?.listenRings ?? 0) * 0.12 + (p?.speakRings ?? 0) * 0.1 + vision * 0.35;
 
         const pulse = 1 + novaAudio * 0.22 + userAudio * 0.1 + Math.sin(t * 1.8) * 0.015 * motion;
         const amp = (0.5 + energy * 1.2 + think * 0.8 + novaAudio * 2.5) * motion + 0.05;

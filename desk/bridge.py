@@ -313,8 +313,15 @@ def index():
     Serves the same page for the main window and the ambient strip
     (`/?mode=ambient`); the page picks its layout from the query string.
     """
-    page = UI_INDEX if UI_INDEX.is_file() else STATIC_DIR / "index.html"
-    html = page.read_text(encoding="utf-8")
+    if not UI_INDEX.is_file():
+        # A source checkout that was never built, or a bundle missing its
+        # interface: say exactly that instead of a traceback or a blank window.
+        return Response(
+            "<!doctype html><title>NOVA</title><body style='font:14px sans-serif;"
+            "background:#0a0b10;color:#cbd5e1;padding:40px'><h2>NOVA's interface is not built</h2>"
+            "<p>Run <code>npm install</code> and <code>npm run build</code> in <code>desk/ui</code>, "
+            "then restart NOVA.</p></body>", status=503, mimetype="text/html")
+    html = UI_INDEX.read_text(encoding="utf-8")
     html = html.replace("__DESK_TOKEN__", run_token)
     html = html.replace("__DESK_VERSION__", APP_VERSION)
     resp = Response(html, mimetype="text/html")

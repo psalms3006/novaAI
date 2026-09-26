@@ -1,45 +1,38 @@
 """Every asset the desktop UI references must exist on disk.
 
-The vendored three.module.js (r174) imports ./three.core.js, which was never
-vendored alongside it. The import failed at load time, so the whole Three.js
-module — and with it the Mind Map view — was dead in both the dev app and the
-packaged build, with only a 404 in the server log to show for it.
+A vendored three.module.js once imported a ./three.core.js that was never
+vendored alongside it, so the Mind Map was dead in both the dev app and the
+packaged build with only a 404 in the server log to show for it. The window is
+now the desk/ui build in desk/static/ui; this checks what that build points at:
+the page's script and stylesheet, and every font and icon the stylesheet loads.
 """
 from __future__ import annotations
 
 import re
 from pathlib import Path
 
-import pytest
-
 STATIC = Path(__file__).resolve().parent.parent / "desk" / "static"
+UI = STATIC / "ui"
 
 
 def _referenced_assets() -> set[str]:
     refs: set[str] = set()
-
-    html = (STATIC / "index.html").read_text(encoding="utf-8", errors="replace")
-    refs |= {
-        r[len("/static/"):]
-        for r in re.findall(r'(?:src|href)="(/static/[^"]+)"', html)
-    }
-
-    for js in STATIC.rglob("*.js"):
-        txt = js.read_text(encoding="utf-8", errors="replace")
-        for spec in re.findall(r"""from\s+['"]([^'"]+)['"]""", txt):
-            if spec.startswith("."):
-                try:
-                    refs.add((js.parent / spec).resolve()
-                             .relative_to(STATIC.resolve()).as_posix())
-                except ValueError:
-                    pass
-            elif spec.startswith("/static/"):
-                refs.add(spec[len("/static/"):])
+    html = (UI / "index.html").read_text(encoding="utf-8", errors="replace")
+    refs |= {r[len("/static/"):] for r in re.findall(r'(?:src|href)="(/static/[^"]+)"', html)}
+    for css in UI.glob("assets/*.css"):
+        text = css.read_text(encoding="utf-8", errors="replace")
+        for url in re.findall(r"url\(\s*['\"]?([^'\")]+)['\"]?\s*\)", text):
+            if url.startswith("data:") or url.startswith("#"):
+                continue
+            if url.startswith("/static/"):
+                refs.add(url[len("/static/"):])
+            else:
+                refs.add((css.parent / url.split("?")[0].split("#")[0]).resolve().relative_to(STATIC.resolve()).as_posix())
     return refs
 
 
 def test_static_dir_exists():
-    assert STATIC.is_dir(), f"missing SPA directory: {STATIC}"
+    assert UI.is_dir(), f"missing interface build: {UI} (run `npm run build` in desk/ui)"
 
 
 def test_every_referenced_asset_exists():
@@ -48,15 +41,7 @@ def test_every_referenced_asset_exists():
 
 
 def test_at_least_some_references_were_found():
-    """Guards the test itself — a broken parser would pass vacuously."""
-    assert len(_referenced_assets()) >= 10
-
-
-def test_three_core_is_vendored_next_to_three_module():
-    """three.module.js is useless without its split-out core."""
-    three = STATIC / "vendor" / "three"
-    if not (three / "three.module.js").exists():
-        pytest.skip("three.js is not vendored in this checkout")
-    assert (three / "three.core.js").exists(), (
-        "three.module.js imports ./three.core.js — vendor it too"
-    )
+    """Guards the test itself -- a broken parser would pass vacuously."""
+    refs = _referenced_assets()
+    assert len(refs) >= 10, refs
+    assert any(r.endswith(".js") for r in refs) and any(r.endswith(".woff2") for r in refs)

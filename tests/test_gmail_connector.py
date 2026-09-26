@@ -271,16 +271,11 @@ def test_gmail_can_be_connected_from_the_app_not_only_a_script():
     )
     assert "/api/accounts" in bridge
 
-    app_js = io.open(root / "desk" / "static" / "app.js",
-                     encoding="utf-8").read()
-    assert "connections(host)" in app_js, "no Connections panel"
-    assert "account_changed" in app_js, (
+    # The window's Connect button and its account_changed handling are
+    # checked in tests/test_desk_ui_behaviour.py.
+    assert "account_changed" in bridge, (
         "consent finishes in a browser and the app never learns the outcome"
     )
-
-    html = io.open(root / "desk" / "static" / "index.html",
-                   encoding="utf-8").read()
-    assert 'data-tab="connections"' in html, "the panel has no tab to open it"
 
 
 def test_the_consent_flow_does_not_block_the_server():

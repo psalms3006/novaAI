@@ -10,6 +10,7 @@ export type SettingsSectionId =
   | 'permissions'
   | 'tools'
   | 'connections'
+  | 'account'
   | 'diagnostics'
   | 'about';
 

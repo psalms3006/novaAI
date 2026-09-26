@@ -30,24 +30,19 @@ from pathlib import Path
 
 import pytest
 
-APP_JS = Path(__file__).resolve().parents[1] / "desk" / "static" / "app.js"
+ONBOARDING = Path(__file__).resolve().parents[1] / "desk" / "ui" / "src" / "nova" / "onboarding.ts"
 
 pytestmark = pytest.mark.skipif(
-    shutil.which("node") is None, reason="node is needed to run app.js logic"
+    shutil.which("node") is None, reason="node is needed to run the onboarding module"
 )
 
 
 def _decide(status) -> bool:
-    """Run the real shouldShowOnboarding() from app.js under Node."""
-    source = APP_JS.read_text(encoding="utf-8", errors="replace")
-    start = source.index("function shouldShowOnboarding")
-    end = source.index("\n}", start) + 2
-    fn = source[start:end]
-
-    script = fn + f"\nprocess.stdout.write(JSON.stringify(" \
-                  f"shouldShowOnboarding({json.dumps(status)})));"
-    out = subprocess.run(["node", "-e", script], capture_output=True,
-                         text=True, timeout=60)
+    """Run the real shouldShowOnboarding() from desk/ui under Node (which runs TypeScript)."""
+    script = (f"const m = await import({json.dumps(ONBOARDING.as_uri())});"
+              f"process.stdout.write(JSON.stringify(m.shouldShowOnboarding({json.dumps(status)})));")
+    out = subprocess.run(["node", "--input-type=module", "-e", script],
+                         capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr
     return json.loads(out.stdout)
 
@@ -86,10 +81,7 @@ def test_a_failed_status_call_is_not_treated_as_a_new_user():
 
 def test_the_decision_is_pure_and_takes_no_dom():
     """It has to be callable without a browser, or it cannot be tested."""
-    source = APP_JS.read_text(encoding="utf-8", errors="replace")
-    start = source.index("function shouldShowOnboarding")
-    end = source.index("\n}", start)
-    body = source[start:end]
+    body = ONBOARDING.read_text(encoding="utf-8")
     for forbidden in ("document.", "$(", "window."):
         assert forbidden not in body, (
             f"shouldShowOnboarding touches {forbidden}; keep the decision "

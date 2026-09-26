@@ -126,6 +126,13 @@ def test_a_finished_research_task_is_filed_as_research(tmp_path, monkeypatch):
                           [{"tool": "web_search", "args": {"query": "life on icy moons"}}])
     _run(manager, task)
 
+    # The task is marked finished a moment *before* its research is filed
+    # (task_manager: `t.finished = ...` then `_remember_research(t)`), so on a
+    # busy machine an immediate read can land in between. Wait for the filing.
+    import time
+    deadline = time.time() + 5
+    while not mem.recall_research("life on icy moons") and time.time() < deadline:
+        time.sleep(0.02)
     [hit] = mem.recall_research("life on icy moons")
     assert "Europa" in hit["text"]
     assert "https://example.org/europa" in hit["meta"]["sources"]

@@ -14,6 +14,9 @@ import re
 import pytest
 from flask import Flask, jsonify, request
 
+# The checks on the previous window (desk/static) that lived here moved to
+# tests/test_desk_ui_behaviour.py when the interface became desk/ui.
+
 TOKEN = "test-desk-token"
 
 
@@ -53,18 +56,6 @@ def client(monkeypatch):
 
 
 AUTH = {"X-NOVA-Desk": TOKEN}
-
-
-def test_the_spa_sends_the_header_the_bridge_checks():
-    """Guards against the two halves drifting apart again."""
-    js = io.open("desk/static/account.js", encoding="utf-8").read()
-    bridge = io.open("desk/bridge.py", encoding="utf-8").read()
-
-    checked = re.search(r'request\.headers\.get\("([^"]+)",\s*""\)', bridge)
-    assert checked, "could not find the bridge's token header check"
-    header = checked.group(1)
-    assert f'"{header}"' in js, (
-        f"the bridge checks {header} but account.js does not send it")
 
 
 def test_account_endpoints_require_the_desk_token(client):
@@ -150,18 +141,3 @@ def test_verify_endpoints_require_the_desk_token(client):
         assert client.post(path).status_code == 401
 
 
-def test_the_spa_never_says_check_your_inbox_when_nothing_was_sent():
-    """Section 7: NOVA must not imply an email exists that does not.
-
-    The 'check your inbox' wording must sit behind delivery.sent; the
-    unconfigured branch must say email is not configured instead.
-    """
-    js = io.open("desk/static/account.js", encoding="utf-8").read()
-    step = js[js.index("function showVerifyStep"):js.index("function present()")]
-
-    assert "delivery.sent" in step, "the verify step does not check delivery"
-    sent_branch, _, unsent_branch = step.partition("} else {")
-    assert "We sent a link" in sent_branch
-    assert "no email delivery configured" in unsent_branch
-    assert "We sent a link" not in unsent_branch, \
-        "the unconfigured branch claims an email was sent"

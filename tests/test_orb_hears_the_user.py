@@ -26,6 +26,9 @@ import pytest
 
 from nova_voice import VoiceGate, frame_rms
 
+# The checks on the previous window (desk/static) that lived here moved to
+# tests/test_desk_ui_behaviour.py when the interface became desk/ui.
+
 
 FRAME = 320   # 20 ms at 16 kHz
 
@@ -173,17 +176,3 @@ def test_the_microphone_callback_publishes_the_level():
     )
 
 
-def test_the_surface_distinguishes_hearing_from_listening():
-    """The orb needs a distinct state, or the signal changes nothing visible."""
-    from pathlib import Path
-
-    static = Path(__file__).resolve().parents[1] / "desk" / "static"
-
-    app = (static / "app.js").read_text(encoding="utf-8", errors="replace")
-    assert '"mic_level"' in app or "case \"mic_level\"" in app, (
-        "app.js ignores mic_level events"
-    )
-
-    for name in ("orb3d.js", "orb.js"):
-        text = (static / name).read_text(encoding="utf-8", errors="replace")
-        assert "hearing" in text, f"{name} has no hearing state to show"

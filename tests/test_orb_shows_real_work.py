@@ -25,8 +25,10 @@ import pytest
 
 from task_manager import TaskManager
 
+# The checks on the previous window (desk/static) that lived here moved to
+# tests/test_desk_ui_behaviour.py when the interface became desk/ui.
+
 REPO = Path(__file__).resolve().parents[1]
-STATIC = REPO / "desk" / "static"
 
 
 def _manager(tmp_path, executor=None, **kw):
@@ -141,29 +143,6 @@ def test_a_task_that_fails_still_releases_the_orb(tmp_path):
 
 
 # ── the surface ─────────────────────────────────────────────────────────────
-
-def test_the_orb_has_a_state_for_being_interrupted():
-    """`interrupted` is published by LiveManager and was handled nowhere."""
-    for name in ("orb3d.js", "orb.js"):
-        text = (STATIC / name).read_text(encoding="utf-8", errors="replace")
-        assert "interrupted" in text, (
-            f"{name} cannot show that the user cut NOVA off"
-        )
-
-
-def test_the_interrupted_event_reaches_the_orb():
-    app = (STATIC / "app.js").read_text(encoding="utf-8", errors="replace")
-    assert 'case "interrupted"' in app, (
-        "LiveManager publishes 'interrupted' and app.js ignores it, so the "
-        "one moment the user took control looks like every other moment"
-    )
-
-
-def test_the_surface_shows_background_work():
-    app = (STATIC / "app.js").read_text(encoding="utf-8", errors="replace")
-    assert "task_activity" in app, (
-        "app.js has no handler for background work starting or stopping"
-    )
 
 
 def test_the_desktop_wires_task_activity_to_the_surface():

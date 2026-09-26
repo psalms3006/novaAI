@@ -53,6 +53,8 @@ export const CommandPalette: React.FC = () => {
       },
       { id: 'nav-presence', category: 'Go to', title: 'Presence', icon: 'fa-shapes', run: () => setCurrentScreen('substrate') },
       { id: 'nav-map', category: 'Go to', title: 'Memory map', icon: 'fa-diagram-project', run: () => setCurrentScreen('synaptic') },
+      { id: 'nav-library', category: 'Go to', title: 'Library — conversations, documents, projects, files', icon: 'fa-book-open', run: () => setCurrentScreen('library') },
+      { id: 'set-account', category: 'Settings', title: 'Account & access (API key, offline, NOVA Cloud)', icon: 'fa-key', run: settings('account') },
       { id: 'set-permissions', category: 'Settings', title: 'Permissions', icon: 'fa-shield-halved', run: settings('permissions') },
       { id: 'set-memory', category: 'Settings', title: 'Memory', icon: 'fa-database', run: settings('memory') },
       { id: 'set-voice', category: 'Settings', title: 'Voice session', icon: 'fa-microphone', run: settings('voice') },
@@ -161,7 +163,7 @@ export const CommandPalette: React.FC = () => {
 
         <div className="px-4 py-2.5 border-t flex items-center justify-between text-[10px] font-mono opacity-50" style={{ borderColor: theme.palette.glassBorder, color: theme.palette.textMuted }}>
           <span>↑↓ choose · Enter run</span>
-          <span>1 · 2 · 3 switch screens</span>
+          <span>1 · 2 · 3 · 4 switch screens</span>
         </div>
       </div>
     </div>

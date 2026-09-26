@@ -110,6 +110,9 @@ def test_a_dead_speaker_never_claims_to_be_speaking():
 import re
 from pathlib import Path
 
+# The checks on the previous window (desk/static) that lived here moved to
+# tests/test_desk_ui_behaviour.py when the interface became desk/ui.
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -135,20 +138,6 @@ def test_the_event_bus_can_name_every_state_the_session_publishes():
     mapped = set(re.findall(r'"([a-z_]+)"\s*:', block))
     missing = published_states() - mapped
     assert not missing, f"states with no orb mapping, so drawn as idle: {sorted(missing)}"
-
-
-def test_every_mapped_orb_state_is_one_the_orb_can_draw():
-    bridge = (ROOT / "desk" / "bridge.py").read_text(encoding="utf-8")
-    block = bridge.split("orb_map = {", 1)[1].split("}", 1)[0]
-    targets = set(re.findall(r':\s*"([a-z_]+)"', block))
-
-    orb = (ROOT / "desk" / "static" / "orb.js").read_text(encoding="utf-8")
-    table = orb.split("const STATES = {", 1)[1].split("};", 1)[0]
-    known = set(re.findall(r"^\s*([a-z_]+)\s*:", table, re.M))
-    known |= set(re.findall(r"STATES\.([a-z_]+)\s*=", orb))
-
-    unknown = targets - known
-    assert not unknown, f"orb has no such state, so setState ignores it: {sorted(unknown)}"
 
 
 def test_speaking_is_drawn_as_speaking_not_as_idle():

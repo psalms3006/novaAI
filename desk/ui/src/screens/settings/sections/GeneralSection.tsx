@@ -21,6 +21,7 @@ export const GeneralSection: React.FC = () => {
             options={[
               { value: 'substrate', label: 'Presence' },
               { value: 'synaptic', label: 'Memory map' },
+              { value: 'library', label: 'Library' },
               { value: 'runtime', label: 'Settings' },
             ]}
           />

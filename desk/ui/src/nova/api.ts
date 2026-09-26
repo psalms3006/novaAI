@@ -57,6 +57,27 @@ export async function postJSON<T = unknown>(path: string, body: unknown = {}, me
   return data as T;
 }
 
+/** Upload one file as multipart `file`. The browser sets the boundary, so no Content-Type here. */
+export async function uploadFile<T = Record<string, unknown>>(path: string, file: File, timeoutMs = 300000): Promise<T> {
+  const form = new FormData();
+  form.append('file', file);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(path, { method: 'POST', body: form, headers: { 'X-NOVA-Desk': TOKEN }, signal: ctrl.signal });
+    let j: Record<string, unknown> = {};
+    try {
+      j = await r.json();
+    } catch {
+      /* empty body */
+    }
+    if (!r.ok || j.ok === false) throw new ApiError(String(j.message || j.error || `Upload failed (${r.status})`), r.status);
+    return j as T;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Events the text-chat endpoint streams back, one `data:` line each. */
 export interface ChatEvent {
   type: string;

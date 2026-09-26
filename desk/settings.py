@@ -116,7 +116,7 @@ _UI_PREFS = {
     "corner_radius": ("sharp", "soft", "round"),
     "ambient_motion": bool,
     "quality": ("quality", "balanced", "performance"),
-    "landing_view": ("substrate", "synaptic", "runtime"),
+    "landing_view": ("substrate", "synaptic", "runtime", "library"),
     "time_format": ("12h", "24h"),
     "presence": ("orb", "humanoid"),
     "show_transcript": bool,

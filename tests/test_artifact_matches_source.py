@@ -91,13 +91,13 @@ def _digest(path: Path) -> str:
 def test_the_bundled_frontend_matches_the_source():
     """An uncompressed data file, so this compares content, not module names."""
     _require_a_bundle_claiming_to_be_current()
-    source = REPO / "desk" / "static" / "app.js"
-    packaged = INTERNAL / "desk" / "static" / "app.js"
+    source = REPO / "desk" / "static" / "ui" / "index.html"
+    packaged = INTERNAL / "desk" / "static" / "ui" / "index.html"
     if not packaged.exists():
         pytest.skip("frontend not present in this bundle")
 
     assert _digest(packaged) == _digest(source), (
-        f"the bundled app.js is not the one in this checkout "
+        f"the bundled interface is not the one in this checkout "
         f"({packaged.stat().st_size} bytes vs {source.stat().st_size}). "
         f"The bundle is stale -- rebuild with --clean."
     )

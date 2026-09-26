@@ -295,6 +295,9 @@ def test_the_end_of_the_acknowledgement_is_what_sends_the_frame():
 import re
 from pathlib import Path
 
+# The checks on the previous window (desk/static) that lived here moved to
+# tests/test_desk_ui_behaviour.py when the interface became desk/ui.
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -311,26 +314,6 @@ def test_every_vision_event_is_forwarded_to_the_shared_event_bus():
     forwarded = set(re.findall(r'"(vision_[a-z_]+)"', block))
     assert not published - forwarded, (
         f"published but never forwarded: {sorted(published - forwarded)}")
-
-
-def test_the_window_shows_that_NOVA_is_reading_the_screen():
-    app = (ROOT / "desk" / "static" / "app.js").read_text(encoding="utf-8")
-    assert 'case "vision_capture":' in app
-    body = app.split('case "vision_capture":', 1)[1].split("break;", 1)[0]
-    assert "vision-active" in body, "nothing marks the screen as being read"
-
-
-def test_the_ring_that_marks_it_is_actually_styled():
-    """A class with no rule behind it is an interface that says nothing."""
-    css = (ROOT / "desk" / "static" / "hud.css").read_text(encoding="utf-8")
-    assert "body.vision-active .orb-stage::after" in css
-
-
-def test_the_ambient_orb_shows_it_too():
-    """Ambient mode is where the orb is the entire interface, so it is the
-    surface on which an invisible screen read would matter most."""
-    hud = (ROOT / "desk" / "static" / "hud.js").read_text(encoding="utf-8")
-    assert '"vision_capture"' in hud
 
 
 # ── routing, which is the difference between 1 s and 30 s ────────────────────

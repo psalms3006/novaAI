@@ -21,6 +21,9 @@ from pathlib import Path
 
 from task_manager import Task, TaskManager, TaskStep
 
+# The checks on the previous window (desk/static) that lived here moved to
+# tests/test_desk_ui_behaviour.py when the interface became desk/ui.
+
 REPO = Path(__file__).resolve().parents[1]
 
 
@@ -119,8 +122,3 @@ def test_the_task_list_endpoint_returns_computed_progress(monkeypatch, tmp_path)
     assert entry["seconds_remaining"] is not None
 
 
-def test_the_hud_recognises_the_status_tasks_actually_have():
-    hud = (REPO / "desk" / "static" / "hud.js").read_text(encoding="utf-8")
-    finder = re.search(r"\(d\.tasks[^\n]*\.find\(([^\n]*)\);", hud)
-    assert finder, "the HUD no longer picks a running task out of /api/system"
-    assert "RUNNING" in finder.group(1)
