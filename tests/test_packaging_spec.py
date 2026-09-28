@@ -125,5 +125,56 @@ class HiddenImportTests(unittest.TestCase):
                                      f"{name} is listed but not importable")
 
 
+def _excludes() -> list[str]:
+    tree = ast.parse(SPEC.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg == "excludes":
+            return [e.value for e in node.value.elts if isinstance(e, ast.Constant)]
+    return []
+
+
+# What the packaged app imports at run time, each of which an over-eager
+# exclude has already broken once:
+#   * faster_whisper/audio.py imports `av` at the top, so excluding av turned
+#     off offline speech recognition in every EXE ("faster-whisper failed to
+#     import at load time").
+#   * mcp/__init__ imports fastmcp, which imports starlette, so excluding
+#     starlette turned off every MCP tool ("nova_mcp package not found").
+RUNTIME_IMPORTS = [
+    "from faster_whisper import WhisperModel",
+    "from nova_mcp.bridge import new_bridge",
+    "from nova_core.rag.embeddings import OnnxBackend",
+]
+
+
+class ExcludesTests(unittest.TestCase):
+    def test_nothing_the_app_imports_is_excluded(self):
+        """Excludes beat the import graph; this runs the imports without them."""
+        import importlib.util
+        import subprocess
+        excluded = _excludes()
+        self.assertIn("torch", excluded)          # the parse found the list
+        script = (
+            "import sys, importlib.abc\n"
+            f"sys.path.insert(0, {str(ROOT)!r})\n"
+            f"BLOCK = set({excluded!r})\n"
+            "class B(importlib.abc.MetaPathFinder):\n"
+            "    def find_spec(self, name, path, target=None):\n"
+            "        if name.split('.')[0] in BLOCK:\n"
+            "            raise ImportError(f'{name} is excluded by the spec')\n"
+            "sys.meta_path.insert(0, B())\n"
+            "exec(sys.argv[1])\n"
+        )
+        for stmt in RUNTIME_IMPORTS:
+            top = stmt.split()[1].split(".")[0]
+            if importlib.util.find_spec(top) is None:
+                continue
+            with self.subTest(stmt=stmt):
+                r = subprocess.run([sys.executable, "-c", script, stmt],
+                                   capture_output=True, text=True, timeout=120)
+                self.assertEqual(r.returncode, 0,
+                                 f"{stmt} fails in the packaged app:\n{r.stderr[-800:]}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

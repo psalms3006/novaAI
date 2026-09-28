@@ -780,8 +780,11 @@ def _load_whisper_async() -> None:
         return
     try:
         from faster_whisper import WhisperModel
-    except ImportError:
-        log.error("faster-whisper failed to import at load time — STT unavailable.")
+    except ImportError as e:
+        # Name the cause: this read only "failed to import", which hid that the
+        # packaged app had excluded one of its dependencies (av).
+        log.error("faster-whisper failed to import at load time — STT unavailable (%s: %s).",
+                  type(e).__name__, e)
         _stt_loaded.set()
         return
     try:

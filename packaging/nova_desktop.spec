@@ -297,9 +297,14 @@ a = Analysis(
         # to keyword matching, which is exactly what the hidden import was
         # added to prevent.
         "scipy", "sklearn", "transformers", "tensorflow",
-        "av", "librosa", "soundfile", "numba",
+        # NOT "av": faster_whisper/audio.py imports it at the top, so excluding
+        # it switched off offline speech recognition in every EXE.
+        "librosa", "soundfile", "numba",
         "playwright",
-        "uvicorn", "starlette", "gunicorn",
+        # NOT "starlette": mcp/__init__ imports fastmcp, which imports it, so
+        # excluding it switched off every MCP tool. tests/test_packaging_spec.py
+        # runs the app's imports with this list blocked.
+        "uvicorn", "gunicorn",
         # NOTE: pydantic is REQUIRED by google.genai v2.x — must NOT be excluded.
         "rich", "pygments", "orjson",
     ],

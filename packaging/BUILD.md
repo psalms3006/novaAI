@@ -52,7 +52,7 @@ The NOVA window should open. First run creates `%APPDATA%\NOVA\`.
 ## Step 2 — build the installer
 
 ```bat
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\NOVA-Setup.iss
+"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" packaging\NOVA-Setup.iss
 ```
 
 Output: **`packaging\out\NOVA-Setup.exe`** — the distributable installer.

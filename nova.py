@@ -517,9 +517,10 @@ try:
         log = logging.getLogger(__name__)
         log.warning("nova_mcp.models could not be imported — MCP tools disabled.")
     HAS_MCP = True
-except ImportError:
+except ImportError as _mcp_import_error:
     HAS_MCP = False
-    log.warning("nova_mcp package not found — MCP tools disabled. pip install mcp to enable.")
+    log.warning("MCP tools disabled — nova_mcp could not be imported (%s: %s).",
+                type(_mcp_import_error).__name__, _mcp_import_error)
 _faiss_index:       Optional[Any]  = None
 # Reentrant: add_memory_fact() holds this lock and then calls
 # _atomic_save_memory(), which takes it again. With a plain Lock that is a

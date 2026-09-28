@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (89):
+Commits in the last 14 days (90):
 
+- 587cec5 2026-09-28 Search personal memory in the packaged app; stop warning about a disabled MCP server
 - 340d7f7 2026-09-26 Make NOVA an orchestrator: visible, handed-off, reviewed background work
 - 8ce2a4b 2026-09-26 Plan a task submitted as a goal instead of refusing it
 - 59c1134 2026-09-26 Honour Gemini's GoAway and resume the session instead of being cut off
@@ -154,8 +155,7 @@ Commits in the last 14 days (89):
 - 5614aaa 2026-09-20 Answer "what have you been doing?" from a record, not from memory
 - f9f3b15 2026-09-20 Read the user's mail, read-only, and say what is worth their attention
 - 397ea61 2026-09-20 Say why a one-second workflow does not run every second
-- 21c6dd6 2026-09-20 Actually run the scheduler, instead of shipping a third orphan
-- ...and 49 more
+- ...and 50 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns
