@@ -57,7 +57,9 @@ def _bearer() -> str:
     h = request.headers.get("Authorization", "")
     if h.lower().startswith("bearer "):
         return h[7:].strip()
-    return ""
+    # google-genai owns the Authorization header on gateway calls, so the
+    # desktop's gateway shim carries the same access token here instead.
+    return request.headers.get("X-NOVA-Session", "").strip()
 
 
 def _account_state(user_id: str, device_id: str):

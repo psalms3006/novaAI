@@ -347,7 +347,87 @@ class RateLimitBucket(Base):
     count = Column(Integer, nullable=False, default=0)
 
 
+# -- instances ---------------------------------------------------------------
+#
+# New tables only, never new columns on existing ones: the schema is created
+# with create_all, which adds missing tables to an existing database but never
+# alters a table that is already there.
+
+class Instance(Base):
+    """An account's personal NOVA: who NOVA is talking to, and whether that
+    person has been through setup. One per account today; the key is its own
+    so a second instance per account needs no change to anything that refers
+    to one."""
+
+    __tablename__ = "instances"
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"),
+                     nullable=False, unique=True, index=True)
+    preferred_name = Column(String(80), nullable=False, default="")
+    # "student", "developer", ... -- a short choice, not free text.
+    role = Column(String(32), nullable=False, default="")
+    # What the person chose to tell NOVA about themselves. This is private
+    # content: no admin endpoint returns it.
+    about = Column(Text, nullable=False, default="")
+    onboarding_completed_at = Column(Float, nullable=True)
+    plan = Column(String(24), nullable=False, default="free")
+    created_at = Column(Float, nullable=False, default=now)
+    updated_at = Column(Float, nullable=False, default=now, onupdate=now)
+
+
+class ModelUsage(Base):
+    """Per instance, per UTC day, per kind of model access. Enough to enforce
+    a daily quota and to show usage; nothing about what was asked."""
+
+    __tablename__ = "model_usage"
+
+    instance_id = Column(String(36), ForeignKey("instances.id", ondelete="CASCADE"),
+                         primary_key=True)
+    day = Column(String(10), primary_key=True)          # YYYY-MM-DD, UTC
+    kind = Column(String(24), primary_key=True)         # live_token | generate
+    requests = Column(Integer, nullable=False, default=0)
+    input_tokens = Column(Integer, nullable=False, default=0)
+    output_tokens = Column(Integer, nullable=False, default=0)
+
+
+# -- releases and updates ----------------------------------------------------
+
+class Release(Base):
+    """A published desktop release. `manifest` holds the exact bytes the owner
+    signed; the server stores and serves them but cannot produce a valid
+    signature for anything else."""
+
+    __tablename__ = "releases"
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    channel = Column(String(16), nullable=False, default="stable", index=True)
+    version = Column(String(32), nullable=False)
+    manifest = Column(Text, nullable=False)
+    signature = Column(String(128), nullable=False)
+    min_supported = Column(String(32), nullable=False, default="0.0.0")
+    rollout_percent = Column(Integer, nullable=False, default=100)
+    active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(Float, nullable=False, default=now)
+
+
+class DeviceUpdateState(Base):
+    """What each installation last reported about updating."""
+
+    __tablename__ = "device_update_state"
+
+    device_id = Column(String(36), primary_key=True)
+    channel = Column(String(16), nullable=False, default="stable")
+    current_version = Column(String(32), nullable=False, default="")
+    last_check_at = Column(Float, nullable=True)
+    last_result = Column(String(16), nullable=True)     # installed | failed | rolled_back
+    last_target = Column(String(32), nullable=True)
+    last_error = Column(String(200), nullable=True)
+    updated_at = Column(Float, nullable=False, default=now, onupdate=now)
+
+
 __all__ = [
+    "Instance", "ModelUsage", "Release", "DeviceUpdateState",
     "Base", "User", "UserStatus", "Profile", "Device", "AuthSession",
     "EmailToken", "Preference", "ActivityEvent", "ModelCall", "AgentRun",
     "ErrorEvent", "FeatureFlag", "FeatureFlagOverride", "AdminUser",

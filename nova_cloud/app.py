@@ -39,12 +39,18 @@ def create_app(cfg=None) -> Flask:
     from .api_sync import bp as sync_bp
     from .api_telemetry import bp as telemetry_bp
     from .api_admin import bp as admin_bp
+    from .api_instance import bp as instance_bp
+    from .api_model import bp as model_bp
+    from .api_updates import bp as updates_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(devices_bp)
     app.register_blueprint(sync_bp)
     app.register_blueprint(telemetry_bp)
     app.register_blueprint(admin_bp)
+    app.register_blueprint(instance_bp)
+    app.register_blueprint(model_bp)
+    app.register_blueprint(updates_bp)
 
     @app.after_request
     def _headers(resp):

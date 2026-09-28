@@ -86,6 +86,46 @@ class Config:
     # entirely: trusting its first entry let any client pick its own IP and
     # walk past every rate limit.
     trusted_proxy_hops: int = field(default_factory=lambda: _int("NOVA_TRUSTED_PROXY_HOPS", 0))
+
+    # -- model access ------------------------------------------------------
+    # The one Gemini key. It lives only here, on the server; the desktop gets
+    # either a short-lived Live token or has its text requests forwarded.
+    gemini_api_key: str = field(default_factory=lambda: os.getenv("NOVA_GEMINI_API_KEY", ""))
+    # Models the gateway will forward to. Anything else is refused, so a
+    # client cannot spend the key on a model the plan does not include.
+    allowed_models: str = field(default_factory=lambda: os.getenv(
+        "NOVA_ALLOWED_MODELS",
+        "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-flash-latest,"
+        "gemini-flash-lite-latest,text-embedding-004,gemini-embedding-001"))
+    # The Live model an ephemeral token is locked to.
+    live_model: str = field(default_factory=lambda: os.getenv(
+        "NOVA_LIVE_MODEL", "gemini-3.1-flash-live-preview"))
+    live_token_minutes: int = field(default_factory=lambda: _int("NOVA_LIVE_TOKEN_MINUTES", 30))
+    # Daily limits for the default plan. Other plans: NOVA_PLAN_<NAME>_LIVE /
+    # NOVA_PLAN_<NAME>_GENERATE.
+    free_live_per_day: int = field(default_factory=lambda: _int("NOVA_PLAN_FREE_LIVE", 60))
+    free_generate_per_day: int = field(default_factory=lambda: _int("NOVA_PLAN_FREE_GENERATE", 400))
+
+    # Public half of the owner's release-signing key (base64, 32 bytes). Used
+    # to refuse publishing a release whose signature does not verify. The
+    # private half is never on the server.
+    update_public_key: str = field(default_factory=lambda: os.getenv("NOVA_UPDATE_PUBLIC_KEY", ""))
+
+    def plan_limits(self, plan: str) -> dict:
+        p = (plan or "free").upper()
+        if p == "FREE":
+            live, gen = self.free_live_per_day, self.free_generate_per_day
+        else:
+            live = _int(f"NOVA_PLAN_{p}_LIVE", self.free_live_per_day)
+            gen = _int(f"NOVA_PLAN_{p}_GENERATE", self.free_generate_per_day)
+        # Embeddings are cheap and come in bursts (indexing a document), so
+        # they get a larger allowance -- but still a limit: 0 would mean none.
+        return {"live_token": live, "generate": gen,
+                "embed": _int(f"NOVA_PLAN_{p}_EMBED", gen * 10)}
+
+    def model_allowed(self, model: str) -> bool:
+        m = (model or "").strip().removeprefix("models/")
+        return m in {x.strip() for x in self.allowed_models.split(",") if x.strip()}
     admin_require_mfa: bool = field(default_factory=lambda: _bool("NOVA_ADMIN_REQUIRE_MFA", True))
 
     def __post_init__(self) -> None:
