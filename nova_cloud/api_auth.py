@@ -39,10 +39,8 @@ _BAD_CREDS = "Incorrect email or password."
 
 
 def _client_ip() -> str:
-    fwd = request.headers.get("X-Forwarded-For", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.remote_addr or ""
+    from .auth_guard import client_ip
+    return client_ip()
 
 
 def _fail(message: str, status: int = 400, code: str = "bad_request"):
@@ -223,6 +221,16 @@ def signup():
             return _fail("That email cannot be used to create an account.",
                          409, "email_taken")
 
+        # Check the device before creating anything. A failure after the user
+        # row is added would be committed by session_scope on return, leaving
+        # an account nobody can sign up for again ("email taken").
+        new_device_id = (body.get("device_id") or "").strip()[:36]
+        if not new_device_id or not (body.get("device_secret") or "").strip():
+            return _fail("device_id and device_secret are required", 400, "device_error")
+        if s.get(Device, new_device_id) is not None:
+            return _fail("This device is registered to another account.", 400,
+                         "device_error")
+
         cfg = current_app.config["NOVA_CFG"]
         user = User(
             email=email,
@@ -236,6 +244,7 @@ def signup():
         try:
             device, _ = _register_device(s, user, body)
         except (ValueError, PermissionError) as e:
+            s.rollback()
             return _fail(str(e), 400, "device_error")
 
         tokens = _issue_session(s, user, device, ip, request.headers.get("User-Agent", ""))
@@ -406,7 +415,7 @@ def logout():
 def logout_all():
     """Sign out every device. Requires a valid access token."""
     from .auth_guard import require_user
-    err = require_user()
+    err = require_user(allow_unverified=True)
     if err:
         return err
     with session_scope() as s:
@@ -422,7 +431,11 @@ def logout_all():
             a.revoked_at = now()
             n += 1
         record_event(s, "USER_LOGOUT", user_id=user.id, scope="all", sessions=n)
-        return jsonify({"ok": True, "sessions_revoked": n})
+        uid = user.id
+    # After the commit, so no request can re-cache the old epoch in between.
+    from .auth_guard import invalidate_auth_cache
+    invalidate_auth_cache(uid)
+    return jsonify({"ok": True, "sessions_revoked": n})
 
 
 @bp.post("/password/forgot")
@@ -496,7 +509,10 @@ def reset_password():
                 AuthSession.revoked_at.is_(None))).all():
             a.revoked_at = now()
         record_event(s, "PASSWORD_RESET", user_id=user.id)
-        return jsonify({"ok": True, "message": "Password updated. Sign in again."})
+        uid = user.id
+    from .auth_guard import invalidate_auth_cache
+    invalidate_auth_cache(uid)
+    return jsonify({"ok": True, "message": "Password updated. Sign in again."})
 
 
 def _consume_email_token(token: str, kind: str) -> tuple[bool, str]:
@@ -554,7 +570,7 @@ def resend_verification():
     configured when they signed up.
     """
     from .auth_guard import require_user
-    err = require_user()
+    err = require_user(allow_unverified=True)
     if err:
         return err
     with session_scope() as s:
@@ -579,7 +595,7 @@ def resend_verification():
 @bp.get("/me")
 def me():
     from .auth_guard import require_user
-    err = require_user()
+    err = require_user(allow_unverified=True)
     if err:
         return err
     with session_scope() as s:

@@ -31,6 +31,24 @@ _REVOCATION_TTL_S = 10.0
 _cache: dict[str, tuple[float, tuple]] = {}
 
 
+def client_ip() -> str:
+    """The caller's address, for rate limits and hashed audit fields.
+
+    X-Forwarded-For is written by whoever sends the request, so only the
+    entries appended by our own proxies can be believed: with N trusted hops,
+    the Nth entry from the right is the address the outermost proxy saw.
+    With no configured proxy the header is ignored.
+    """
+    from .config import config
+    hops = max(0, int(config().trusted_proxy_hops))
+    if hops:
+        parts = [p.strip() for p in request.headers.get("X-Forwarded-For", "").split(",")
+                 if p.strip()]
+        if len(parts) >= hops:
+            return parts[-hops]
+    return request.remote_addr or ""
+
+
 def _unauthorised(message: str, code: str = "unauthorised", status: int = 401):
     return jsonify({"ok": False, "error": code, "message": message}), status
 
@@ -55,6 +73,7 @@ def _account_state(user_id: str, device_id: str):
             user.status if user else None,
             int(user.token_epoch) if user else -1,
             (dev.revoked_at is not None) if dev else True,
+            bool(user.email_verified) if user else False,
         )
     _cache[key] = (time.time(), state)
     return state
@@ -69,10 +88,12 @@ def invalidate_auth_cache(user_id: str | None = None) -> None:
         _cache.pop(k, None)
 
 
-def require_user():
+def require_user(allow_unverified: bool = False):
     """Populate g.user_id / g.device_id, or return an error response.
 
     Returns None on success so callers can write `if err: return err`.
+    An account whose email is not verified reaches only the routes that
+    pass `allow_unverified` (who am I, resend, sign out, delete).
     """
     token = _bearer()
     if not token:
@@ -86,7 +107,7 @@ def require_user():
 
     user_id = claims.get("sub") or ""
     device_id = claims.get("did") or ""
-    status, epoch, device_revoked = _account_state(user_id, device_id)
+    status, epoch, device_revoked, email_verified = _account_state(user_id, device_id)
 
     if status is None:
         return _unauthorised("Invalid session.", "invalid_token")
@@ -98,6 +119,9 @@ def require_user():
         return _unauthorised("Session expired.", "token_expired")
     if device_revoked:
         return _unauthorised("This device has been signed out.", "device_revoked", 403)
+    if not email_verified and not allow_unverified:
+        return _unauthorised("Verify your email address to continue.",
+                             "email_unverified", 403)
 
     g.user_id = user_id
     g.device_id = device_id
@@ -105,14 +129,17 @@ def require_user():
     return None
 
 
-def user_required(fn: Callable):
-    @functools.wraps(fn)
-    def wrapper(*a, **kw):
-        err = require_user()
-        if err:
-            return err
-        return fn(*a, **kw)
-    return wrapper
+def user_required(fn: Callable | None = None, *, allow_unverified: bool = False):
+    """`@user_required` or `@user_required(allow_unverified=True)`."""
+    def deco(f: Callable):
+        @functools.wraps(f)
+        def wrapper(*a, **kw):
+            err = require_user(allow_unverified=allow_unverified)
+            if err:
+                return err
+            return f(*a, **kw)
+        return wrapper
+    return deco(fn) if fn is not None else deco
 
 
 # -- admin -------------------------------------------------------------------
@@ -177,4 +204,4 @@ def admin_required(permission: str | None = None):
 
 
 __all__ = ["require_user", "user_required", "require_admin", "admin_required",
-           "invalidate_auth_cache"]
+           "invalidate_auth_cache", "client_ip"]

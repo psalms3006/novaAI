@@ -74,8 +74,18 @@ class Config:
     retention_errors_d: int = field(default_factory=lambda: _int("NOVA_RET_ERRORS", 90))
     retention_admin_audit_d: int = field(default_factory=lambda: _int("NOVA_RET_AUDIT", 730))
 
+    # Required by default in production: an account is only fully active once
+    # its owner has proved the address. Development keeps sign-up one step.
     require_email_verification: bool = field(
-        default_factory=lambda: _bool("NOVA_REQUIRE_EMAIL_VERIFICATION", False))
+        default_factory=lambda: _bool(
+            "NOVA_REQUIRE_EMAIL_VERIFICATION",
+            os.getenv("NOVA_ENV", "development") in ("production", "prod")))
+
+    # How many reverse proxies sit in front of the app and append to
+    # X-Forwarded-For (Caddy on the EC2 = 1). 0 means the header is ignored
+    # entirely: trusting its first entry let any client pick its own IP and
+    # walk past every rate limit.
+    trusted_proxy_hops: int = field(default_factory=lambda: _int("NOVA_TRUSTED_PROXY_HOPS", 0))
     admin_require_mfa: bool = field(default_factory=lambda: _bool("NOVA_ADMIN_REQUIRE_MFA", True))
 
     def __post_init__(self) -> None:

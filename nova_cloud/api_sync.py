@@ -202,7 +202,7 @@ def get_flags():
 
 
 @bp.post("/v1/account/delete")
-@user_required
+@user_required(allow_unverified=True)
 def delete_account():
     """Delete the account and everything personally attached to it.
 

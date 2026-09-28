@@ -45,8 +45,8 @@ ENROL_WINDOW = 10
 
 
 def _ip() -> str:
-    fwd = request.headers.get("X-Forwarded-For", "")
-    return fwd.split(",")[0].strip() if fwd else (request.remote_addr or "")
+    from .auth_guard import client_ip
+    return client_ip()
 
 
 def audit(s, action: str, *, target_type: str | None = None,
@@ -195,6 +195,17 @@ def admin_mfa_enrol():
         admin = s.scalar(select(AdminUser).where(AdminUser.email == email))
         if admin is None or not sec.verify_password(admin.password_hash, password):
             return jsonify({"ok": False, "error": "invalid_credentials"}), 401
+
+        if not confirm and admin.mfa_enabled:
+            # Re-enrolling here would let anyone holding the password alone
+            # replace this admin's authenticator -- MFA reduced to a password.
+            # Resetting an enrolled admin is an operator action on the server
+            # (`python -m nova_cloud.manage enrol-mfa`).
+            audit(s, "admin.mfa_reenrol_refused", target_type="admin",
+                  target_id=admin.id, result="denied")
+            return jsonify({"ok": False, "error": "already_enrolled",
+                            "message": "MFA is already set up for this account. "
+                                       "Ask an operator to reset it."}), 409
 
         if not confirm:
             # Step 1: hand out a secret, store it, but leave MFA disabled until
