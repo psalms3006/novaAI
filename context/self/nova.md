@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (91):
+Commits in the last 14 days (92):
 
+- 7bae680 2026-09-28 Fix the uninstaller's runtime error; ask about user data only when uninstalling
 - 3ade886 2026-09-28 Bundle what offline speech and MCP import; say why an import failed
 - 587cec5 2026-09-28 Search personal memory in the packaged app; stop warning about a disabled MCP server
 - 340d7f7 2026-09-26 Make NOVA an orchestrator: visible, handed-off, reviewed background work
@@ -154,8 +155,7 @@ Commits in the last 14 days (91):
 - 34f11d2 2026-09-20 Keep the Google API catalogue out of the installer
 - 0e66daf 2026-09-20 Bundle what Gmail needs, and only that
 - 5614aaa 2026-09-20 Answer "what have you been doing?" from a record, not from memory
-- f9f3b15 2026-09-20 Read the user's mail, read-only, and say what is worth their attention
-- ...and 51 more
+- ...and 52 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns
