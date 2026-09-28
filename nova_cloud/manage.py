@@ -405,9 +405,59 @@ def serve(args) -> int:
     return 0
 
 
+def publish_release(args) -> int:
+    """Publish a release made by tools/release.py (manifest + .sig files)."""
+    from pathlib import Path
+    from .api_updates import publish
+    from .config import config
+    manifest = Path(args.manifest).read_text(encoding="utf-8")
+    signature = Path(args.signature).read_text(encoding="utf-8").strip()
+    try:
+        rel = publish(manifest, signature, config().update_public_key,
+                      channel=args.channel, rollout_percent=args.rollout)
+    except ValueError as e:
+        print(f"Refused: {e}")
+        return 1
+    print(f"Published {rel['version']} on {rel['channel']} "
+          f"(rollout {rel['rollout_percent']}%, min supported {rel['min_supported']}).")
+    return 0
+
+
+def set_channel(args) -> int:
+    """Enrol one installation in beta/dev, or back to stable."""
+    from .api_updates import CHANNELS
+    from .db import session_scope
+    from .models import DeviceUpdateState
+    if args.channel not in CHANNELS:
+        print(f"channel must be one of {CHANNELS}")
+        return 1
+    with session_scope() as s:
+        st = s.get(DeviceUpdateState, args.device_id)
+        if st is None:
+            st = DeviceUpdateState(device_id=args.device_id)
+            s.add(st)
+        st.channel = args.channel
+    print(f"Device {args.device_id} is now on {args.channel}.")
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="nova_cloud.manage")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("publish-release",
+                       help="publish a signed release (from tools/release.py)")
+    c.add_argument("--manifest", required=True)
+    c.add_argument("--signature", required=True)
+    c.add_argument("--channel", default="stable")
+    c.add_argument("--rollout", type=int, default=100,
+                   help="percent of installations offered it (default 100)")
+    c.set_defaults(fn=publish_release)
+
+    c = sub.add_parser("set-channel", help="put one device on stable/beta/dev")
+    c.add_argument("--device-id", required=True)
+    c.add_argument("--channel", required=True)
+    c.set_defaults(fn=set_channel)
 
     c = sub.add_parser("create-admin")
     c.add_argument("--email", required=True)

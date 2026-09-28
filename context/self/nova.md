@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (94):
+Commits in the last 14 days (95):
 
+- b11d22f 2026-09-28 Give each account a NOVA instance, managed model access, and signed updates
 - 907ebe4 2026-09-28 Close four account-security holes found in the backend audit
 - 07d0a82 2026-09-28 Document NOVA's current architecture and the production target
 - 7bae680 2026-09-28 Fix the uninstaller's runtime error; ask about user data only when uninstalling
@@ -154,8 +155,7 @@ Commits in the last 14 days (94):
 - f95a6a0 2026-09-20 Look at what a user points NOVA at, without running it
 - d87fe3c 2026-09-20 Notice when NOVA has gone quiet, instead of letting the user talk to nothing
 - d36a3dc 2026-09-20 Stop asking a set-up user to set NOVA up again
-- 34f11d2 2026-09-20 Keep the Google API catalogue out of the installer
-- ...and 54 more
+- ...and 55 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns
