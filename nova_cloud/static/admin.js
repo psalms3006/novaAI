@@ -96,6 +96,7 @@
 
   var SECTIONS = [
     { id: "dashboard", label: "Dashboard", perm: "dashboard.view" },
+    { id: "fleet", label: "Instances & updates", perm: "dashboard.view" },
     { id: "users", label: "Users", perm: "users.view" },
     { id: "devices", label: "Devices", perm: "devices.view" },
     { id: "activity", label: "Activity", perm: "activity.view" },
@@ -189,6 +190,49 @@
           card("Network degraded", m.network_degraded_24h)
         ])
       ]));
+    });
+  };
+
+  VIEWS.fleet = function () {
+    return api("/fleet").then(function (j) {
+      var f = j.fleet;
+      var kids = header("Instances & updates",
+        "Each account's NOVA, the app versions in the field, model usage today and update rollout. Counts only.");
+      kids.push(el("div", { class: "section-title", text: "Instances" }));
+      kids.push(el("div", { class: "cards" }, [
+        card("Instances", f.instances_total),
+        card("Finished setup", f.instances_onboarded),
+        card("Online now", f.instances_online),
+        card("Offline", f.instances_offline)
+      ]));
+      kids.push(el("div", { class: "section-title", text: "App versions in use" }));
+      kids.push(table(["Version", "Devices"], f.app_versions, function (v) {
+        return el("tr", {}, [el("td", { class: "mono", text: v.version }), el("td", { text: num(v.devices) })]);
+      }));
+      kids.push(el("div", { class: "section-title", text: "Model usage today (UTC)" }));
+      kids.push(table(["Kind", "Requests", "Input tokens", "Output tokens"], f.model_usage_today, function (u) {
+        return el("tr", {}, [el("td", { text: u.kind }), el("td", { text: num(u.requests) }),
+          el("td", { text: num(u.input_tokens) }), el("td", { text: num(u.output_tokens) })]);
+      }));
+      kids.push(el("div", { class: "section-title", text: "Published releases" }));
+      kids.push(table(["Channel", "Version", "Min supported", "Rollout", "Published"], f.releases, function (r) {
+        return el("tr", {}, [el("td", { text: r.channel }), el("td", { class: "mono", text: r.version }),
+          el("td", { class: "mono", text: r.min_supported }), el("td", { text: r.rollout_percent + "%" }),
+          el("td", { class: "mono", text: stamp(r.published_at) })]);
+      }));
+      kids.push(el("div", { class: "section-title", text: "Update results" }));
+      kids.push(table(["Result", "Devices"], f.update_results, function (r) {
+        return el("tr", {}, [el("td", {}, [pill(r.result, r.result === "installed" ? "ok"
+          : (r.result === "failed" || r.result === "rolled_back" ? "bad" : ""))]), el("td", { text: num(r.devices) })]);
+      }));
+      if (f.recent_update_failures.length) {
+        kids.push(el("div", { class: "section-title", text: "Recent update failures" }));
+        kids.push(table(["Device", "Target", "Result", "Error", "When"], f.recent_update_failures, function (x) {
+          return el("tr", {}, [el("td", { class: "mono", text: x.device_id }), el("td", { class: "mono", text: x.target || "—" }),
+            el("td", { text: x.result }), el("td", { text: x.error || "—" }), el("td", { text: ago(x.at) })]);
+        }));
+      }
+      return el("div", {}, kids);
     });
   };
 

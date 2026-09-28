@@ -380,7 +380,24 @@ def user_detail(user_id: str):
         # Opening an individual user record is a privileged read.
         audit(s, "users.view_detail", target_type="user", target_id=u.id)
 
-        return jsonify({"ok": True, "user": {
+        from .models import Instance, ModelUsage
+        inst = s.scalar(select(Instance).where(Instance.user_id == u.id))
+        usage = []
+        if inst is not None:
+            usage = [{"day": r.day, "kind": r.kind, "requests": r.requests,
+                      "input_tokens": r.input_tokens, "output_tokens": r.output_tokens}
+                     for r in s.scalars(select(ModelUsage)
+                                        .where(ModelUsage.instance_id == inst.id)
+                                        .order_by(ModelUsage.day.desc()).limit(30)).all()]
+
+        return jsonify({"ok": True, "instance": None if inst is None else {
+            # Operational fields only. The profile's free-text "about" is the
+            # person's own words and is deliberately not returned.
+            "id": inst.id, "plan": inst.plan,
+            "onboarding_completed": inst.onboarding_completed_at is not None,
+            "onboarding_completed_at": inst.onboarding_completed_at,
+            "created_at": inst.created_at,
+        }, "model_usage": usage, "user": {
             "id": u.id, "email": u.email,
             "display_name": prof.display_name if prof else "",
             "locale": prof.locale if prof else "en",
@@ -399,6 +416,64 @@ def user_detail(user_id: str):
             # Stated explicitly so nobody assumes it was merely left out.
             "note": "Conversation content and memory are not accessible here.",
         })
+
+
+@bp.get("/fleet")
+@admin_required("dashboard.view")
+def fleet():
+    """Instances, app versions, model usage and update rollout, at a glance.
+    Counts only; nothing here identifies what anyone said or stored."""
+    from .models import DeviceUpdateState, Instance, ModelUsage, Release
+    from .api_instance import today
+    t = now()
+    online_window = 10 * 60
+    with session_scope() as s:
+        def scalar(q):
+            return int(s.scalar(q) or 0)
+
+        instances_total = scalar(select(func.count()).select_from(Instance))
+        instances_onboarded = scalar(select(func.count()).select_from(Instance)
+                                     .where(Instance.onboarding_completed_at.is_not(None)))
+        live_devices = Device.revoked_at.is_(None)
+        online = scalar(select(func.count(distinct(Device.user_id)))
+                        .where(live_devices, Device.last_seen_at > t - online_window))
+        versions = [{"version": v or "unknown", "devices": n} for v, n in s.execute(
+            select(Device.app_version, func.count()).where(live_devices)
+            .group_by(Device.app_version).order_by(func.count().desc())).all()]
+        plans = [{"plan": p, "instances": n} for p, n in s.execute(
+            select(Instance.plan, func.count()).group_by(Instance.plan)).all()]
+        usage_today = [{"kind": k, "requests": int(r or 0), "input_tokens": int(i or 0),
+                        "output_tokens": int(o or 0)} for k, r, i, o in s.execute(
+            select(ModelUsage.kind, func.sum(ModelUsage.requests),
+                   func.sum(ModelUsage.input_tokens), func.sum(ModelUsage.output_tokens))
+            .where(ModelUsage.day == today()).group_by(ModelUsage.kind)).all()]
+        releases = [{"channel": r.channel, "version": r.version,
+                     "min_supported": r.min_supported, "rollout_percent": r.rollout_percent,
+                     "published_at": r.created_at}
+                    for r in s.scalars(select(Release).where(Release.active.is_(True))).all()]
+        results = [{"result": res or "none", "devices": n} for res, n in s.execute(
+            select(DeviceUpdateState.last_result, func.count())
+            .group_by(DeviceUpdateState.last_result)).all()]
+        failures = [{"device_id": d.device_id, "target": d.last_target,
+                     "result": d.last_result, "error": d.last_error, "at": d.updated_at}
+                    for d in s.scalars(select(DeviceUpdateState)
+                                       .where(DeviceUpdateState.last_result.in_(
+                                           ("failed", "rolled_back")))
+                                       .order_by(DeviceUpdateState.updated_at.desc())
+                                       .limit(20)).all()]
+        return jsonify({"ok": True, "generated_at": t, "fleet": {
+            "instances_total": instances_total,
+            "instances_onboarded": instances_onboarded,
+            "instances_online": online,
+            "instances_offline": max(0, instances_total - online),
+            "online_window_s": online_window,
+            "app_versions": versions,
+            "plans": plans,
+            "model_usage_today": usage_today,
+            "releases": releases,
+            "update_results": results,
+            "recent_update_failures": failures,
+        }})
 
 
 @bp.post("/users/<user_id>/status")

@@ -247,6 +247,11 @@ def signup():
             s.rollback()
             return _fail(str(e), 400, "device_error")
 
+        # Every account has its NOVA instance from the start (and older
+        # accounts get theirs at next sign-in), so it is never missing
+        # from anything that counts or looks for instances.
+        from .api_instance import get_or_create_instance
+        get_or_create_instance(s, user.id)
         tokens = _issue_session(s, user, device, ip, request.headers.get("User-Agent", ""))
         record_event(s, "USER_CREATED", user_id=user.id, device_id=device.id,
                      platform=device.platform, app_version=device.app_version)
@@ -313,6 +318,11 @@ def login():
             return _fail("This device is registered to a different account.",
                          403, "device_conflict")
 
+        # Every account has its NOVA instance from the start (and older
+        # accounts get theirs at next sign-in), so it is never missing
+        # from anything that counts or looks for instances.
+        from .api_instance import get_or_create_instance
+        get_or_create_instance(s, user.id)
         tokens = _issue_session(s, user, device, ip,
                                 request.headers.get("User-Agent", ""))
         record_event(s, "USER_LOGIN", user_id=user.id, device_id=device.id,

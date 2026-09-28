@@ -337,3 +337,55 @@ def test_an_update_result_is_recorded_for_the_device(client):
     with session_scope() as s:
         st = s.get(DeviceUpdateState, d["device_id"])
         assert st.last_result == "rolled_back" and st.last_target == "1.1.0"
+
+
+# -- admin: fleet view and privacy ----------------------------------------------
+
+def _admin_token(client):
+    from nova_cloud import security as sec
+    from nova_cloud.db import session_scope
+    from nova_cloud.models import AdminUser
+    client.application.config["NOVA_CFG"].admin_require_mfa = False
+    from nova_cloud import config as cfgmod
+    cfgmod.config().admin_require_mfa = False
+    with session_scope() as s:
+        s.add(AdminUser(email="root@nova.local", password_hash=sec.hash_password(PASSWORD),
+                        role="SUPER_ADMIN", mfa_enabled=False))
+    r = client.post("/admin/api/auth/login", json={"email": "root@nova.local",
+                                                    "password": PASSWORD})
+    assert r.status_code == 200, r.get_json()
+    return r.get_json()["access_token"]
+
+
+def test_admin_fleet_counts_instances_versions_usage_and_updates(client, seen):
+    ta, _ = signup(client, "a@example.com")
+    tb, _ = signup(client, "b@example.com")
+    client.post("/v1/instance/onboarding/complete", headers=auth(ta))
+    client.post("/gateway/v1beta/models/gemini-2.5-flash:generateContent",
+                headers=auth(ta), json={})
+    client.post("/v1/updates/report", headers=auth(tb),
+                json={"result": "failed", "target": "1.1.0", "error": "sha256 mismatch"})
+    admin = _admin_token(client)
+    f = client.get("/admin/api/fleet", headers=auth(admin)).get_json()["fleet"]
+    assert f["instances_total"] == 2 and f["instances_onboarded"] == 1
+    assert {"version": "1.0.0", "devices": 2} in f["app_versions"]
+    assert any(u["kind"] == "generate" and u["requests"] == 1 for u in f["model_usage_today"])
+    assert f["recent_update_failures"][0]["error"] == "sha256 mismatch"
+
+
+def test_admin_user_detail_shows_instance_metadata_but_not_the_persons_words(client):
+    ta, _ = signup(client, "a@example.com")
+    client.patch("/v1/instance/profile", headers=auth(ta),
+                 json={"about": "my private life story"})
+    admin = _admin_token(client)
+    users = client.get("/admin/api/users", headers=auth(admin)).get_json()
+    uid = (users.get("users") or users.get("items"))[0]["id"]
+    d = client.get(f"/admin/api/users/{uid}", headers=auth(admin))
+    body = d.get_data(as_text=True)
+    assert d.status_code == 200 and d.get_json()["instance"]["id"]
+    assert "private life story" not in body
+
+
+def test_a_user_token_cannot_read_the_fleet(client):
+    t, _ = signup(client, "a@example.com")
+    assert client.get("/admin/api/fleet", headers=auth(t)).status_code == 401
