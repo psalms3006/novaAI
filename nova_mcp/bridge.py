@@ -75,10 +75,15 @@ class MCPBridge:
             results = {}
 
         self._rebuild_name_map()
+        # A server switched off in config is not a fault; warning about it sent
+        # readers of the log after a problem that did not exist.
+        disabled = {c.name for c in configs if not c.enabled}
         connected = [n for n, ok in results.items() if ok]
-        failed = [n for n, ok in results.items() if not ok]
+        failed = [n for n, ok in results.items() if not ok and n not in disabled]
         if connected:
             log.info("MCP servers connected: %s", ", ".join(connected))
+        if disabled:
+            log.info("MCP servers disabled in config: %s", ", ".join(sorted(disabled)))
         if failed:
             log.warning("MCP servers failed to connect: %s", ", ".join(failed))
         return results

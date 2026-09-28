@@ -2538,15 +2538,17 @@ def main() -> None:
         global HAS_SENTENCE_TRANSFORMERS
         embed_start = time.time()
         try:
-            from sentence_transformers import SentenceTransformer  # lazy import
-        except ImportError:
-            HAS_SENTENCE_TRANSFORMERS = False
-            log.warning("sentence-transformers not installed — memory search disabled.")
-            _embedder_loaded.set()
-            return
-
-        try:
-            nova_state._embedder = SentenceTransformer(EMBED_MODEL)
+            # sentence-transformers in development; the ONNX export of the
+            # same model in the packaged app, which has no torch.
+            from nova_core.rag.embeddings import load_memory_encoder
+            encoder, how = load_memory_encoder(EMBED_MODEL)
+            if encoder is None:
+                HAS_SENTENCE_TRANSFORMERS = False
+                log.warning("Memory search disabled — %s", how)
+                _embedder_loaded.set()
+                return
+            nova_state._embedder = encoder
+            log.info("Memory embedder: %s", how)
             print(f"✅ Embedding model ready ({time.time()-embed_start:.2f}s)")
         except Exception as e:
             # Do NOT collapse this into the ImportError branch above. Loading a

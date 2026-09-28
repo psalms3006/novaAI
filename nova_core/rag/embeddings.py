@@ -280,6 +280,42 @@ def download_onnx_model(progress=None) -> Path:
     return target
 
 
+# -- personal memory ---------------------------------------------------------
+
+class OnnxSentenceEncoder:
+    """The ONNX model behind the one SentenceTransformer method memory uses.
+
+    The packaged app excludes torch, so sentence-transformers never imports
+    there and personal memory search was silently off in every EXE. The ONNX
+    export is the same model (tools/export_embedder_onnx.py, mean pooled,
+    normalised), so its vectors are interchangeable with the ones it replaces.
+    """
+
+    def __init__(self, backend=None):
+        self.backend = backend if backend is not None else OnnxBackend()
+
+    def encode(self, texts, normalize_embeddings: bool = True, **_ignored) -> np.ndarray:
+        if isinstance(texts, str):
+            texts = [texts]
+        return np.asarray(self.backend.embed(list(texts)), dtype=np.float32)
+
+    def get_sentence_embedding_dimension(self) -> int:
+        return int(self.backend.dim)
+
+
+def load_memory_encoder(model_name: str):
+    """(encoder, how) for personal memory; encoder is None with the reason."""
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError:
+        backend = OnnxBackend()
+        ok, why = backend.available()
+        if ok:
+            return OnnxSentenceEncoder(backend), f"onnx ({why})"
+        return None, f"sentence-transformers is not installed and the onnx model is unusable: {why}"
+    return SentenceTransformer(model_name), f"sentence-transformers ({model_name})"
+
+
 # -- cloud -------------------------------------------------------------------
 
 class CloudBackend:
@@ -421,4 +457,5 @@ __all__ = [
     "BackendUnavailable", "Resolution", "resolve", "describe_choices",
     "download_onnx_model", "onnx_model_dir", "tokenise", "bm25_scores",
     "content_hash", "CHOICES", "ONNX_MODEL_REPO", "ONNX_DIM",
+    "OnnxSentenceEncoder", "load_memory_encoder",
 ]
