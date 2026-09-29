@@ -13,7 +13,11 @@
 ;   * Contains NO secrets: no .env, no API keys, no DPAPI blobs
 
 #define MyAppName "NOVA"
+; Overridable at build time: ISCC /DMyAppVersion=1.0.1 packaging/NOVA-Setup.iss
+; (keep equal to APP_VERSION in nova_version.py)
+#ifndef MyAppVersion
 #define MyAppVersion "1.0.0"
+#endif
 #define MyAppPublisher "Omniel"
 #define MyAppExeName "NOVA.exe"
 
