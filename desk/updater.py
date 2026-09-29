@@ -265,6 +265,19 @@ if ($Relaunch -eq '1') { Start-Process -FilePath $AppExe -ArgumentList $Relaunch
 '''
 
 
+def spawn_helper(args: list) -> subprocess.Popen:
+    """Start the helper so it outlives NOVA, with no window.
+
+    CREATE_NO_WINDOW, not DETACHED_PROCESS: PowerShell given no console at
+    all exits before running a single line. That is how the first real
+    update test failed -- staged, verified, handed over, and then nothing.
+    """
+    flags = 0
+    if os.name == "nt":
+        flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    return subprocess.Popen(args, close_fds=True, creationflags=flags)
+
+
 def apply_staged(*, relaunch: bool, relaunch_args: str = "", wait_pid: int | None = None) -> bool:
     """Hand the staged update to the helper. The caller must then exit."""
     s = staged()
@@ -281,8 +294,7 @@ def apply_staged(*, relaunch: bool, relaunch_args: str = "", wait_pid: int | Non
             "-Version", s["version"], "-FromVersion", current_version(),
             "-UpdateDir", str(update_dir()), "-TimeoutSec", str(HEALTH_TIMEOUT_S),
             "-Relaunch", "1" if relaunch else "0", "-RelaunchArgs", relaunch_args or " "]
-    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-    subprocess.Popen(args, close_fds=True, creationflags=flags)
+    spawn_helper(args)
     _set(state="applying")
     log.info("[UPDATE] handing %s to the installer helper", s["version"])
     return True

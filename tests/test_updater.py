@@ -210,3 +210,25 @@ def test_helper_restores_the_working_version_when_the_new_one_never_starts(up, t
     res = _run_helper(up, inst, upd, installer, timeout=6)
     assert res["result"] == "rolled_back" and "did not start" in res["error"]
     assert (inst / "version.txt").read_text().strip() == "1.0.0"
+
+
+@windows_only
+def test_the_helper_survives_being_spawned_the_way_nova_spawns_it(up, tmp_path):
+    """The attached runs above passed while the real hand-off did nothing:
+    PowerShell started with no console exits before its first line. This
+    spawns it through the same function NOVA uses and waits for its log."""
+    import time
+    inst, upd, installer = _rig(tmp_path, installer_exit=1)
+    ps1 = upd / "apply_update.ps1"
+    ps1.write_text(up.HELPER_PS1, encoding="utf-8")
+    up.spawn_helper(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                     "-WindowStyle", "Hidden", "-File", str(ps1), "-NovaPid", "0",
+                     "-Installer", str(installer), "-InstallerArgs", "/VERYSILENT",
+                     "-InstallDir", str(inst), "-AppExe", str(inst / "NOVA.cmd"),
+                     "-Version", "1.1.0", "-FromVersion", "1.0.0", "-UpdateDir", str(upd),
+                     "-TimeoutSec", "5", "-Relaunch", "0", "-RelaunchArgs", " "])
+    deadline = time.time() + 60
+    while time.time() < deadline and not (upd / "result.json").exists():
+        time.sleep(0.5)
+    assert (upd / "update.log").exists(), "the spawned helper never ran"
+    assert json.loads((upd / "result.json").read_text(encoding="utf-8-sig"))["result"] == "rolled_back"

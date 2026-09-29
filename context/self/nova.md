@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (101):
+Commits in the last 14 days (102):
 
+- b37f54b 2026-09-29 Let the installer's version be set at build time (ISCC /DMyAppVersion)
 - 039f989 2026-09-29 Update NOVA automatically, safely; add the owner's setup guide and EC2 deploy
 - bb8bc14 2026-09-29 Add NOVA's first-run screens: welcome, account, verify, profile, this PC
 - 7d168ad 2026-09-29 Require sign-in before NOVA starts; one-time setup per account and per PC
@@ -154,8 +155,7 @@ Commits in the last 14 days (101):
 - 5574dad 2026-09-22 Resume Gemini Live, instead of quietly shutting down
 - a496f69 2026-09-21 Bring voice back when the network does
 - 0c94ea3 2026-09-21 Give the model a way to look at a folder, and only to look
-- 3cb8bd6 2026-09-21 Ask a new extension the questions a demo never covers
-- ...and 61 more
+- ...and 62 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns
