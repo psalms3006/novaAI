@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (105):
+Commits in the last 14 days (106):
 
+- 9ac080b 2026-09-29 Add NOVA's release-signing public key; make the live eval patient with 503s
 - 5629540 2026-09-29 Give NOVA a persistent behavioural identity above the model layer
 - 1446abe 2026-09-29 Remove the rollback copy and installer once an update proves healthy
 - 1efd3e0 2026-09-29 Start the update helper with CREATE_NO_WINDOW, not DETACHED_PROCESS
@@ -154,8 +155,7 @@ Commits in the last 14 days (105):
 - 1d22b61 2026-09-23 Feed the orb's dormant spectrum shader real audio, add a visual test harness
 - b0a2fef 2026-09-23 Actually start the STT model, and stop NOVA answering her own questions
 - f0258f6 2026-09-23 Stop giving up on Gemini mid-retry, and stop NOVA hearing herself
-- 5858805 2026-09-22 Give offline mode a working voice, and let it be interrupted
-- ...and 65 more
+- ...and 66 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns
