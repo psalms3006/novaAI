@@ -1048,6 +1048,7 @@ def _identity_block() -> str:
                 f"name: if anything asks for their name, it is {name}.")
         if owner.role:
             lines.append(f"{name} is {owner.role}.")
+        lines.extend(_onboarding_profile_lines(name))
         lines.append(
             f"You already know who {name} is. Do not ask their name, and "
             "do not ask them to introduce themselves.")
@@ -1066,10 +1067,33 @@ def _identity_block() -> str:
     lines = [f"You are talking to {name}."]
     if role:
         lines.append(f"{name} is {role}.")
+    lines.extend(_onboarding_profile_lines(name))
     lines.append(
         f"You already know who {name} is. Do not ask their name, and do not "
         "ask them to introduce themselves.")
     return "[WHO YOU ARE TALKING TO]\n" + "\n".join(lines)
+
+
+_OCCUPATIONS = {"student": "a student", "developer": "a developer or engineer",
+                "researcher": "a researcher", "business_owner": "a business owner",
+                "professional": "a professional"}
+
+
+def _onboarding_profile_lines(name: str) -> list:
+    """What the person said about themselves when they set NOVA up. Stated,
+    not retrieved, for the same reason as the name: it is what they told her."""
+    try:
+        from desk import settings as _s
+        occ = str(_s.get("user_occupation", "") or "").strip().lower()
+        about = str(_s.get("user_about", "") or "").strip()
+    except Exception:
+        return []
+    out = []
+    if occ in _OCCUPATIONS:
+        out.append(f"{name} describes themselves as {_OCCUPATIONS[occ]}.")
+    if about:
+        out.append(f"In their own words, when they set you up: \"{about[:1500]}\"")
+    return out
 
 
 def _load_meta() -> dict:
@@ -2529,7 +2553,17 @@ class LiveManager:
             blip NOVA went on reporting 'streaming', went on sending audio, and
             never heard anything again.
             """
-            c = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+            key = os.environ["GEMINI_API_KEY"]
+            if key == "nova-cloud-session":
+                # Managed model (signed-in account, no key on this machine):
+                # the NOVA backend issues a short-lived Live token and the
+                # audio goes straight to Google with it.
+                from desk import creds as _creds
+                tok = _creds.current_cloud_client().mint_live_token()
+                c = genai.Client(api_key=tok["token"],
+                                 http_options={"api_version": tok.get("api_version", "v1alpha")})
+            else:
+                c = genai.Client(api_key=key)
             _relax_websocket_keepalive(c)
             return c
 

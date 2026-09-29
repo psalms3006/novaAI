@@ -47,9 +47,11 @@ def test_settings_still_work_after_a_permission_change(settings):
 
 def test_permission_updates_merge_and_validate(settings):
     settings.set_many({"permissions": {"files": "allow"}})
-    settings.set_many({"permissions": {"exec": "deny", "files": "bogus", "nope": "allow"}})
+    settings.set_many({"permissions": {"exec": "deny", "file_read": "bogus", "nope": "allow"}})
     perms = settings.all()["permissions"]
-    assert perms["files"] == "allow", "an invalid value must not overwrite a valid one"
+    assert perms["file_read"] == "allow", "an invalid value must not overwrite a valid one"
     assert perms["exec"] == "deny"
     assert "nope" not in perms
-    assert perms["web"] == "allow" and perms["screen"] == "ask", "untouched categories keep their defaults"
+    assert perms["browser_read"] == "allow" and perms["screen_read"] == "ask",         "untouched scopes keep their defaults"
+    # The legacy "files: allow" became allow-to-read, ask-before-changing.
+    assert perms["file_write"] == "ask"

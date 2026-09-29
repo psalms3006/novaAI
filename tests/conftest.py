@@ -24,6 +24,11 @@ import pytest
 _DATA_SANDBOX = tempfile.mkdtemp(prefix="nova-test-data-")
 os.environ["NOVA_DATA_DIR"] = _DATA_SANDBOX
 
+#: The machine-level folder (lifecycle.json, accounts\<id>\). Without this a
+#: test that signs in would activate an account in the developer's real
+#: %APPDATA%\NOVA -- and the first activation adopts (moves) the data there.
+os.environ["NOVA_MACHINE_DIR"] = tempfile.mkdtemp(prefix="nova-test-machine-")
+
 
 _PRODUCTION_KEYS = (
     "DATABASE_URL",
@@ -69,3 +74,19 @@ def _no_live_database():
             os.environ.pop(key, None)
 
     yield
+
+
+@pytest.fixture(autouse=True)
+def _no_account_leaks_between_tests():
+    """nova_lifecycle.activate_account() sets NOVA_ACCOUNT_ID / NOVA_DATA_DIR
+    directly. Left behind, the next test resolves paths as that account -- and
+    once did so inside the developer's real %APPDATA%/NOVA. Reset after every
+    test, whatever it did."""
+    yield
+    os.environ.pop("NOVA_ACCOUNT_ID", None)
+    os.environ["NOVA_DATA_DIR"] = _DATA_SANDBOX
+    try:
+        import nova_lifecycle
+        nova_lifecycle._original_data_dir = None
+    except Exception:
+        pass

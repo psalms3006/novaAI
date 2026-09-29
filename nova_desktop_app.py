@@ -75,7 +75,7 @@ _LOADING_HTML = """<!DOCTYPE html>
       fetch('/api/health',{signal:AbortSignal.timeout(2000)})
         .then(function(r){ return r.json(); })
         .then(function(j){
-          if(j && (j.ready || j.brain_ready)){
+          if(j && (j.ready || j.brain_ready || j.auth_required)){
             statusEl.textContent='Ready!';
             statusEl.className='status ready';
             setTimeout(function(){window.location.href='/'},300);
@@ -134,6 +134,13 @@ def main() -> int:
     _log(f"Python {sys.version}")
 
     _instance_lock = _claim_single_instance()
+    if _instance_lock is False and "--after-restart" in sys.argv:
+        # A deliberate restart (sign-out, account switch, update): the old
+        # process is exiting and will release the lock in a moment.
+        deadline = time.time() + 20
+        while _instance_lock is False and time.time() < deadline:
+            time.sleep(0.25)
+            _instance_lock = _claim_single_instance()
     if _instance_lock is False:
         _log("Another NOVA is already running — not starting a second one.")
         print("NOVA is already running. Look for the orb, or close the other "
@@ -142,6 +149,37 @@ def main() -> int:
         return 0
     # Held for the life of the process; released by the kernel on exit.
     globals()["_INSTANCE_LOCK"] = _instance_lock
+
+    # ── Who is this, and have they been here before? ─────────────────
+    # Before credentials and before the brain: both read the signed-in
+    # account's folder, which only exists once the account is known.
+    import nova_lifecycle
+    import nova_runtime
+    from nova_version import APP_VERSION
+    nova_runtime.set_logger(_log)
+    first_run = nova_lifecycle.is_first_run()
+    nova_lifecycle.ensure_installation(APP_VERSION)
+    os.environ["NOVA_FIRST_RUN"] = "1" if first_run else "0"
+    auth_gate = False
+    try:
+        import nova_account
+        acct = nova_account.account()
+        if acct.configured:
+            if acct.signed_in and acct.user_id:
+                info = nova_lifecycle.activate_account(acct.user_id)
+                _log(f"Account {acct.user_id[:8]}… active"
+                     + (f"; adopted {len(info['adopted'])} existing item(s)" if info["adopted"] else ""))
+            else:
+                # Sign-in is required on a build with an account server. The
+                # window opens on sign-in; the brain starts after it.
+                auth_gate = True
+                _log("No signed-in account: waiting for sign-in before starting the brain")
+        else:
+            _log("No NOVA account server configured: running locally without sign-in")
+    except Exception as e:
+        _log(f"Account check failed ({e}); continuing without an account")
+    os.environ["NOVA_AUTH_GATE"] = "1" if auth_gate else "0"
+    _log(f"Lifecycle: first_run={first_run} version={APP_VERSION} gate={auth_gate}")
 
     try:
         from desk.creds import bootstrap as _creds_bootstrap
@@ -173,42 +211,11 @@ def main() -> int:
     server_thread.start()
     _log("Server thread started")
 
-    # ── Step 1b: Initialize AI brain in background ─────────────────────
-    # nova.main() does ALL heavy init (tools, MCP, embeddings, memory, planner, router)
-    # then calls run_desk_server() which would duplicate our server.
-    # We monkey-patch run_desk_server to a no-op so nova.main() only does init.
-    def _init_nova_brain():
-        try:
-            _log("Brain: importing nova module...")
-            import nova as nova_mod
-            _orig_run_desk = getattr(nova_mod, 'run_desk_server', None)
-            if callable(_orig_run_desk):
-                nova_mod.run_desk_server = lambda *a, **kw: None
-            _log("Brain: calling nova.main() (this takes ~25s for Ollama+embeddings)...")
-            try:
-                nova_mod.main()
-            finally:
-                if callable(_orig_run_desk):
-                    nova_mod.run_desk_server = _orig_run_desk
-            _log("Brain: nova.main() returned — init complete")
-            # Diagnostic: check if router was actually set
-            _nr = getattr(nova_mod, '_nova_router', None)
-            _nr_type = type(_nr).__name__ if _nr else "None"
-            _log(f"Brain: nova._nova_router = {_nr_type} ({_nr})")
-            # Set flag so bridge knows brain is ready
-            try:
-                import desk.bridge as _br
-                if hasattr(_br, '_brain_ready'):
-                    _br._brain_ready = True
-                _log("Brain: set _brain_ready flag in bridge")
-            except Exception as fe:
-                _log(f"Brain: could not set bridge flag: {fe}")
-        except Exception as e:
-            _log(f"Brain init FAILED: {e}\n{traceback.format_exc()}")
-
-    brain_thread = threading.Thread(target=_init_nova_brain, name="NOVABrain", daemon=True)
-    brain_thread.start()
-    _log("Brain init thread started")
+    # ── Step 1b: the brain, unless sign-in has to come first ─────────
+    if auth_gate:
+        _log("Brain deferred until sign-in")
+    else:
+        nova_runtime.start_brain()
 
     # ── Step 2: Create window IMMEDIATELY ──────────────────────────────
     try:
@@ -273,7 +280,8 @@ def main() -> int:
                     # Wait until the NOVA brain (router) is actually ready, not just
                     # the HTTP server. This prevents the user from typing before the
                     # intelligence pipeline has finished initialising.
-                    if payload.get("ready") or payload.get("brain_ready"):
+                    if (payload.get("ready") or payload.get("brain_ready")
+                            or payload.get("auth_required")):
                         _log(f"Backend ready (status={r.status_code}, ready=true)")
                         _on_backend_ready()
                         return True

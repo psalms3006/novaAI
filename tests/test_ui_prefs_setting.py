@@ -17,6 +17,7 @@ import pytest
 @pytest.fixture()
 def settings(tmp_path, monkeypatch):
     monkeypatch.setenv("APPDATA", str(tmp_path / "roaming"))
+    monkeypatch.setenv("NOVA_MACHINE_DIR", str(tmp_path / "roaming" / "NOVA"))
     import desk.settings as mod
     return importlib.reload(mod)
 

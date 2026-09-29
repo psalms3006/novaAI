@@ -15,15 +15,48 @@ from pathlib import Path
 
 _LOCK = threading.Lock()
 
+# Granular scopes. Reading and changing are separate decisions: someone may
+# happily let NOVA read their documents and still want to be asked before she
+# changes or deletes one, and the same for reading a web page versus acting in
+# it. "Allow the computer" is never one switch for everything.
 _PERMISSION_CATEGORIES = [
-    "web",        # web search / browsing
-    "network",    # outbound network calls
-    "screen",     # screen capture & vision analysis
-    "mic",        # microphone capture / listening
-    "files",      # reading/writing/deleting files
-    "computer",   # open/close apps, system settings, automation
-    "exec",       # running commands / code
+    "microphone",        # voice capture, wake word
+    "screen_read",       # screenshots, seeing what is on screen
+    "file_read",         # listing, reading, searching files
+    "file_write",        # creating, changing, moving, deleting files
+    "browser_read",      # searching and reading the web
+    "browser_interact",  # acting in the browser: closing tabs, downloading
+    "computer_control",  # opening/closing apps, settings, mouse and keyboard
+    "exec",              # running programs, scripts and code
+    "network",           # other outbound actions, such as sending messages
 ]
+
+# How the earlier seven categories carry over, so nobody's choices reset.
+# Where one old choice becomes two, "allow" becomes allow-to-read but
+# ask-before-changing: the old switch never promised silent deletion.
+_LEGACY_PERMISSIONS = {
+    "mic": ("microphone",), "screen": ("screen_read",),
+    "files": ("file_read", "file_write"), "web": ("browser_read", "browser_interact"),
+    "computer": ("computer_control",), "exec": ("exec",), "network": ("network",),
+}
+_WRITE_SIDE = {"file_write", "browser_interact"}
+
+
+def migrate_permissions(perms) -> dict:
+    """Any stored permissions (old or new keys) -> the current scopes."""
+    out = dict(_DEFAULTS["permissions"])
+    if not isinstance(perms, dict):
+        return out
+    for old, new_keys in _LEGACY_PERMISSIONS.items():
+        val = perms.get(old)
+        if val not in ("allow", "ask", "deny"):
+            continue
+        for k in new_keys:
+            out[k] = "ask" if (val == "allow" and k in _WRITE_SIDE) else val
+    for k in _PERMISSION_CATEGORIES:
+        if perms.get(k) in ("allow", "ask", "deny"):
+            out[k] = perms[k]
+    return out
 
 _DEFAULTS = {
     # ── identity ───────────────────────────────────────────────
@@ -40,6 +73,11 @@ _DEFAULTS = {
     # person she had been introduced to many times, and kept asking again.
     # Identity is not a fact to search for; it is a fact to be told.
     "user_role": "",
+    # From first-run onboarding (and editable later): what best describes
+    # them, and what they chose to tell NOVA about themselves. Both reach the
+    # model through the identity block, as the seed NOVA personalises from.
+    "user_occupation": "",
+    "user_about": "",
     "mic_device": "",               # input device name or index; blank = system default
     "voice_language": "en-US",      # BCP-47 hint for speech recognition
     "user_system_prompt": "",       # user's custom NOVA instructions (reaches inference)
@@ -70,18 +108,22 @@ _DEFAULTS = {
     "barge_in": True,               # interrupt NOVA's speech with new input
     # ── safety / permissions ───────────────────────────────────
     "confirm_policy": "prompt",     # prompt | auto-safe
-    "permissions": {                # per-category: allow | ask | deny
-        "web": "allow",
-        "network": "allow",
-        "screen": "ask",
-        "mic": "allow",
-        "files": "ask",
-        "computer": "ask",
+    "permissions": {                # per-scope: allow | ask | deny
+        "microphone": "allow",
+        "screen_read": "ask",
+        "file_read": "ask",
+        "file_write": "ask",
+        "browser_read": "allow",
+        "browser_interact": "ask",
+        "computer_control": "ask",
         "exec": "ask",
+        "network": "allow",
     },
     # ── general / window ───────────────────────────────────────
     "launch_on_startup": False,
     "start_minimized": False,
+    # manual | open | background -- applied to Windows by desk.startup.
+    "startup_mode": "manual",
     "remember_window": True,
     "workspace_dir": "",            # where NOVA may create files ("" = default)
     "offline_fallback": True,       # permit offline reasoning path when online is down
@@ -151,8 +193,11 @@ _SAFE_KEYS = set(_DEFAULTS.keys())
 def machine_data_dir() -> Path:
     """%APPDATA%/NOVA: what belongs to this PC, not to a person (device
     identity, downloaded models, knowledge files, logs)."""
+    override = os.getenv("NOVA_MACHINE_DIR", "").strip()   # same rule as nova_lifecycle
     base = os.getenv("APPDATA") or ""
-    if base:
+    if override:
+        d = Path(override)
+    elif base:
         d = Path(base) / "NOVA"
     else:
         d = Path.home() / ".nova"
@@ -194,6 +239,8 @@ def _load() -> dict:
 def get(key: str, default=None):
     with _LOCK:
         data = _load()
+        if key == "permissions":
+            return migrate_permissions(data.get("permissions"))
         return data.get(key, _DEFAULTS.get(key, default))
 
 
@@ -206,11 +253,17 @@ def set_many(updates: dict) -> dict:
                 # function already holds, and threading.Lock is not
                 # re-entrant -- saving a permission deadlocked every later
                 # settings read and write in the process.
-                current = data.get("permissions")
-                merged = dict(_DEFAULTS["permissions"])
-                if isinstance(current, dict):
-                    merged.update(current)
+                merged = migrate_permissions(data.get("permissions"))
+                # An update may still name an earlier category ("files");
+                # it means the scopes that category became.
+                translated = {}
                 for cat, val in v.items():
+                    if cat in _LEGACY_PERMISSIONS and val in ("allow", "ask", "deny"):
+                        for k in _LEGACY_PERMISSIONS[cat]:
+                            translated[k] = "ask" if (val == "allow" and k in _WRITE_SIDE) else val
+                    else:
+                        translated[cat] = val
+                for cat, val in translated.items():
                     if cat in _PERMISSION_CATEGORIES and val in ("allow", "ask", "deny"):
                         merged[cat] = val
                 data["permissions"] = merged
@@ -235,8 +288,7 @@ def all() -> dict:
         data = _load()
         merged = dict(_DEFAULTS)
         merged.update(data)
-        if not isinstance(merged.get("permissions"), dict):
-            merged["permissions"] = dict(_DEFAULTS["permissions"])
+        merged["permissions"] = migrate_permissions(data.get("permissions"))
         prefs = merged.get("ui_prefs")
         merged["ui_prefs"] = _clean_ui_prefs(prefs) if isinstance(prefs, dict) else {}
         return merged

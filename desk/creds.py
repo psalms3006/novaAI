@@ -33,11 +33,14 @@ import ctypes.wintypes as wt
 import json
 import os
 import secrets
+import logging
 import sys
 import time
 from pathlib import Path
 
 from desk.settings import app_data_dir, get as _get_setting, set_many
+
+log = logging.getLogger("nova.desk.creds")
 
 _CRED_FILE = "byok.bin"
 _PLAINTEXT_FILE = "api_keys.json"     # plaintext fallback (mirrors MARK XXXIX)
@@ -131,13 +134,22 @@ def _store_plaintext_key(api_key: str) -> None:
 
 
 def store_byok(api_key: str) -> None:
+    """Seal the key with DPAPI (readable only by this Windows user).
+
+    This used to write a plaintext copy first, unconditionally, so every key
+    sat readable in api_keys.json even when DPAPI worked. Plaintext is now
+    only the fallback for a machine where sealing genuinely fails, and a
+    successful seal removes any old plaintext copy.
+    """
     key = api_key.strip()
-    # Always persist a plaintext copy first (reliable in frozen builds)…
-    _store_plaintext_key(key)
-    # …then attempt the more secure DPAPI seal; failures are non-fatal because
-    # load_byok() falls back to the plaintext file.
     try:
         _cred_path().write_bytes(dpapi_protect(key))
+    except Exception as e:
+        log.warning("DPAPI unavailable (%s); storing the key unencrypted", type(e).__name__)
+        _store_plaintext_key(key)
+        return
+    try:
+        _plaintext_path().unlink(missing_ok=True)
     except Exception:
         pass
 
@@ -152,6 +164,11 @@ def clear_byok() -> None:
 
 def load_byok() -> str:
     p = _cred_path()
+    if not p.exists() and _plaintext_path().exists():
+        # Migrate a key left in plaintext by an older build.
+        legacy = _load_plaintext_key()
+        if legacy:
+            store_byok(legacy)
     if p.exists():
         try:
             return dpapi_unprotect(p.read_bytes())
@@ -264,69 +281,54 @@ def device_identity() -> dict:
 # ── NOVA cloud client (REST contract) ────────────────────────────────────────
 
 class NovaCloudClient:
-    """Client for the NOVA auth backend / AI gateway.
+    """Model access through the signed-in NOVA account (nova_cloud).
 
-    Expected backend contract (implement server-side when deploying NOVA Cloud):
+    The session is the account's own access token (nova_account refreshes it),
+    so there is one identity for sign-in, sync and models:
 
-      POST {url}/v1/devices/register
-           headers: X-NOVA-Device: <device_id>
-           body:    {"secret": <device secret>, "platform": "windows"}
-           200 ->   {"ok": true}
+      POST {url}/v1/model/live-token     short-lived Gemini Live token (voice)
+      POST {url}/gateway/<Google path>   text/streaming/embeddings, forwarded
+                                         with the server's key, header
+                                         X-NOVA-Session: <access token>
 
-      POST {url}/v1/sessions
-           headers: X-NOVA-Device: <device_id>, Authorization: Bearer <secret>
-           200 ->   {"session_token": "...", "expires_in": 3600}
-
-      POST {url}/v1/live/token          (optional; ephemeral Live credentials)
-           headers: X-NOVA-Session: <session token>
-           200 ->   {"token": "...", "expires_in": <seconds>}
-
-      The gateway also accepts normal Generative-Language paths under
-      {url}/gateway/... with header X-NOVA-Session instead of a Gemini key.
-
-    Until such a backend exists, every method raises honestly and cloud mode
-    stays inactive — nothing here pretends to succeed.
+    The Gemini key itself never reaches this machine.
     """
 
     def __init__(self, base_url: str):
         self.base = (base_url or "").rstrip("/")
-        self._session_token = ""
-        self._expires = 0.0
+        self._live: dict = {}
 
     @property
     def active(self) -> bool:
-        return bool(self.base)
-
-    def _post(self, path: str, body: dict | None = None, headers: dict | None = None,
-              timeout: float = 8.0) -> dict:
-        import requests
-        h = {"X-NOVA-Device": device_identity()["device_id"]}
-        h.update(headers or {})
-        r = requests.post(self.base + path, json=body or {}, headers=h, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-
-    def register_device(self) -> dict:
-        ident = device_identity()
-        return self._post("/v1/devices/register",
-                          {"secret": ident["secret"], "platform": ident["platform"]})
+        if not self.base:
+            return False
+        try:
+            import nova_account
+            return nova_account.account().signed_in
+        except Exception:
+            return False
 
     def get_session(self, force_refresh: bool = False) -> str:
-        if self._session_token and not force_refresh and time.time() < self._expires - 60:
-            return self._session_token
-        ident = device_identity()
-        j = self._post("/v1/sessions", {},
-                       {"Authorization": f"Bearer {ident['secret']}"})
-        tok = (j.get("session_token") or "").strip()
+        import nova_account
+        tok = nova_account.account().ensure_access_token()
         if not tok:
-            raise RuntimeError("cloud backend returned no session token")
-        self._session_token = tok
-        self._expires = time.time() + float(j.get("expires_in", 3600))
+            raise RuntimeError("not signed in to NOVA, or NOVA Cloud is unreachable")
         return tok
 
     def mint_live_token(self) -> dict:
-        return self._post("/v1/live/token", {},
-                          {"X-NOVA-Session": self.get_session()})
+        """A Live token, reused while it has more than two minutes left (the
+        backend issues them for 30 minutes and several sessions)."""
+        if self._live and time.time() < float(self._live.get("_expires", 0)) - 120:
+            return {k: v for k, v in self._live.items() if not k.startswith("_")}
+        import requests
+        r = requests.post(self.base + "/v1/model/live-token",
+                          headers={"Authorization": f"Bearer {self.get_session()}"},
+                          timeout=10)
+        j = r.json() if r.content else {}
+        if r.status_code >= 400 or not j.get("token"):
+            raise RuntimeError(j.get("message") or f"live token refused ({r.status_code})")
+        self._live = {**j, "_expires": time.time() + float(j.get("expires_in") or 600)}
+        return {k: v for k, v in self._live.items() if not k.startswith("_")}
 
     def gateway_base_url(self) -> str:
         return self.base + "/gateway"
@@ -357,6 +359,16 @@ def apply_gateway_shim(client) -> None:
 
     def _patched_init(self, *a, **kw):
         orig_init(self, *a, **kw)
+        # A client built with a Live token talks to Google directly: that is
+        # the point of the token. Re-pointing it at the gateway would send the
+        # voice WebSocket to the NOVA server, which does not carry audio.
+        if str(kw.get("api_key") or "").startswith("auth_tokens/"):
+            return
+        # Installed once per process, but only meaningful while the managed
+        # model is the chosen mode: after a switch to the person's own key,
+        # their requests go to Google, not through NOVA's gateway.
+        if os.environ.get("GEMINI_API_KEY") != _SENTINEL:
+            return
         try:
             session = cloud.get_session()          # cached; refreshes near expiry
             from google.genai import types as _t
@@ -377,8 +389,10 @@ _last_status: dict = {}
 
 
 def current_cloud_client() -> NovaCloudClient:
-    url = (os.getenv("NOVA_CLOUD_URL") or _get_setting("cloud_url") or "").strip()
-    return NovaCloudClient(url)
+    # The same server the account signs in to -- one resolver, so the model
+    # gateway can never point somewhere the account does not.
+    from nova_version import cloud_base_url
+    return NovaCloudClient(cloud_base_url())
 
 
 def resolve() -> dict:
@@ -415,7 +429,11 @@ def resolve() -> dict:
         cloud = current_cloud_client()
         byok = load_byok()
         cloud_error = ""
-        if cloud.active:
+        if byok and _get_setting("auth_mode") == "byok":
+            # The person chose their own key over NOVA's managed model.
+            os.environ["GEMINI_API_KEY"] = byok
+            mode = "byok"
+        elif cloud.active:
             try:
                 cloud.get_session()
                 apply_gateway_shim(_import_genai())

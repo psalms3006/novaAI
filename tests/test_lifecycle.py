@@ -180,7 +180,7 @@ def test_two_accounts_see_only_their_own_settings_conversations_and_projects(lc,
     mod.ensure_installation("1.0.0")
 
     mod.activate_account("alice")
-    settings.set_many({"user_name": "Alice", "permissions": {"files": "allow"}})
+    settings.set_many({"user_name": "Alice", "permissions": {"file_read": "allow"}})
     cid = store.new_conversation("Alice's chat")
     projects_mod = projects
     before = len(projects_mod.list_projects()) if hasattr(projects_mod, "list_projects") else None
@@ -188,7 +188,7 @@ def test_two_accounts_see_only_their_own_settings_conversations_and_projects(lc,
     mod.deactivate()
     mod.activate_account("bob")
     assert settings.get("user_name") == "User"
-    assert settings.all()["permissions"]["files"] == "ask"
+    assert settings.all()["permissions"]["file_read"] == "ask"
     assert all(c["id"] != cid for c in store.list_conversations())
 
     mod.deactivate()
@@ -212,3 +212,49 @@ def test_the_byok_key_belongs_to_the_account_and_the_device_to_the_pc(lc, monkey
     mod.activate_account("bob")
     assert creds.device_identity()["device_id"] == dev_a
     assert creds._cred_path().parent == tmp_path / "NOVA" / "accounts" / "bob"
+
+
+# -- permission scopes --------------------------------------------------------
+
+def test_old_permission_choices_carry_over_to_the_new_scopes(lc, monkeypatch, tmp_path):
+    mod, machine = lc
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setenv("NOVA_MACHINE_DIR", str(tmp_path / "NOVA"))
+    from desk import settings
+    mod.ensure_installation("1.0.0")
+    mod.activate_account("a")
+    settings.settings_path().write_text(json.dumps({"permissions": {
+        "files": "allow", "web": "deny", "mic": "allow", "screen": "ask", "computer": "deny"}}))
+    p = settings.get("permissions")
+    assert (p["file_read"], p["file_write"]) == ("allow", "ask")
+    assert (p["browser_read"], p["browser_interact"]) == ("deny", "deny")
+    assert p["microphone"] == "allow" and p["screen_read"] == "ask"
+    assert p["computer_control"] == "deny"
+
+
+def test_reading_and_changing_files_are_separate_decisions():
+    from desk.confirm import scope_for
+    assert scope_for("file_controller", {"action": "read"}) == "file_read"
+    assert scope_for("file_controller", {"action": "list"}) == "file_read"
+    assert scope_for("file_controller", {"action": "delete"}) == "file_write"
+    assert scope_for("file_controller", {"action": "write"}) == "file_write"
+    assert scope_for("browser_control", {"action": "open_url"}) == "browser_read"
+    assert scope_for("browser_control", {"action": "download"}) == "browser_interact"
+    assert scope_for("remember_fact", {}) == ""
+
+
+def test_a_permission_change_takes_effect_on_the_next_call(lc, monkeypatch, tmp_path):
+    """Test L: changing a permission after onboarding applies immediately."""
+    mod, _ = lc
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    monkeypatch.setenv("NOVA_MACHINE_DIR", str(tmp_path / "NOVA"))
+    from desk import settings, confirm
+    mod.ensure_installation("1.0.0")
+    mod.activate_account("a")
+    settings.set_many({"permissions": {"file_write": "deny"}})
+    if not confirm._HAS_SAFETY:
+        pytest.skip("nova_safety unavailable")
+    blocked = confirm._ui_safety_gate("file_controller", {"action": "delete", "path": "x"})
+    assert blocked and "turned off" in blocked
+    settings.set_many({"permissions": {"file_write": "allow"}})
+    assert confirm._ui_safety_gate("file_controller", {"action": "delete", "path": "x"}) is None

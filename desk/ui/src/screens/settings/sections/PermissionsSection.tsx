@@ -7,13 +7,15 @@ import type { PermissionValue } from '../../../types/settings';
 import { Button, Card, Loading, NotConnected, Row, SectionHeader, useResource } from '../primitives';
 
 const CATEGORY: Record<string, { label: string; what: string; icon: string }> = {
-  web: { label: 'Search the web', what: 'Web searches and reading pages.', icon: 'fa-globe' },
-  network: { label: 'Use the network', what: 'Other outbound connections, such as downloads.', icon: 'fa-network-wired' },
-  screen: { label: 'See your screen', what: 'Screenshots and looking at what is on screen.', icon: 'fa-eye' },
-  mic: { label: 'Use the microphone', what: 'Listening outside the voice session.', icon: 'fa-microphone' },
-  files: { label: 'Work with files', what: 'Reading, writing, moving and deleting files.', icon: 'fa-folder-tree' },
-  computer: { label: 'Control the computer', what: 'Opening and closing apps, system settings, automation.', icon: 'fa-laptop-code' },
+  microphone: { label: 'Use the microphone', what: 'Voice conversations and the wake word.', icon: 'fa-microphone' },
+  screen_read: { label: 'See your screen', what: 'Screenshots and understanding what is on screen.', icon: 'fa-eye' },
+  file_read: { label: 'Read your files', what: 'Listing, opening and searching files.', icon: 'fa-folder-open' },
+  file_write: { label: 'Change your files', what: 'Creating, editing, moving and deleting files.', icon: 'fa-file-pen' },
+  browser_read: { label: 'Browse and research', what: 'Searching the web and reading pages.', icon: 'fa-globe' },
+  browser_interact: { label: 'Act in the browser', what: 'Closing tabs and downloading.', icon: 'fa-arrow-pointer' },
+  computer_control: { label: 'Control the computer', what: 'Opening and closing apps, settings, mouse and keyboard.', icon: 'fa-laptop-code' },
   exec: { label: 'Run commands', what: 'Running programs, scripts and code.', icon: 'fa-terminal' },
+  network: { label: 'Send things out', what: 'Other outbound actions, such as sending messages.', icon: 'fa-network-wired' },
 };
 
 const CHOICES: { value: PermissionValue; label: string }[] = [
@@ -26,13 +28,13 @@ export const PermissionsSection: React.FC = () => {
   const { theme, addToast } = useNova();
   const rt = useRuntime();
   const { settings, setPermission } = useNovaSettings();
-  const perms = useResource(() => getJSON<{ categories: string[]; tool_map: Record<string, string> }>('/api/permissions', 8000));
+  const perms = useResource(() => getJSON<{ categories: string[]; tool_map: Record<string, string[] | string> }>('/api/permissions', 8000));
 
   if (!settings || !perms.data) return <Loading what="permissions" error={perms.error} />;
 
   const toolsFor = (cat: string) =>
     Object.entries(perms.data?.tool_map || {})
-      .filter(([, c]) => c === cat)
+      .filter(([, c]) => (Array.isArray(c) ? c.includes(cat) : c === cat))
       .map(([t]) => t);
 
   return (

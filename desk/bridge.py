@@ -52,7 +52,7 @@ from . import live_session as desk_live
 from . import account_api as desk_account
 
 log = _nova.log
-APP_VERSION = "1.0.0"
+from nova_version import APP_VERSION
 
 _META: dict = {}
 run_token: str = secrets.token_hex(16)
@@ -561,7 +561,19 @@ def api_health():
         ready = getattr(nova, "_nova_router", None) is not None
     except Exception:
         ready = False
-    return jsonify({"ok": True, "ready": ready, "brain_ready": _brain_ready})
+    # Waiting for sign-in is a ready state for the window: it has something to
+    # show (the sign-in screen), and the brain will not start until then.
+    auth_required = (os.environ.get("NOVA_AUTH_GATE") == "1"
+                     and not (ready or _brain_ready))
+    try:
+        import nova_runtime
+        brain = nova_runtime.brain_state()
+    except Exception:
+        brain = {}
+    return jsonify({"ok": True, "ready": ready, "brain_ready": _brain_ready,
+                    "auth_required": auth_required,
+                    "brain_starting": bool(brain.get("started")) and not brain.get("ready"),
+                    "brain_error": brain.get("error", "")})
 
 
 # ── tools ─────────────────────────────────────────────────────────────────────
@@ -999,6 +1011,11 @@ def api_voice_status():
 @app.post("/api/live/start")
 @require_token
 def api_live_start():
+    # The microphone permission governs voice itself, not only the wake word.
+    if (desk_settings.get("permissions", {}) or {}).get("microphone") == "deny":
+        return jsonify({"ok": False, "error": "microphone_denied",
+                        "message": "The microphone is turned off in NOVA's permissions. "
+                                   "Turn it on in Settings > Permissions to talk to NOVA."}), 403
     mgr = desk_live.get_live_manager()
     r = mgr.start()
     return jsonify(r)
@@ -1950,7 +1967,7 @@ def api_permissions():
     return jsonify({
         "categories": list(desk_settings._PERMISSION_CATEGORIES),  # noqa: SLF001
         "permissions": desk_settings.get("permissions", {}),
-        "tool_map": desk_confirm.TOOL_CATEGORY,
+        "tool_map": desk_confirm.tool_scopes(),
         "policy": desk_settings.get("confirm_policy", "prompt"),
     })
 
@@ -2613,6 +2630,13 @@ def run_desk_server(meta, port: int | None = None) -> None:
         _start_account_session()
     except Exception as e:                       # never block startup on this
         log.warning("[DESK] account surface unavailable: %s", e)
+
+    # Offline model preparation (first-run and Settings), with real progress.
+    try:
+        from desk import offline_model
+        offline_model.register(app, require_token)
+    except Exception as e:
+        log.warning("[DESK] offline model surface unavailable: %s", e)
 
     # Document library. Registered here so the SPA can list and add documents;
     # the tool path reaches the same library through nova_core.rag.api.

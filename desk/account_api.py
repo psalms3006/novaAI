@@ -14,6 +14,7 @@ Two rules the endpoints follow:
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -119,10 +120,11 @@ def register(app, require_token, meta: dict) -> None:
                          body.get("display_name", ""))
         except nova_account.AccountError as e:
             return jsonify({"ok": False, "error": e.code, "message": e.message}), 400
+        restarting = bind_signed_in_account(acct)
         _adopt_identity(acct, meta)
         pull_preferences_async()
         acct.emit("NOVA_STARTED", surface="desktop")
-        return jsonify({"ok": True, **_status_payload()})
+        return jsonify({"ok": True, "restarting": restarting, **_status_payload()})
 
     @app.post("/api/account/signin")
     @require_token
@@ -133,10 +135,11 @@ def register(app, require_token, meta: dict) -> None:
             acct.sign_in(body.get("email", ""), body.get("password", ""))
         except nova_account.AccountError as e:
             return jsonify({"ok": False, "error": e.code, "message": e.message}), 400
+        restarting = bind_signed_in_account(acct)
         _adopt_identity(acct, meta)
         pull_preferences_async()
         acct.emit("USER_LOGIN", surface="desktop")
-        return jsonify({"ok": True, **_status_payload()})
+        return jsonify({"ok": True, "restarting": restarting, **_status_payload()})
 
     @app.post("/api/account/signout")
     @require_token
@@ -146,12 +149,17 @@ def register(app, require_token, meta: dict) -> None:
         acct.emit("USER_LOGOUT", surface="desktop")
         acct.flush(timeout=2.0)
         acct.sign_out(everywhere=bool(body.get("everywhere")))
-        # The name NOVA calls the user by came from the account, so it goes
-        # too. Nothing else local is touched: models, knowledge files and
-        # conversations stay exactly where they are.
-        desk_settings.set_many({"user_name": "User"})
-        meta["user_name"] = "User"
-        return jsonify({"ok": True, **_status_payload()})
+        # The account's data stays in its own folder, untouched, for when they
+        # sign back in. This process is still holding it -- memory loaded,
+        # tasks running -- so NOVA restarts onto the sign-in screen rather
+        # than let the next person inherit a live copy of someone else.
+        import nova_lifecycle
+        import nova_runtime
+        restarting = bool(nova_lifecycle.active_account_id())
+        nova_lifecycle.deactivate()
+        if restarting and not _NO_RELAUNCH:
+            nova_runtime.relaunch()
+        return jsonify({"ok": True, "restarting": restarting, **_status_payload()})
 
     @app.post("/api/account/verify/resend")
     @require_token
@@ -219,6 +227,149 @@ def register(app, require_token, meta: dict) -> None:
         except nova_account.AccountError as e:
             return jsonify({"ok": False, "error": e.code, "message": e.message}), 400
 
+    # -- first run / onboarding ---------------------------------------------
+    #
+    # What the window should show is decided here, from separate facts, never
+    # one flag (nova_lifecycle): signed out -> sign in; unverified -> verify;
+    # this account never set up -> profile; this account never set up on this
+    # PC -> permissions/offline/startup; otherwise NOVA. Nothing here reads the
+    # app version, so an update cannot bring any of it back.
+
+    def _instance(acct) -> dict:
+        inst = acct.cached_instance()
+        if inst.get("pending_sync"):
+            def _sync():
+                try:
+                    acct.complete_onboarding()
+                except nova_account.AccountError:
+                    pass
+            threading.Thread(target=_sync, name="nova-onboarding-sync", daemon=True).start()
+        if inst:
+            return inst
+        try:
+            return acct.instance()
+        except nova_account.AccountError:
+            return {}
+
+    def lifecycle_payload() -> dict:
+        import nova_lifecycle
+        import nova_runtime
+        acct = _acct()
+        first_run = os.environ.get("NOVA_FIRST_RUN") == "1"
+        base = {"accounts_enabled": acct.configured, "first_run": first_run,
+                "brain": nova_runtime.brain_state()}
+        if not acct.configured:
+            # Local build with no account server: the older local onboarding
+            # (desk.creds) still applies; nothing to gate here.
+            return {**base, "next": "none"}
+        st = acct.status()
+        if not st["signed_in"]:
+            return {**base, "next": "sign_in", "signed_in": False,
+                    "session_expired": bool(st.get("grace_expired"))}
+        inst = _instance(acct)
+        instance_done = bool(inst.get("onboarding_completed"))
+        device_done = nova_lifecycle.device_setup_completed()
+        if st["verification_required"] and not st["email_verified"]:
+            nxt = "verify_email"
+        elif not instance_done:
+            nxt = "profile"
+        elif not device_done:
+            nxt = "device_setup"
+        else:
+            nxt = "none"
+        return {**base, "next": nxt, "signed_in": True, "online": st["online"],
+                "email_verified": st["email_verified"],
+                "instance": inst, "instance_onboarding_completed": instance_done,
+                "device_setup_completed": device_done}
+
+    @app.get("/api/lifecycle")
+    @require_token
+    def api_lifecycle():
+        return jsonify({"ok": True, **lifecycle_payload()})
+
+    @app.post("/api/lifecycle/profile")
+    @require_token
+    def api_lifecycle_profile():
+        body = request.get_json(silent=True) or {}
+        fields = {k: str(body.get(k) or "").strip() for k in ("preferred_name", "role", "about")
+                  if k in body}
+        acct = _acct()
+        try:
+            acct.update_profile(**fields)
+            # The profile is the account-level part of setup: once it is
+            # answered (every field may be skipped), no device asks again.
+            acct.complete_onboarding()
+        except nova_account.Offline:
+            return jsonify({"ok": False, "error": "offline",
+                            "message": "Saving your profile needs a connection."}), 503
+        except nova_account.AccountError as e:
+            return jsonify({"ok": False, "error": e.code, "message": e.message}), 400
+        local = {}
+        if fields.get("preferred_name"):
+            local["user_name"] = fields["preferred_name"]
+            meta["user_name"] = fields["preferred_name"]
+        if "role" in fields:
+            local["user_occupation"] = fields["role"]
+        if "about" in fields:
+            local["user_about"] = fields["about"]
+        if local:
+            desk_settings.set_many(local)
+        return jsonify({"ok": True, **lifecycle_payload()})
+
+    @app.post("/api/lifecycle/complete")
+    @require_token
+    def api_lifecycle_complete():
+        """Finish setup. Reports each step from what actually happened."""
+        import nova_lifecycle
+        body = request.get_json(silent=True) or {}
+        steps = []
+        acct = _acct()
+        if not (acct.configured and acct.signed_in):
+            return jsonify({"ok": False, "error": "not_signed_in"}), 400
+        steps.append({"id": "account", "label": "Account connected", "ok": True})
+
+        perms = body.get("permissions")
+        if isinstance(perms, dict) and perms:
+            desk_settings.set_many({"permissions": perms})
+            steps.append({"id": "permissions", "label": "Permissions saved", "ok": True})
+
+        mode = body.get("startup_mode")
+        if mode:
+            try:
+                from . import startup
+                r = startup.set_mode(mode)
+                steps.append({"id": "startup", "ok": True,
+                              "label": ("NOVA will start with Windows" if mode != "manual"
+                                        else "NOVA will start when you open it")
+                              + ("" if r.get("supported", True) else " (not supported here)")})
+            except Exception as e:
+                steps.append({"id": "startup", "ok": False, "label": "Startup preference",
+                              "error": str(e)})
+
+        offline = body.get("offline_model")
+        if offline:
+            steps.append({"id": "offline_model", "label": "Offline model",
+                          "ok": offline == "ready",
+                          "detail": {"ready": "verified and ready",
+                                     "skipped": "skipped - you can download it later in Settings",
+                                     "failed": "not downloaded - retry later in Settings"
+                                     }.get(offline, offline)})
+
+        nova_lifecycle.mark_device_setup_complete()
+        steps.append({"id": "local", "label": "This PC set up", "ok": True})
+        try:
+            if not acct.cached_instance().get("onboarding_completed")                     or acct.cached_instance().get("pending_sync"):
+                acct.complete_onboarding()
+            steps.append({"id": "instance", "label": "Your NOVA is ready", "ok": True})
+        except nova_account.AccountError:
+            # Offline: the local part is done; the server is told next time.
+            # Recorded as done here so the next launch does not ask again.
+            acct._cache_instance({**acct.cached_instance(), "onboarding_completed": True,
+                                  "pending_sync": True})
+            steps.append({"id": "instance", "label": "Your NOVA is ready", "ok": True,
+                          "detail": "will sync when you are online"})
+        return jsonify({"ok": True, "steps": steps, **lifecycle_payload()})
+
     @app.post("/api/account/sync")
     @require_token
     def api_account_sync():
@@ -232,6 +383,40 @@ def register(app, require_token, meta: dict) -> None:
             return jsonify({"ok": False, "error": "offline"}), 503
         pull_preferences_async()
         return jsonify({"ok": True, **result})
+
+
+# Tests exercise sign-out without ending the test process.
+_NO_RELAUNCH = False
+
+
+def bind_signed_in_account(acct: nova_account.NovaAccount) -> bool:
+    """Point this process at the signed-in account's data and start NOVA.
+
+    Returns True when a restart was needed instead: this process already
+    holds a different person's NOVA (it should not happen through the UI,
+    which only offers sign-in when nobody is signed in, but it must never
+    mix two people's state if it does).
+    """
+    import nova_lifecycle
+    import nova_runtime
+    uid = acct.user_id
+    if not uid:
+        return False
+    current = nova_lifecycle.active_account_id()
+    if current and current != uid and nova_runtime.brain_state().get("started"):
+        nova_lifecycle.activate_account(uid)
+        if not _NO_RELAUNCH:
+            nova_runtime.relaunch()
+        return True
+    nova_lifecycle.activate_account(uid)
+    os.environ["NOVA_AUTH_GATE"] = "0"
+    try:
+        from . import creds
+        creds.apply_runtime()                  # this account's key / managed model
+    except Exception:
+        pass
+    nova_runtime.start_brain()
+    return False
 
 
 def _adopt_identity(acct: nova_account.NovaAccount, meta: dict) -> None:

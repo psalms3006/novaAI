@@ -32,7 +32,7 @@ from typing import Callable
 
 import nova_secure_store as store
 
-APP_VERSION = "0.1.0"
+from nova_version import APP_VERSION, cloud_base_url  # one version, one server
 
 # Secure-store keys.
 _K_SESSION = "account_session"
@@ -137,7 +137,7 @@ class NovaAccount:
 
     def __init__(self, base_url: str = "", on_change: Callable[[], None] | None = None):
         import os
-        self.base = (base_url or os.getenv("NOVA_CLOUD_URL", "")).rstrip("/")
+        self.base = (base_url or cloud_base_url()).rstrip("/")
         self._lock = threading.RLock()
         self._on_change = on_change
         self._session: dict = store.get_json(_K_SESSION) or {}
@@ -363,6 +363,44 @@ class NovaAccount:
                 store.set_json(_K_SESSION, self._session)
         self._notify()
         return self.status()
+
+    # -- instance (the account's personal NOVA) ----------------------------
+    #
+    # The last copy seen is cached with the session, so a launch with no
+    # network still knows whether this person has been through setup and does
+    # not show it to them again.
+
+    def _cache_instance(self, inst: dict) -> dict:
+        with self._lock:
+            if self._session:
+                self._session["instance"] = inst
+                store.set_json(_K_SESSION, self._session)
+        return inst
+
+    def cached_instance(self) -> dict:
+        with self._lock:
+            return dict(self._session.get("instance") or {})
+
+    def instance(self) -> dict:
+        tok = self.ensure_access_token()
+        if not tok:
+            raise Offline()
+        return self._cache_instance(self._request("GET", "/v1/instance", token=tok)["instance"])
+
+    def update_profile(self, **fields) -> dict:
+        tok = self.ensure_access_token()
+        if not tok:
+            raise Offline()
+        body = {k: v for k, v in fields.items() if k in ("preferred_name", "role", "about")}
+        return self._cache_instance(
+            self._request("PATCH", "/v1/instance/profile", body=body, token=tok)["instance"])
+
+    def complete_onboarding(self) -> dict:
+        tok = self.ensure_access_token()
+        if not tok:
+            raise Offline()
+        return self._cache_instance(
+            self._request("POST", "/v1/instance/onboarding/complete", token=tok)["instance"])
 
     # -- devices -----------------------------------------------------------
 
