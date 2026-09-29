@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (98):
+Commits in the last 14 days (99):
 
+- 7d168ad 2026-09-29 Require sign-in before NOVA starts; one-time setup per account and per PC
 - a3fe7e7 2026-09-29 Give each account its own local data folder; keep installation state apart
 - 3110a0b 2026-09-28 Show instances, versions, usage and update rollout to admins
 - cde539e 2026-09-28 Add the owner's release tools: keygen, sign, publish-release, set-channel
@@ -154,8 +155,7 @@ Commits in the last 14 days (98):
 - 3cb8bd6 2026-09-21 Ask a new extension the questions a demo never covers
 - 051009a 2026-09-21 Make trust something an extension climbs, and an install something you can undo
 - f19b2b2 2026-09-21 Try a candidate extension at arm's length, and say what that does not cover
-- 02b8911 2026-09-21 Ask permission where the person can actually answer
-- ...and 58 more
+- ...and 59 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

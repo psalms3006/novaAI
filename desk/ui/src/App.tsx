@@ -12,7 +12,7 @@ import { NotificationToasts } from './components/NotificationToasts';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { AmbientView } from './components/AmbientView';
 import { Onboarding } from './components/Onboarding';
-import { AccountGate } from './components/AccountGate';
+import { FirstRun } from './components/FirstRun';
 import { PresenceScreen } from './screens/PresenceScreen';
 import { SettingsScreen } from './screens/settings/SettingsScreen';
 import { SynapticMapScreen } from './screens/SynapticMapScreen';
@@ -120,7 +120,7 @@ function AppContent() {
       <NotificationToasts />
       <ConfirmDialog />
       <Onboarding />
-      <AccountGate />
+      <FirstRun />
     </div>
   );
 }

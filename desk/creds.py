@@ -388,6 +388,11 @@ def apply_gateway_shim(client) -> None:
 _last_status: dict = {}
 
 
+def _accounts_enabled() -> bool:
+    from nova_version import cloud_base_url
+    return bool(cloud_base_url())
+
+
 def current_cloud_client() -> NovaCloudClient:
     # The same server the account signs in to -- one resolver, so the model
     # gateway can never point somewhere the account does not.
@@ -458,6 +463,9 @@ def resolve() -> dict:
         "byok_present": bool(load_byok()),
         "byok_masked": mask(load_byok()) if mode == "byok" else "",
         "has_credential": mode in ("env", "cloud", "byok"),
+        # A build with an account server sets up through /api/lifecycle, not
+        # the key/offline first-run screen.
+        "accounts_enabled": _accounts_enabled(),
     }
     # Tell the interface what sort of credential is actually in play, so a
     # key that will expire is flagged before it strands the user mid-sentence.

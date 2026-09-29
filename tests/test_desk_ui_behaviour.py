@@ -210,11 +210,11 @@ def test_the_window_sends_the_header_the_bridge_checks():
 
 
 def test_never_says_check_your_inbox_when_nothing_was_sent():
-    gate = _read("components/AccountGate.tsx")
-    step = gate[gate.index("{needsVerify ?"):gate.index("I have confirmed")]
+    gate = _read("components/FirstRun.tsx")
+    step = gate[gate.index("const VerifyStep"):gate.index("I've confirmed my email")]
     sent, _, unsent = step.partition(": //")
-    assert "acct.email_delivery?.sent" in sent and "We sent a link" in sent
-    assert "no email delivery configured" in unsent and "We sent a link" not in unsent
+    assert "acct?.email_delivery?.sent" in sent and "We've sent" in sent
+    assert "could not confirm" in unsent and "We've sent" not in unsent
 
 
 # ── first run ───────────────────────────────────────────────────────────────

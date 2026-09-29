@@ -13,6 +13,7 @@ export interface AuthStatus {
   onboarded?: boolean;
   has_credential?: boolean;
   cloud_configured?: boolean;
+  accounts_enabled?: boolean;
   byok_present?: boolean;
   byok_masked?: string;
   chosen_offline?: boolean;
@@ -24,6 +25,9 @@ export function shouldShowOnboarding(status: { auth?: AuthStatus | null } | null
   if (!status) return false;
   const a = status.auth;
   if (!a || typeof a !== 'object') return false;
+  // A build with a NOVA account server sets up through FirstRun (sign-in,
+  // profile, this PC); this older key/offline screen is for local builds.
+  if (a.accounts_enabled === true) return false;
   if (a.onboarded === true || a.has_credential === true) return false;
   // Both flags must be present and false. Missing means "not answered yet".
   if (a.onboarded === undefined && a.has_credential === undefined) return false;
