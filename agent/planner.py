@@ -23,6 +23,14 @@ BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 
+try:
+    # The planner is one of NOVA's agents: it inherits her standards and has
+    # its own temperament (nova_personality.AGENT_TEMPERAMENTS).
+    import nova_personality as _persona
+    _TEMPERAMENT = chr(10) * 2 + _persona.render("agent:planner")
+except Exception:
+    _TEMPERAMENT = ""
+
 PLANNER_PROMPT = """You are the planning module of NOVA, a personal JARVIS-class AI assistant.
 Your job: break any user goal into a sequence of steps using ONLY the tools listed below.
 
@@ -261,7 +269,7 @@ def create_plan(goal: str, context: str = "", tool_declarations: list | None = N
     model = genai.GenerativeModel(
         model_name="gemini-flash-lite-latest",  # dated ids are retired; see nova-model-ids-expire
         system_instruction=(prompt_for_tools(tool_declarations) if tool_declarations
-                            else PLANNER_PROMPT),
+                            else PLANNER_PROMPT) + _TEMPERAMENT,
     )
 
     user_input = f"Goal: {goal}"
@@ -354,7 +362,7 @@ def replan(goal: str, completed_steps: list, failed_step: dict, error: str) -> d
     model_name = "gemini-2.5-flash" if num_completed > 1 else "gemini-2.5-flash-lite"
     model      = genai.GenerativeModel(
         model_name=model_name,
-        system_instruction=PLANNER_PROMPT,
+        system_instruction=PLANNER_PROMPT + _TEMPERAMENT,
     )
 
     prompt = f"""Goal: {goal}

@@ -77,7 +77,10 @@ def test_an_unplannable_goal_fails_and_says_why(tmp_path):
     _settle(m, task)
     assert task.status == "FAILED"
     assert "could not plan" in task.reason_for_stop
-    assert told and "failed" in told[0]
+    deadline = time.time() + 5            # told on the worker, after the status
+    while not told and time.time() < deadline:
+        time.sleep(0.02)
+    assert told and "couldn't finish" in told[0] and "could not plan" in told[0]
 
 
 def test_a_failing_planner_does_not_crash_the_worker(tmp_path):

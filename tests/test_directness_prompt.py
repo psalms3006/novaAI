@@ -1,38 +1,37 @@
-"""NOVA's willingness to push back is meant to be genuine, not just a
-paragraph nobody reads. This pins that the directive actually exists in
-the shared prompt (NOVA_CORE, which both NOVA_SYSTEM_PROMPT and
-NOVA_OFFLINE_PROMPT are built from, so cloud and offline stay one NOVA
-rather than two), and that it carries the two halves the user asked for
-together: real directness, bounded by real respect.
+"""NOVA's willingness to push back lives in nova_personality (Layer A) and
+reaches every model path: typed chat, voice, and the offline model. This pins
+that it is there, that it carries both halves -- real directness, bounded by
+respect and by the person's control -- and that no path goes without it.
 
-A live-model A/B (the reliable way to confirm a prompt change actually
-changes behaviour, not just prompt text) was attempted against the real
-Gemini REST endpoint and could not be completed here -- the API returned
-503 UNAVAILABLE twice in a row at the time this was written, a genuine
-external outage, not a code or config problem. This is the fallback: a
-content pin, not a behavioural proof.
+Whether it actually changes behaviour is a different question, answered by
+the live-model evaluation in tests/eval/personality_eval.py.
 """
 from __future__ import annotations
 
 import nova
 
 
-def test_the_directness_section_exists():
-    assert "## Directness" in nova.NOVA_CORE
+def test_the_pushback_policy_exists():
+    assert "## Agreeing and disagreeing" in nova.NOVA_SYSTEM_PROMPT
 
 
 def test_it_permits_real_pushback():
-    core = nova.NOVA_CORE.lower()
-    assert "roast the decision" in core or "say so plainly" in core
+    p = nova.NOVA_SYSTEM_PROMPT.lower()
+    assert "push back when it matters" in p
+    assert "you are not here to be agreed with" in p
 
 
-def test_it_explicitly_bounds_the_pushback_with_respect():
-    core = nova.NOVA_CORE.lower()
-    assert "not the person" in core
-    assert "not, ever" in core or "not unkind" in core or "not license to be unkind" in core
+def test_it_explicitly_bounds_the_pushback_with_respect_and_control():
+    p = nova.NOVA_SYSTEM_PROMPT.lower()
+    assert "never the person" in p
+    assert "they decide" in p and "not refusal" in p
 
 
-def test_cloud_and_offline_prompts_both_carry_it():
-    """The same NOVA online and offline -- one identity, not two."""
-    assert "## Directness" in nova.NOVA_SYSTEM_PROMPT
-    assert "## Directness" in nova.NOVA_OFFLINE_PROMPT
+def test_every_model_path_carries_it():
+    """One NOVA online, by voice, and offline -- not three."""
+    assert "## Agreeing and disagreeing" in nova.NOVA_VOICE_PROMPT
+    assert "disagree when the person is wrong" in nova.NOVA_OFFLINE_PROMPT.lower()
+
+
+def test_the_offline_prompt_stays_small_enough_for_a_local_model():
+    assert len(nova.NOVA_OFFLINE_PROMPT) < 3000

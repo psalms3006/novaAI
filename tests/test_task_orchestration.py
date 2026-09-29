@@ -447,4 +447,8 @@ def test_the_voice_is_told_once_at_the_end_not_during(tmp_path):
     m = _manager(tmp_path, Writer(tmp_path))
     m.set_notify(told.append)
     _settle(m, m.submit("Thesis", _steps()))
-    assert len(told) == 1 and "completed" in told[0] and "thesis.md" in told[0]
+    # The announcement follows the terminal status on the worker thread.
+    deadline = time.time() + 5
+    while not told and time.time() < deadline:
+        time.sleep(0.02)
+    assert len(told) == 1 and "is done" in told[0] and "thesis.md" in told[0]

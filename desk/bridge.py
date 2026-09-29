@@ -197,15 +197,26 @@ def _system_prompt(query: str, meta: dict, cid: str | None = None) -> str:
             f"{proj.get('instructions') or 'none'}"
         )
 
-    style = desk_settings.get("response_style", "balanced")
-    if style == "concise":
-        parts.append("\n\n## Response style\n"
-                     "Be concise: short, direct answers. Use lists sparingly. "
-                     "Skip pleasantries.")
-    elif style == "detailed":
-        parts.append("\n\n## Response style\n"
-                     "Be thorough: explain reasoning, include examples and "
-                     "supporting detail where useful.")
+    # Who NOVA is talking to -- the same block the voice session uses. Typed
+    # chat used to go without it, so NOVA knew the person's name and what
+    # they had told her about themselves only when spoken to.
+    try:
+        identity = desk_live._identity_block()
+        if identity:
+            parts.append("\n\n" + identity)
+    except Exception as e:
+        log.debug("identity block unavailable: %s", e)
+
+    # Layer B of nova_personality: what this person has asked of NOVA, with
+    # the Response style setting folded in (it used to be its own block).
+    try:
+        import nova_personality
+        adaptation = nova_personality.adaptation_block(
+            str(desk_settings.get("response_style", "balanced") or ""))
+        if adaptation:
+            parts.append("\n\n" + adaptation)
+    except Exception as e:
+        log.debug("adaptation block unavailable: %s", e)
 
     custom = (desk_settings.get("user_system_prompt") or "").strip()
     if custom:
@@ -658,7 +669,58 @@ def api_delete_conversation(cid):
 
 # ── chat ──────────────────────────────────────────────────────────────────────
 
+def _persona_filter(events):
+    """Strip filler openers ("Great question!", "Absolutely!") from replies.
+
+    The start of each stretch of streamed text is held back briefly -- until
+    a sentence ends or enough has arrived to judge -- cleaned once, and then
+    everything after it streams untouched. The final assistant text is
+    cleaned the same way, so what is stored matches what was shown.
+    """
+    import nova_personality
+    buf, holding = [], True
+
+    def flush():
+        text = "".join(buf)
+        buf.clear()
+        return {"type": "token", "text": nova_personality.clean_reply(text)} if text else None
+
+    for ev in events:
+        typ = ev.get("type")
+        if typ == "token" and holding:
+            buf.append(ev.get("text") or "")
+            joined = "".join(buf)
+            if len(joined) >= 60 or (len(joined) > 12 and any(c in joined for c in ".!?\n")):
+                holding = False
+                out = flush()
+                if out:
+                    yield out
+            continue
+        if typ != "token":
+            out = flush() if buf else None
+            if out:
+                yield out
+            holding = True          # the next stretch of text starts a new reply
+            if typ == "assistant" and ev.get("text"):
+                ev = dict(ev, text=nova_personality.clean_reply(ev["text"]))
+        yield ev
+    out = flush() if buf else None
+    if out:
+        yield out
+
+
 def _run_chat(cid, message, image_path, streaming):
+    try:
+        import nova_personality
+        changed = nova_personality.learn_from_message(message or "")
+        if changed:
+            log.info("[CHAT] adapted to the user: %s", ", ".join(changed))
+    except Exception:
+        pass
+    return _persona_filter(_run_chat_raw(cid, message, image_path, streaming))
+
+
+def _run_chat_raw(cid, message, image_path, streaming):
     meta = _meta_dict()
     msgs = [{"role": "system", "content": _system_prompt(message, meta, cid)}]
     msgs += _history_messages(cid, int(desk_settings.get("history_turns", 10)))

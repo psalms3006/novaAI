@@ -1074,6 +1074,27 @@ def _identity_block() -> str:
     return "[WHO YOU ARE TALKING TO]\n" + "\n".join(lines)
 
 
+def _adaptation_block() -> str:
+    """Layer B of nova_personality for the signed-in account."""
+    try:
+        import nova_personality
+        from desk import settings as _s
+        return nova_personality.adaptation_block(str(_s.get("response_style", "") or ""))
+    except Exception:
+        return ""
+
+
+def _learn_preferences(text: str) -> None:
+    """Explicit requests ("shorter answers", "no jokes") adjust Layer B."""
+    try:
+        import nova_personality
+        changed = nova_personality.learn_from_message(text)
+        if changed:
+            _log("[LIVE] adapted to the user: %s", ", ".join(changed))
+    except Exception:
+        pass
+
+
 _OCCUPATIONS = {"student": "a student", "developer": "a developer or engineer",
                 "researcher": "a researcher", "business_owner": "a business owner",
                 "professional": "a professional"}
@@ -2530,12 +2551,19 @@ class LiveManager:
     async def _connect_and_run(self) -> None:
         meta = _load_meta()
         mem_ctx = _build_memory_context(meta)
-        sys_prompt = _resolve("NOVA_SYSTEM_PROMPT", "")
+        # The spoken variant of NOVA's personality (nova_personality): same
+        # identity as text chat, shaped for the ear.
+        sys_prompt = _resolve("NOVA_VOICE_PROMPT", "") or _resolve("NOVA_SYSTEM_PROMPT", "")
         identity = _identity_block()
         if identity:
             # Before background memory, because it outranks it: memory is what
             # NOVA has picked up, this is what she has been told.
             sys_prompt += f"\n\n{identity}"
+        adaptation = _adaptation_block()
+        if adaptation:
+            # What this person has asked of NOVA (Layer B). After identity,
+            # before memory: it shapes how she talks, not what she knows.
+            sys_prompt += f"\n\n{adaptation}"
         if mem_ctx:
             sys_prompt += f"\n\n[BACKGROUND MEMORY]\n{mem_ctx}"
         tool_decls = _live_tool_declarations(_resolve("TOOL_DECLARATIONS", []))
@@ -3131,6 +3159,7 @@ class LiveManager:
                             threading.Thread(
                                 target=_remember_turn, args=(turn_user, turn_nova),
                                 name="nova-memory", daemon=True).start()
+                            _learn_preferences(turn_user)
 
 
                 if not got_turn:

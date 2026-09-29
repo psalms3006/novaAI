@@ -38,6 +38,7 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Callable, Dict, List, Optional
 
 import agent_activity
+import nova_personality as _persona
 import nova_paths
 
 log = logging.getLogger("nova.task")
@@ -1134,11 +1135,13 @@ class TaskManager:
     def _notify_done(self, t: Task) -> None:
         if not t.notify_done:
             return
-        msg = f"Task '{t.title}' {t.status.lower().replace('_', ' ')}."
-        if t.status == "COMPLETED" and t.artifacts:
-            msg += " Saved " + ", ".join(os.path.basename(a["path"]) for a in t.artifacts[:3]) + "."
-        elif t.status != "COMPLETED" and t.reason_for_stop:
-            msg += f" {t.reason_for_stop}"
+        # Said in NOVA's voice, owning the result and what review caught
+        # (nova_personality) -- not a status line from a dashboard.
+        try:
+            msg = _persona.task_outcome_message(
+                t.title, t.status, t.reason_for_stop, t.artifacts, t.reviews)
+        except Exception:
+            msg = f"Task '{t.title}' {t.status.lower().replace('_', ' ')}."
         fn = self._notify
         if fn is not None:
             try:
