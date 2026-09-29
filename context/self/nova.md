@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (96):
+Commits in the last 14 days (97):
 
+- 3110a0b 2026-09-28 Show instances, versions, usage and update rollout to admins
 - cde539e 2026-09-28 Add the owner's release tools: keygen, sign, publish-release, set-channel
 - b11d22f 2026-09-28 Give each account a NOVA instance, managed model access, and signed updates
 - 907ebe4 2026-09-28 Close four account-security holes found in the backend audit
@@ -154,8 +155,7 @@ Commits in the last 14 days (96):
 - f19b2b2 2026-09-21 Try a candidate extension at arm's length, and say what that does not cover
 - 02b8911 2026-09-21 Ask permission where the person can actually answer
 - f95a6a0 2026-09-20 Look at what a user points NOVA at, without running it
-- d87fe3c 2026-09-20 Notice when NOVA has gone quiet, instead of letting the user talk to nothing
-- ...and 56 more
+- ...and 57 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

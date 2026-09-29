@@ -15,6 +15,9 @@ def _default_memory_dir() -> Path:
     uninstalling/upgrade-replacing the install folder never touches session
     history. Development runs keep the historical ./nova_memories folder.
     """
+    if os.getenv("NOVA_DATA_DIR", "").strip():
+        # The signed-in account's folder (nova_lifecycle), or a test sandbox.
+        return Path(os.environ["NOVA_DATA_DIR"].strip()) / "nova_memories"
     if getattr(sys, "frozen", False):
         base = os.getenv("APPDATA")
         if base:

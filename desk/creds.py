@@ -232,7 +232,9 @@ def classify_credential(key: str) -> dict:
 # ── device identity ──────────────────────────────────────────────────────────
 
 def _device_path() -> Path:
-    return app_data_dir() / _DEVICE_FILE
+    # The installation's identity, shared by every account on this PC.
+    from .settings import machine_data_dir
+    return machine_data_dir() / _DEVICE_FILE
 
 
 def device_identity() -> dict:

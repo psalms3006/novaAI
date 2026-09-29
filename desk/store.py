@@ -14,21 +14,39 @@ import time
 
 from . settings import app_data_dir
 
-_LOCK = threading.Lock()
-_DB_PATH = app_data_dir() / "nova_desktop.db"
+# Reentrant: callers hold it around _conn(), which may create the schema
+# (taking it again) the first time an account's database is opened.
+_LOCK = threading.RLock()
+def _db_path():
+    # Resolved per call, not at import: the bridge is imported before anyone
+    # has signed in, and the conversations belong to whoever then does.
+    return app_data_dir() / "nova_desktop.db"
 
 
-def _conn():
-    conn = sqlite3.connect(str(_DB_PATH), timeout=30)
+_READY: set = set()      # database files whose schema is known to exist
+
+
+def _raw(path: str):
+    conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
-def _init():
+def _conn():
+    # The schema is ensured per database file, not once at import: each
+    # account has its own file, and it may not exist until that person signs in.
+    path = str(_db_path())
+    if path not in _READY:
+        _init(path)
+    return _raw(path)
+
+
+def _init(path: str | None = None):
+    path = path or str(_db_path())
     with _LOCK:
-        with _conn() as c:
+        with _raw(path) as c:
             c.execute(
                 """CREATE TABLE IF NOT EXISTS conversations (
                        id TEXT PRIMARY KEY,
@@ -64,9 +82,7 @@ def _init():
                 "CREATE INDEX IF NOT EXISTS idx_conversations_project "
                 "ON conversations(project_id)"
             )
-
-
-_init()
+        _READY.add(path)
 
 
 def new_conversation(title: str = "New chat", project_id: str = "") -> str:

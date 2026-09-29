@@ -148,7 +148,9 @@ def _clean_ui_prefs(update: dict) -> dict:
 _SAFE_KEYS = set(_DEFAULTS.keys())
 
 
-def app_data_dir() -> Path:
+def machine_data_dir() -> Path:
+    """%APPDATA%/NOVA: what belongs to this PC, not to a person (device
+    identity, downloaded models, knowledge files, logs)."""
     base = os.getenv("APPDATA") or ""
     if base:
         d = Path(base) / "NOVA"
@@ -156,6 +158,23 @@ def app_data_dir() -> Path:
         d = Path.home() / ".nova"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def app_data_dir() -> Path:
+    """The signed-in account's folder once one is active, so settings,
+    permissions, conversations and projects belong to that person
+    (nova_lifecycle). Before sign-in, and in builds with no accounts, the
+    machine folder as before."""
+    if os.getenv("NOVA_ACCOUNT_ID"):
+        try:
+            import nova_lifecycle
+            d = nova_lifecycle.active_account_dir()
+            if d is not None:
+                d.mkdir(parents=True, exist_ok=True)
+                return d
+        except Exception:
+            pass
+    return machine_data_dir()
 
 
 def settings_path() -> Path:

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import shutil
 import threading
 from dataclasses import dataclass
@@ -98,6 +99,9 @@ def _checksum(path: Path) -> str:
 
 
 def default_root() -> Path:
+    # Documents are the signed-in person's, so they live in their folder.
+    if os.getenv("NOVA_ACCOUNT_ID") and os.getenv("NOVA_DATA_DIR"):
+        return Path(os.environ["NOVA_DATA_DIR"]) / "rag"
     try:
         from nova_secure_store import app_dir
         return app_dir() / "rag"
