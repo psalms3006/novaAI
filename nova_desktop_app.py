@@ -37,6 +37,9 @@ except Exception:
 PORT = int(os.getenv("NOVA_DESK_PORT", "") or 8765)
 DESK_URL = f"http://127.0.0.1:{PORT}"
 START_MODE = os.getenv("NOVA_DESK_MODE", "full")
+# Started with Windows as "background" (desk.startup): the orb only.
+if "--background" in sys.argv:
+    START_MODE = "ambient"
 _log_file = Path.home() / ".nova" / "desktop_startup.log"
 
 
@@ -126,7 +129,44 @@ def _claim_single_instance():
         return None
 
 
+def _arg_after(flag: str) -> str:
+    try:
+        return sys.argv[sys.argv.index(flag) + 1]
+    except (ValueError, IndexError):
+        return ""
+
+
+def _health_check_only() -> int:
+    """Run by the update helper after installing a new version: prove this
+    build starts (imports load, the server answers) without opening a window,
+    touching an account, or starting the brain. The helper restores the
+    previous version if the marker never appears."""
+    import requests
+    version = _arg_after("--post-update")
+    _log(f"Health check for {version or '?'} on {DESK_URL}")
+
+    def _serve():
+        from desk.bridge import run_desk_server
+        run_desk_server({})
+    threading.Thread(target=_serve, name="NOVAHealth", daemon=True).start()
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        try:
+            if requests.get(f"{DESK_URL}/api/health", timeout=2).status_code == 200:
+                from desk import updater
+                updater.mark_healthy(version)
+                _log("Health check passed")
+                return 0
+        except Exception:
+            pass
+        time.sleep(0.5)
+    _log("Health check failed: the server never answered")
+    return 1
+
+
 def main() -> int:
+    if "--health-check-only" in sys.argv:
+        return _health_check_only()
     _log("=" * 60)
     _log("NOVA Desktop starting up")
     _log(f"START_MODE={START_MODE}")
@@ -149,6 +189,17 @@ def main() -> int:
         return 0
     # Held for the life of the process; released by the kernel on exit.
     globals()["_INSTANCE_LOCK"] = _instance_lock
+
+    # What happened to the last update (installed / rolled back), recorded
+    # and reported before anything else can overwrite it.
+    try:
+        from desk import updater as _updater
+        _res = _updater.collect_result()
+        if _res:
+            _log(f"Last update: {_res.get('from')} -> {_res.get('version')}: {_res.get('result')}"
+                 + (f" ({_res.get('error')})" if _res.get('error') else ""))
+    except Exception as e:
+        _log(f"Update result check failed: {e}")
 
     # ── Who is this, and have they been here before? ─────────────────
     # Before credentials and before the brain: both read the signed-in
@@ -633,7 +684,32 @@ def main() -> int:
     wait_thread = threading.Thread(target=_wait_for_backend, daemon=True)
     wait_thread.start()
 
+    # Automatic updates: checked in the background, applied when NOVA quits.
+    try:
+        from desk import updater as _updater
+
+        def _required(version):
+            try:
+                import desk.bridge as _br
+                _br.publish_event({"type": "update.required", "version": version,
+                                   "message": "This version of NOVA is no longer supported. "
+                                              "Updating now…"})
+            except Exception:
+                pass
+            time.sleep(4)          # long enough for the window to say why
+        _updater.start_background(on_required=_required)
+    except Exception as e:
+        _log(f"Updater not started: {e}")
+
     webview.start()
+
+    try:
+        from desk import updater as _updater
+        if _updater.staged():
+            _log("Update staged: handing it to the installer helper on quit")
+            _updater.apply_staged(relaunch=False)
+    except Exception as e:
+        _log(f"Update on quit failed to start: {e}")
 
     if ambient_overlay:
         ambient_overlay.destroy()

@@ -29,8 +29,9 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request,sys; \
 sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=8).status==200 else 1)"
 
+# Timeout 300 s: streamed model answers pass through the gateway.
 # Threads, not extra workers: the work is IO-bound on Postgres and Resend, and
 # the Supabase pooler is the real connection limit.
 CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--threads", "4", \
-     "--timeout", "60", "--access-logfile", "-", "--error-logfile", "-", \
+     "--timeout", "300", "--access-logfile", "-", "--error-logfile", "-", \
      "nova_cloud.app:create_app()"]

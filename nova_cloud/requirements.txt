@@ -25,3 +25,9 @@ requests>=2.31
 
 # configuration
 python-dotenv>=1.0
+
+# model access: mints short-lived Gemini Live tokens (api_model.py)
+google-genai>=2.17
+
+# release signatures: Ed25519 verification when publishing updates
+cryptography>=42

@@ -281,6 +281,9 @@ a = Analysis(
         (os.path.join(ROOT, ".env.template"), "."),
         # runtime config template (model selection etc.) — no secrets inside
         (os.path.join(ROOT, "nova_config.toml"), "."),
+        # The release-signing PUBLIC key (tools/release.py keygen). Updates
+        # are verified against it; an empty file means updates are off.
+        (os.path.join(ROOT, "packaging", "update_public_key.txt"), "."),
     ],
     hiddenimports=hidden,
     hookspath=[],

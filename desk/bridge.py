@@ -2213,6 +2213,21 @@ def api_onboarding_complete():
     return jsonify({"ok": True, "auth": _auth_status()})
 
 
+@app.get("/api/update")
+@require_token
+def api_update_status():
+    """Automatic updates: what is installed, what is staged, what happened."""
+    from desk import updater
+    s = updater.status()
+    s["staged"] = updater.staged()
+    try:
+        import json as _json
+        s["history"] = _json.loads((updater.update_dir() / "history.json").read_text("utf-8"))[-5:]
+    except Exception:
+        s["history"] = []
+    return jsonify({"ok": True, **s})
+
+
 @app.get("/api/live/token")
 @require_token
 def api_live_token():

@@ -1,0 +1,44 @@
+# NOVA Cloud on one small server (the EC2 t3.micro): the API in Docker behind
+# Caddy, which obtains and renews the HTTPS certificate by itself.
+#
+#   cd ~/project-nova/deploy/nova-cloud
+#   cp env.production.example .env        # then fill it in (see the guide)
+#   docker compose up -d --build
+#
+# The database is NOT here: it is Supabase (managed Postgres), so this server
+# can be rebuilt or replaced without losing a single account.
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: nova_cloud/Dockerfile
+    env_file: .env
+    environment:
+      NOVA_ENV: production
+      # Caddy is the one proxy in front; only its X-Forwarded-For entry counts.
+      NOVA_TRUSTED_PROXY_HOPS: "1"
+    restart: unless-stopped
+    expose:
+      - "8080"
+    # A t3.micro has 1 GB of RAM; keep the API well inside it.
+    mem_limit: 450m
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      NOVA_DOMAIN: ${NOVA_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+    mem_limit: 120m
+
+volumes:
+  caddy_data:
+  caddy_config:
