@@ -264,6 +264,18 @@ def _persist_turn(cid: str, user_text: str, events: list, started: float):
                 tools[-1].update({"ok": bool(ev.get("ok")), "summary": ev.get("summary", "")})
     content = (final_text if final_text is not None else "".join(streamed_parts)).strip()
     mid = desk_store.upsert_last_assistant(cid, content, {"tools": tools, "latency": round(time.time() - started, 2)})
+    # The session archive is what NOVA reads to know what you talked about
+    # last time; typed turns never reached it, so every desktop session was
+    # archived as "Empty session".
+    try:
+        _mem = getattr(_nova, "_nova_memory", None)
+        if _mem is not None:
+            if (user_text or "").strip():
+                _mem.log_turn("user", user_text.strip())
+            if content:
+                _mem.log_turn("assistant", content)
+    except Exception as e:
+        log.warning("[DESK] session archive not updated: %s", e)
     convo = desk_store.get_conversation(cid)
     if convo and convo["title"] in ("New chat", ""):
         title = (user_text or "New chat").strip().splitlines()[0][:48]
@@ -2463,9 +2475,12 @@ def _collect_mind_map_nodes():
 
     # Working memory nodes (current session)
     try:
-        cid = desk_store.current_conversation_id() if hasattr(desk_store, "current_conversation_id") else None
-        if cid:
-            msgs = desk_store.get_messages(cid, limit=20)
+        # The most recent conversation. This used to call two store functions
+        # that do not exist, behind a hasattr guard, so the region was always empty.
+        recent = desk_store.list_conversations(limit=1)
+        convo = desk_store.get_conversation(recent[0]["id"]) if recent else None
+        if convo:
+            msgs = (convo.get("messages") or [])[-20:]
             for m in msgs:
                 if m.get("role") == "user":
                     nodes.append({

@@ -83,14 +83,14 @@ def _write_docx(path: Path, content: str, title: str) -> None:
         # of identical paragraphs is not a document.
         if stripped.startswith("#"):
             level = min(len(stripped) - len(stripped.lstrip("#")), 4)
-            doc.add_heading(stripped.lstrip("# ").strip(), level=max(1, level))
+            doc.add_heading(_plain(stripped.lstrip("# ").strip()), level=max(1, level))
         elif stripped[:2] in ("- ", "* "):
-            doc.add_paragraph(stripped[2:].strip(), style="List Bullet")
+            _md_runs(doc.add_paragraph(style="List Bullet"), stripped[2:].strip())
         elif re.match(r"^\d+[.)]\s", stripped):
-            doc.add_paragraph(re.sub(r"^\d+[.)]\s*", "", stripped),
-                              style="List Number")
+            _md_runs(doc.add_paragraph(style="List Number"),
+                     re.sub(r"^\d+[.)]\s*", "", stripped))
         else:
-            doc.add_paragraph(stripped)
+            _md_runs(doc.add_paragraph(), stripped)
     doc.save(str(path))
 
 
@@ -112,7 +112,7 @@ def _write_pdf(path: Path, content: str, title: str) -> None:
 
     def flush_bullets():
         if bullets:
-            flow.append(ListFlowable([ListItem(Paragraph(_escape(b), body))
+            flow.append(ListFlowable([ListItem(Paragraph(_inline_pdf(b), body))
                                       for b in bullets], bulletType="bullet"))
             flow.append(Spacer(1, 6))
             bullets.clear()
@@ -125,13 +125,13 @@ def _write_pdf(path: Path, content: str, title: str) -> None:
         if stripped.startswith("#"):
             flush_bullets()
             level = min(len(stripped) - len(stripped.lstrip("#")), 3)
-            flow.append(Paragraph(_escape(stripped.lstrip("# ").strip()),
+            flow.append(Paragraph(_inline_pdf(stripped.lstrip("# ").strip()),
                                   styles[f"Heading{max(1, level)}"]))
         elif stripped[:2] in ("- ", "* "):
             bullets.append(stripped[2:].strip())
         else:
             flush_bullets()
-            flow.append(Paragraph(_escape(stripped), body))
+            flow.append(Paragraph(_inline_pdf(stripped), body))
     flush_bullets()
 
     if not flow:
@@ -143,6 +143,53 @@ def _write_pdf(path: Path, content: str, title: str) -> None:
 def _escape(text: str) -> str:
     """reportlab reads a mini-markup, so raw & < > would break the build."""
     return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+#: Inline Markdown the model writes: **bold**, *italic* / _italic_, `code`.
+#: It used to reach PDFs as literal asterisks ("**Communicate:**").
+_MD_INLINE = re.compile(r"(\*\*[^*]+\*\*|__[^_]+__|`[^`]+`|\*[^*\s][^*]*\*|(?<![A-Za-z0-9])_[^_\s][^_]*_(?![A-Za-z0-9]))")
+
+
+def _md_parts(text: str):
+    """(kind, text) pieces: kind is '', 'b', 'i' or 'code'."""
+    pos = 0
+    for m in _MD_INLINE.finditer(text or ""):
+        if m.start() > pos:
+            yield "", text[pos:m.start()]
+        tok = m.group(0)
+        if tok[:2] in ("**", "__"):
+            yield "b", tok[2:-2]
+        elif tok[0] == "`":
+            yield "code", tok[1:-1]
+        else:
+            yield "i", tok[1:-1]
+        pos = m.end()
+    if pos < len(text or ""):
+        yield "", text[pos:]
+
+
+def _plain(text: str) -> str:
+    return "".join(t for _, t in _md_parts(text))
+
+
+def _inline_pdf(text: str) -> str:
+    out = []
+    for kind, t in _md_parts(text):
+        t = _escape(t)
+        out.append({"b": f"<b>{t}</b>", "i": f"<i>{t}</i>",
+                    "code": f'<font face="Courier">{t}</font>'}.get(kind, t))
+    return "".join(out)
+
+
+def _md_runs(paragraph, text: str) -> None:
+    for kind, t in _md_parts(text):
+        run = paragraph.add_run(t)
+        if kind == "b":
+            run.bold = True
+        elif kind == "i":
+            run.italic = True
+        elif kind == "code":
+            run.font.name = "Consolas"
 
 
 def _rows_from(content: str) -> list[list[str]]:
@@ -188,11 +235,11 @@ def _write_pptx(path: Path, content: str, title: str) -> None:
             continue
         if stripped.startswith("#") or current is None:
             current = prs.slides.add_slide(prs.slide_layouts[1])
-            current.shapes.title.text = stripped.lstrip("# ").strip() or "Slide"
+            current.shapes.title.text = _plain(stripped.lstrip("# ").strip()) or "Slide"
         else:
             body = current.placeholders[1].text_frame
             para = body.add_paragraph() if body.text else body.paragraphs[0]
-            para.text = stripped.lstrip("-* ").strip()
+            para.text = _plain(stripped.lstrip("-* ").strip())
     if not prs.slides:
         prs.slides.add_slide(prs.slide_layouts[1]).shapes.title.text = title or "Untitled"
     prs.save(str(path))

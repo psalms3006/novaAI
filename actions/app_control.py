@@ -117,6 +117,31 @@ def _enum_windows() -> list[tuple[int, str]]:
     return found
 
 
+#: Words that name the browser or app chrome, not the thing the person means.
+_TITLE_NOISE = {"google", "chrome", "microsoft", "edge", "mozilla", "firefox", "window",
+                "the", "and", "http", "https", "www", "com", "org", "net", "html"}
+
+
+def _title_words(text: str) -> list[str]:
+    import re as _re
+    return [w for w in _re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) > 2 and w not in _TITLE_NOISE]
+
+
+def _not_found(title: str) -> str:
+    """Say what *is* open, so the next attempt can use a real title instead
+    of another guess (four blind guesses at a Chrome tab, 2026-09-2x)."""
+    seen, names = set(), []
+    for _, t in _enum_windows():
+        t = t.strip()
+        if t and t not in seen and t not in ("Program Manager", "Settings"):
+            seen.add(t)
+            names.append(t)
+    shown = "; ".join(n[:70] for n in names[:15])
+    return (f"I couldn't find a window matching {title!r}. Open windows: {shown}. "
+            f"Use one of these titles (a distinctive part is enough).")
+
+
 def _find_handle(title: str, timeout: float = FIND_TIMEOUT_S) -> tuple[int, str] | None:
     """The handle and title of the best window matching `title`.
 
@@ -137,8 +162,19 @@ def _find_handle(title: str, timeout: float = FIND_TIMEOUT_S) -> tuple[int, str]
     user32.IsHungAppWindow.restype = wintypes.BOOL
 
     while True:
-        candidates = [(h, t) for h, t in _enum_windows()
-                      if not want or want in t.lower()]
+        windows = _enum_windows()
+        candidates = [(h, t) for h, t in windows if not want or want in t.lower()]
+        if not candidates and want:
+            # The model rarely knows a window's exact title: it guesses
+            # "Founder Profiles - Google Chrome" for a tab titled differently,
+            # or passes the page's URL, which no title contains. Fall back to
+            # the words: every meaningful word present, else most of them.
+            words = _title_words(want)
+            if words:
+                scored = [(sum(w in t.lower() for w in words), h, t) for h, t in windows]
+                best = max((s for s, _, _ in scored), default=0)
+                if best and (best == len(words) or best >= max(2, (len(words) + 1) // 2)):
+                    candidates = [(h, t) for s, h, t in scored if s == best]
         if candidates:
             def rank(item):
                 handle, text = item
@@ -394,7 +430,7 @@ def _act_focus(args: dict) -> str:
     title = args.get("window") or args.get("app") or ""
     found = _find_handle(title)
     if found is None:
-        return f"I couldn't find a window matching {title!r}."
+        return _not_found(title)
     handle, text = found
     _raise(handle)
     # Verify rather than assume: focus can be refused for a window owned by an
@@ -410,7 +446,7 @@ def _act_inspect(args: dict) -> str:
     title = args.get("window") or args.get("app") or ""
     found = _find_handle(title)
     if found is None:
-        return f"I couldn't find a window matching {title!r}."
+        return _not_found(title)
     handle, wtitle = found
 
     def _read() -> list[dict]:
@@ -433,7 +469,7 @@ def _act_click(args: dict) -> str:
     kind = args.get("control_type") or ""
     win = _find_window(title)
     if win is None:
-        return f"I couldn't find a window matching {title!r}."
+        return _not_found(title)
     ctrl = _match(win, name, kind)
     if ctrl is None:
         available = ", ".join(c["name"] for c in _controls(win, limit=12))
@@ -485,7 +521,7 @@ def _act_type(args: dict) -> str:
         return "There's nothing to type."
     found = _find_handle(title)
     if found is None:
-        return f"I couldn't find a window matching {title!r}."
+        return _not_found(title)
     handle, wtitle = found
 
     # A window that is not responding cannot receive input, and saying "typed"
@@ -643,7 +679,7 @@ def _act_press(args: dict) -> str:
         # the window, raise it, and refuse if it did not come forward.
         found = _find_handle(title)
         if found is None:
-            return f"I couldn't find a window matching {title!r}."
+            return _not_found(title)
         handle, target = found
         if _is_hung(handle, target):
             return (f"{target} is not responding, so it can't accept input. "

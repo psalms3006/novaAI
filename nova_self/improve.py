@@ -66,6 +66,27 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def unavailable_reason(root: Optional[Path] = None) -> str:
+    """Why self-editing cannot run here, or '' if it can.
+
+    The installed app is compiled: it carries no editable source, no test
+    suite and no git history, and its interpreter *is* NOVA.exe -- so the old
+    test command, "<interpreter> -m pytest tests", would have started a second
+    copy of NOVA instead of running a test. Say so plainly instead of
+    rehearsing something that cannot be rehearsed.
+    """
+    if getattr(sys, "frozen", False):
+        return ("I'm running as the installed app, which doesn't include my source code or "
+                "test suite, so I can't safely change myself from here. Improvements to NOVA "
+                "come through updates. I can write the change up as a proposal for the "
+                "developer instead.")
+    root = Path(root) if root else repo_root()
+    if not (root / "tests").is_dir() or not (root / ".git").exists():
+        return ("My source code here isn't a development checkout with its tests, so I can't "
+                "rehearse a change to myself safely.")
+    return ""
+
+
 @dataclass
 class Edit:
     """One exact replacement in one file.
@@ -194,6 +215,9 @@ class SelfImprover:
         working tree. That is the trade: it will not see a change that
         depends on uncommitted work, and in exchange a result means something.
         """
+        why_not = unavailable_reason(self.root)
+        if why_not:
+            return Outcome(False, "unavailable", why_not, proposal.attempt_id)
         attempt = Attempt(
             attempt_id=proposal.attempt_id, problem=proposal.problem,
             rationale=proposal.rationale, risk=proposal.risk,
@@ -259,7 +283,10 @@ class SelfImprover:
         for edit in proposal.edits:
             target = tree / edit.path
             if not target.is_file():
-                raise ValueError(f"{edit.path}: no such file in the workspace")
+                raise ValueError(
+                    f"{edit.path}: no such file in the workspace. Self-edits change "
+                    f"existing files only; read the file you mean first (action=read) "
+                    f"and propose an edit to it.")
             text = target.read_text(encoding="utf-8")
             target.write_text(edit.apply_to(text), encoding="utf-8",
                               newline="")

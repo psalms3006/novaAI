@@ -317,6 +317,53 @@ def _remember_turn(user_text: str, nova_text: str) -> None:
         _log("[LIVE] memory extraction unavailable: %s", e)
 
 
+def _confirmation_waiting() -> bool:
+    """Is a "should I proceed?" question waiting for the person right now?"""
+    try:
+        from desk.confirm import store
+        return bool(store.pending(limit=1))
+    except Exception:
+        return False
+
+
+def _archive_turn(holder: dict, user_text: str, nova_text: str) -> None:
+    """Keep the conversation itself, the way typed chat already is. Runs in a thread.
+
+    Voice turns were only ever offered to fact extraction, so a spoken session
+    left nothing behind: no conversation in the window's history, and the
+    session archive -- what NOVA reads to know what you talked about last time
+    -- recorded every desktop session as "Empty session". One conversation per
+    voice session, stored locally in this account's own database.
+    """
+    user_text = (user_text or "").strip()
+    nova_text = (nova_text or "").strip()
+    if not user_text and not nova_text:
+        return
+    try:
+        from desk import store as desk_store
+        with holder.setdefault("_lock", threading.Lock()):
+            if not holder.get("cid"):
+                title = "Voice — " + (" ".join(user_text.split()[:6]) or time.strftime("%H:%M"))
+                holder["cid"] = desk_store.new_conversation(title=title[:80])
+            cid = holder["cid"]
+            if user_text:
+                desk_store.add_message(cid, "user", user_text, {"voice": True})
+            if nova_text:
+                desk_store.add_message(cid, "assistant", nova_text, {"voice": True})
+    except Exception as e:
+        _log("[LIVE] could not save the voice turn to history: %s", e)
+    try:
+        import nova as _nova
+        mem = getattr(_nova, "_nova_memory", None)
+        if mem is not None:
+            if user_text:
+                mem.log_turn("user", user_text)
+            if nova_text:
+                mem.log_turn("assistant", nova_text)
+    except Exception as e:
+        _log("[LIVE] could not add the voice turn to the session archive: %s", e)
+
+
 def _telemetry(event: str, **attrs) -> None:
     """Operational telemetry. Metadata only -- no transcripts, no audio, ever.
 
@@ -1315,6 +1362,7 @@ class LiveManager:
             self._has_greeted = False
             self._auth_rejected = False
             self._offline = False
+            self._voice_history = {}          # a new voice session is a new conversation
         self._trace = VoiceTrace(uuid.uuid4().hex[:6])
         self._trace.mark("connect_start")
         self._thread = threading.Thread(target=self._run_loop, name="nova-live", daemon=True)
@@ -2830,10 +2878,14 @@ class LiveManager:
         """Log and report a connection that failed; returns the new count."""
         if not connected_ok:
             failures += 1
-        _log(
-            "[LIVE] connect/run error (failure %d/%d): %s",
-            failures, self.MAX_RECONNECT_ATTEMPTS, e,
-        )
+        # While offline the same error repeats every few seconds by design
+        # (so voice resumes the moment the network does); it once filled the
+        # log with hundreds of identical lines. Log it once per outage.
+        if not (self._offline and self._is_offline(str(e))):
+            _log(
+                "[LIVE] connect/run error (failure %d/%d): %s",
+                failures, self.MAX_RECONNECT_ATTEMPTS, e,
+            )
         self._last_error = str(e)
         if self._is_auth_failure(str(e)):
             # Permanent: report it in the user's language and stop.
@@ -3155,6 +3207,13 @@ class LiveManager:
                         # involve a model call and must never delay audio.
                         turn_user, turn_nova = " ".join(heard), " ".join(said)
                         heard, said = [], []
+                        if turn_user or turn_nova:
+                            if not hasattr(self, "_voice_history"):
+                                self._voice_history = {}
+                            threading.Thread(
+                                target=_archive_turn,
+                                args=(self._voice_history, turn_user, turn_nova),
+                                name="nova-voice-history", daemon=True).start()
                         if turn_user:
                             threading.Thread(
                                 target=_remember_turn, args=(turn_user, turn_nova),
@@ -3460,9 +3519,9 @@ class LiveManager:
         work = agent_activity.begin(agent_activity.agent_for_tool(name),
                                     _tool_action(name, args), source="voice")
         try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(self._execute_tool, name, args),
-                timeout=budget)
+            result = await self._await_tool(
+                asyncio.ensure_future(asyncio.to_thread(self._execute_tool, name, args)),
+                budget)
         except asyncio.TimeoutError:
             # Say it failed, and say not to try again.
             #
@@ -3491,6 +3550,27 @@ class LiveManager:
                 id=fc.id, name=name, response=response,
                 scheduling=gtypes.FunctionResponseScheduling.WHEN_IDLE)
         return gtypes.FunctionResponse(id=fc.id, name=name, response=response)
+
+    @staticmethod
+    async def _await_tool(task: "asyncio.Future", budget: float) -> Any:
+        """Wait for a tool, but not against the person.
+
+        The budget is for the tool's own work. While NOVA is waiting for the
+        person to answer "should I proceed?", the clock stops -- it used to
+        keep running, so a read that needed a yes gave up at 30 s while the
+        question was still on screen, and the "yes" arrived for nothing. The
+        confirmation store has its own limit (five minutes), after which it
+        answers "no" itself.
+        """
+        deadline = time.time() + budget
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=min(1.0, max(0.05, deadline - time.time())))
+            if done:
+                return task.result()
+            if _confirmation_waiting():
+                deadline = max(deadline, time.time() + 5.0)
+            elif time.time() >= deadline:
+                raise asyncio.TimeoutError()
 
     @staticmethod
     def _execute_tool(name: str, args: dict) -> Any:

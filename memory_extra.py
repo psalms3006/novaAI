@@ -34,6 +34,14 @@ MAX_COMBINED_LENGTH = _nova.MAX_COMBINED_LENGTH
 genai = _nova.genai if HAS_GEMINI else None
 _gemini_generate_with_delay = _nova._gemini_generate_with_delay
 VISION_MODEL = _nova.VISION_MODEL
+#: Fact extraction runs on its own model. It used to share gemini-flash-latest
+#: with typed chat -- on the free tier one pool of 20 requests a day -- so every
+#: fact remembered cost the person a reply, and a busy day starved both.
+MEMORY_MODEL = os.getenv("NOVA_MEMORY_MODEL", "").strip() or "gemini-flash-lite-latest"
+#: Turns worth remembering that could not be processed yet (rate limit, model
+#: busy, offline). Kept on disk and processed later -- never silently dropped.
+MEMORY_PENDING_FILE = MEMORY_META_FILE.parent / "memory_pending.jsonl"
+_PENDING_MAX = 200
 
 _faiss_index = None
 
@@ -432,35 +440,111 @@ def _should_extract_memory(user_msg: str, ai_reply: str) -> bool:
     return personal or len(text.split()) >= 6
 
 
+def _queue_pending(user_msg: str, ai_reply: str) -> None:
+    try:
+        with _memory_lock:
+            lines = []
+            if MEMORY_PENDING_FILE.exists():
+                lines = MEMORY_PENDING_FILE.read_text(encoding="utf-8").splitlines()
+            lines.append(json.dumps({"user": user_msg[:2000], "nova": (ai_reply or "")[:2000],
+                                     "at": time.time()}, ensure_ascii=False))
+            MEMORY_PENDING_FILE.parent.mkdir(parents=True, exist_ok=True)
+            MEMORY_PENDING_FILE.write_text("\n".join(lines[-_PENDING_MAX:]) + "\n", encoding="utf-8")
+    except Exception as e:
+        log.warning("Could not keep a turn for later memory processing: %s", e)
+
+
+def _take_pending(n: int = 3) -> list:
+    try:
+        with _memory_lock:
+            if not MEMORY_PENDING_FILE.exists():
+                return []
+            lines = [l for l in MEMORY_PENDING_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
+            take, keep = lines[:n], lines[n:]
+            if keep:
+                MEMORY_PENDING_FILE.write_text("\n".join(keep) + "\n", encoding="utf-8")
+            else:
+                MEMORY_PENDING_FILE.unlink()
+        return [json.loads(l) for l in take]
+    except Exception as e:
+        log.warning("Could not read turns waiting for memory processing: %s", e)
+        return []
+
+
+def pending_count() -> int:
+    try:
+        return sum(1 for l in MEMORY_PENDING_FILE.read_text(encoding="utf-8").splitlines() if l.strip())
+    except Exception:
+        return 0
+
+
+def process_pending(n: int = 3) -> int:
+    """Work through turns that were kept while the model was unavailable."""
+    done = 0
+    for item in _take_pending(n):
+        if _is_rate_limited():
+            _queue_pending(item.get("user", ""), item.get("nova", ""))
+            break
+        ok = _extract(item.get("user", ""), item.get("nova", ""), load_memory())
+        if not ok:
+            break                     # it was re-queued; try again later
+        done += 1
+    return done
+
+
 def extract_memory_updates(user_msg: str, ai_reply: str, meta: dict) -> dict:
     """Extract and store personal facts from conversation using Gemini REST.
-    Runs heuristic gate first — only hits the API if content is likely useful.
-    Silently skips while rate-limited to avoid 429 spam in the log."""
-    if not (HAS_GEMINI and GEMINI_API_KEY):
-        return meta
+
+    Runs a heuristic gate first -- only calls the model if the turn is likely
+    to hold something worth keeping. While the provider is rate-limited or
+    unreachable the turn is *kept* (memory_pending.jsonl) and processed later,
+    instead of being dropped as it used to be."""
+    # Any turn is a chance to catch up on what was kept while the model was busy.
+    if HAS_GEMINI and _api_key() and not _is_rate_limited() and pending_count():
+        process_pending(2)
     if not _should_extract_memory(user_msg, ai_reply):
         return meta  # Nothing worth storing — skip entirely
-    if _is_rate_limited():
-        return meta  # Quota exhausted — skip silently, don't spam log
+    if not (HAS_GEMINI and _api_key()) or _is_rate_limited():
+        _queue_pending(user_msg, ai_reply)
+        return meta
+    _extract(user_msg, ai_reply, meta)
+    if pending_count():
+        process_pending()
+    return meta
+
+
+def _api_key() -> str:
+    # Read now, not at import: the key can arrive after NOVA started
+    # (onboarding, a switch to the person's own key, managed mode).
+    return os.environ.get("GEMINI_API_KEY", "").strip() or GEMINI_API_KEY
+
+
+def _extract(user_msg: str, ai_reply: str, meta: dict) -> bool:
+    """One extraction call. True if it reached a verdict; False if the turn
+    had to be kept for later."""
     combined = (user_msg + " " + ai_reply)[:MAX_COMBINED_LENGTH]
     prompt = (
         "Extract personal facts from this conversation. "
         "Return ONLY a JSON object with optional fields: user_name, user_gender, new_fact, new_preference. "
-        "Rules: Return {} if nothing new. new_fact: one atomic fact. No markdown, raw JSON only.\n\n"
+        "Rules: Return {} if nothing new. new_fact: one atomic fact about the user, their "
+        "life, work, people or standing wishes -- never a description of what is on the "
+        "screen, which window is open, or what NOVA just did. No markdown, raw JSON only.\n\n"
         f"Conversation: {combined}"
     )
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        response = _gemini_generate_with_delay(
-            client,
-            model=VISION_MODEL,
-            contents=[prompt]
-        )
+        client = genai.Client(api_key=_api_key())
+        try:
+            response = _gemini_generate_with_delay(client, model=MEMORY_MODEL, contents=[prompt])
+        except Exception as e:
+            if "404" not in str(e) and "NOT_FOUND" not in str(e):
+                raise
+            # A retired or unavailable model id must not end memory.
+            response = _gemini_generate_with_delay(client, model=VISION_MODEL, contents=[prompt])
         text = (response.text or "{}").strip()
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
         text = re.sub(r"```\s*$", "", text, flags=re.MULTILINE).strip()
         if not text:
-            return meta
+            return True
         updates = json.loads(text)
         if updates.get("user_name"):
             meta["user_name"] = str(updates["user_name"])[:50]
@@ -471,10 +555,14 @@ def extract_memory_updates(user_msg: str, ai_reply: str, meta: dict) -> dict:
         if updates.get("new_preference"):
             add_memory_fact(f"Preference: {str(updates['new_preference'])[:500]}", meta)
         _reset_rate_limit()
-        return meta
+        return True
+    except json.JSONDecodeError:
+        return True                   # the model answered, just not in JSON: nothing to keep
     except Exception as e:
         _note_extraction_failure(str(e))
-    return meta
+        if _is_transient_provider_error(str(e)) or "getaddrinfo" in str(e) or "connect" in str(e).lower():
+            _queue_pending(user_msg, ai_reply)
+        return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════

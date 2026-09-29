@@ -291,14 +291,12 @@ def run_turn(
     # which routes through IntelligenceRouter — works with or without Gemini key
     if HAS_GEMINI and GEMINI_API_KEY and genai and gtypes:
         try:
+            # A back-off recorded by *another* caller (memory extraction,
+            # vision) used to refuse the whole chat for up to 30 minutes. The
+            # router has its own fallbacks (another model, then the offline
+            # one), so say so and carry on instead of turning the person away.
             if _is_rate_limited and callable(_is_rate_limited) and _is_rate_limited():
-                yield _ev("error", message=(
-                    "Gemini is rate-limited right now (free-tier quota). "
-                    "Please wait a minute and retry."
-                ))
-                if _publish_task_done:
-                    _publish_task_done(task_id, ok=False, summary="Rate limited")
-                return
+                yield _ev("status", label="Gemini is busy — using a fallback if needed")
         except Exception:
             pass
     else:

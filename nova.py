@@ -1257,6 +1257,14 @@ try:
 except Exception as _cap_err:
     log.warning("tool output cap not installed: %s", _cap_err)
 
+try:
+    from nova_core import hooks as _hooks_mod
+    from nova_core.errors import log_failures as _log_tool_failures
+    _hooks_mod.remove(_log_tool_failures)
+    _hooks_mod.add_post(_log_tool_failures, "*", name="log_failures")
+except Exception as _lf_err:
+    log.warning("tool failure logging not installed: %s", _lf_err)
+
 # OpenAI-compatible tool definitions (used by Ollama when model supports tools)
 TOOL_DEFINITIONS_OPENAI = [
     {

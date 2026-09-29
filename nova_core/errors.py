@@ -96,4 +96,28 @@ def advice(c: ErrorClass) -> str:
     return _ADVICE[c]
 
 
-__all__ = ["ErrorClass", "classify", "from_status", "retryable", "advice"]
+#: How a tool says it did not work. Only these are logged: successful results
+#: can hold the person's content, and the log is for finding faults.
+_FAILURE_OPENERS = re.compile(
+    r"^(error|failed|refused|action cancelled|i can'?t|i couldn'?t|could not|couldn'?t|"
+    r"unable to|tool '[^']+' (is unavailable|error|encountered)|the '[^']+' tool did not|"
+    r"no confirmation received|permission denied|traceback|[a-z_]+ error:)", re.I)
+
+
+def looks_failed(result) -> bool:
+    return isinstance(result, str) and bool(_FAILURE_OPENERS.match(result.strip()))
+
+
+def log_failures(tool: str, args: dict, result, meta: dict):
+    """Post-hook: leave a trail when a tool fails, so the next look at the log
+    shows what went wrong -- not just "tool X finished in 0.1s"."""
+    if looks_failed(result):
+        import logging
+        c = classify(result)
+        logging.getLogger("nova.tools").warning(
+            "[TOOL] %s failed (%s): %s", tool, c.value, result.strip().replace("\n", " ")[:160])
+    return None
+
+
+__all__ = ["ErrorClass", "classify", "from_status", "retryable", "advice",
+           "looks_failed", "log_failures"]

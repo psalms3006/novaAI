@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (107):
+Commits in the last 14 days (108):
 
+- 8e54747 2026-09-29 Self-extending skills, tool hooks, deferred MCP tools, and the Claude Code audit
 - b6d42fb 2026-09-29 Eval: selectable model, fairer confidence rubric, first partial live results
 - 9ac080b 2026-09-29 Add NOVA's release-signing public key; make the live eval patient with 503s
 - 5629540 2026-09-29 Give NOVA a persistent behavioural identity above the model layer
@@ -154,8 +155,7 @@ Commits in the last 14 days (107):
 - fc807ad 2026-09-23 Wire the self-knowledge summary into NOVA's actual system prompt
 - 157ad8f 2026-09-23 Give NOVA a living self-knowledge doc, grounded in the code that exists
 - 1d22b61 2026-09-23 Feed the orb's dormant spectrum shader real audio, add a visual test harness
-- b0a2fef 2026-09-23 Actually start the STT model, and stop NOVA answering her own questions
-- ...and 67 more
+- ...and 68 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns
