@@ -189,20 +189,36 @@ def _quota(e: Exception) -> bool:
     return "RESOURCE_EXHAUSTED" in s or "exceeded your current quota" in s
 
 
-def ask_gemini(client, system: str, turns: list) -> str:
-    from google.genai import types
-    for attempt in range(4):
+def _overloaded(e: Exception) -> bool:
+    s = str(e)
+    return "503" in s or "UNAVAILABLE" in s or "high demand" in s
+
+
+def _call_with_patience(fn):
+    """Google's 503 'high demand' is temporary: wait it out (up to ~90 s),
+    then stop the run cleanly with progress saved rather than crash."""
+    for attempt in range(7):
         try:
-            r = client.models.generate_content(
-                model=MODEL, contents=_gemini_contents(turns),
-                config=types.GenerateContentConfig(system_instruction=system, temperature=0.7))
-            return (r.text or "").strip()
+            return fn()
         except Exception as e:
             if _quota(e) and attempt >= 1:
                 raise QuotaExhausted(str(e)[:200])
-            if attempt == 3:
+            if attempt == 6:
+                if _overloaded(e):
+                    raise QuotaExhausted("Gemini is overloaded (503) -- " + str(e)[:120])
                 raise
-            time.sleep(8 * (attempt + 1))
+            time.sleep(min(30, 5 * (attempt + 1)))
+
+
+def ask_gemini(client, system: str, turns: list) -> str:
+    from google.genai import types
+
+    def call():
+        r = client.models.generate_content(
+            model=MODEL, contents=_gemini_contents(turns),
+            config=types.GenerateContentConfig(system_instruction=system, temperature=0.7))
+        return (r.text or "").strip()
+    return _call_with_patience(call)
 
 
 def ask_ollama(model: str, system: str, turns: list) -> str:
@@ -221,19 +237,13 @@ def ask_ollama(model: str, system: str, turns: list) -> str:
 def judge(client, sc: dict, reply: str) -> dict:
     from google.genai import types
     convo = "\n".join(f"{t['role'].upper()}: {t['text']}" for t in sc["turns"][-6:])
-    for attempt in range(4):
-        try:
-            r = client.models.generate_content(
-                model=JUDGE_MODEL, contents=JUDGE % (sc["expect"], convo, reply),
-                config=types.GenerateContentConfig(temperature=0, response_mime_type="application/json"))
-            j = json.loads(r.text)
-            return {"pass": bool(j.get("pass")), "reason": str(j.get("reason", ""))}
-        except Exception as e:
-            if _quota(e) and attempt >= 1:
-                raise QuotaExhausted(str(e)[:200])
-            if attempt == 3:
-                raise
-            time.sleep(8 * (attempt + 1))
+    def call():
+        r = client.models.generate_content(
+            model=JUDGE_MODEL, contents=JUDGE % (sc["expect"], convo, reply),
+            config=types.GenerateContentConfig(temperature=0, response_mime_type="application/json"))
+        j = json.loads(r.text)
+        return {"pass": bool(j.get("pass")), "reason": str(j.get("reason", ""))}
+    return _call_with_patience(call)
 
 
 def main() -> int:
