@@ -309,6 +309,10 @@ TOOL_CAPABILITIES: dict[str, frozenset[Capability]] = {
     "document*": _caps(C.MEMORY_READ, C.USER_DATA),
     "knowledge*": _caps(C.MEMORY_READ),
     "nova_task": _caps(C.MEMORY_READ, C.MEMORY_WRITE),
+    # NOVA's learned skills. Running one can call an outside provider the
+    # person connected, so it declares NETWORK_WRITE; each tool step inside
+    # a skill is dispatched again and checked on its own.
+    "nova_capability": _caps(C.MEMORY_READ, C.MEMORY_WRITE, C.NETWORK_READ, C.NETWORK_WRITE),
     "planner": _caps(C.MEMORY_READ),
     "game_updater": _caps(C.NETWORK_READ, C.FILE_WRITE, C.PROCESS_CONTROL),
 }

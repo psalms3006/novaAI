@@ -426,7 +426,40 @@ class DeviceUpdateState(Base):
     updated_at = Column(Float, nullable=False, default=now, onupdate=now)
 
 
+# -- shared capability knowledge ---------------------------------------------
+
+class CatalogProvider(Base):
+    """A provider NOVA installations may use for some kind of work.
+
+    Global, technical knowledge only: how to reach it, what it costs, what it
+    needs. Never anyone's credential or content -- a person's key lives in
+    their own OS credential store and never leaves their machine. Entries are
+    curated by the owner (manage.py catalog-add); installations only report
+    whether a listed provider passed or failed their local test, which is how
+    `validated_count` means something.
+    """
+
+    __tablename__ = "capability_catalog"
+
+    id = Column(String(64), primary_key=True)
+    name = Column(String(120), nullable=False)
+    description = Column(Text, nullable=False, default="")
+    kind = Column(String(24), nullable=False, default="http_api")
+    cost = Column(String(64), nullable=False, default="")
+    requires_account = Column(Boolean, nullable=False, default=False)
+    data_leaves_device = Column(Boolean, nullable=False, default=True)
+    docs_url = Column(String(500), nullable=False, default="")
+    setup = Column(JSONCol, nullable=False, default=dict)
+    tags = Column(JSONCol, nullable=False, default=list)
+    validated_count = Column(Integer, nullable=False, default=0)
+    failed_count = Column(Integer, nullable=False, default=0)
+    enabled = Column(Boolean, nullable=False, default=True)
+    created_at = Column(Float, nullable=False, default=now)
+    updated_at = Column(Float, nullable=False, default=now, onupdate=now)
+
+
 __all__ = [
+    "CatalogProvider",
     "Instance", "ModelUsage", "Release", "DeviceUpdateState",
     "Base", "User", "UserStatus", "Profile", "Device", "AuthSession",
     "EmailToken", "Preference", "ActivityEvent", "ModelCall", "AgentRun",

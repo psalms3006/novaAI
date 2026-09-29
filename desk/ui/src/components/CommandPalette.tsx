@@ -60,6 +60,7 @@ export const CommandPalette: React.FC = () => {
       { id: 'set-voice', category: 'Settings', title: 'Voice session', icon: 'fa-microphone', run: settings('voice') },
       { id: 'set-models', category: 'Settings', title: 'Models & offline', icon: 'fa-microchip', run: settings('intelligence') },
       { id: 'set-tools', category: 'Settings', title: 'Tools & tasks', icon: 'fa-toolbox', run: settings('tools') },
+      { id: 'set-skills', category: 'Settings', title: 'Skills NOVA has learned', icon: 'fa-graduation-cap', run: settings('skills') },
       { id: 'set-diag', category: 'Settings', title: 'Diagnostics & event stream', icon: 'fa-heart-pulse', run: settings('diagnostics') },
       { id: 'set-appearance', category: 'Settings', title: 'Appearance', icon: 'fa-palette', run: settings('appearance') },
       { id: 'presence-orb', category: 'Presence', title: 'Show the orb', icon: 'fa-atom', run: () => setPresenceType('orb') },

@@ -211,7 +211,9 @@ def test_the_dispatcher_asks_through_the_voice_channel():
 
     import nova
 
-    source = inspect.getsource(nova._execute_tool_sync)
+    # Every call goes _execute_tool_sync (hooks) -> _execute_tool_core (gates).
+    assert "_execute_tool_core(" in inspect.getsource(nova._execute_tool_sync)
+    source = inspect.getsource(nova._execute_tool_core)
     assert "VoiceConfirmer" in source, (
         "the confirmation gate still asks on stdin during a voice session"
     )

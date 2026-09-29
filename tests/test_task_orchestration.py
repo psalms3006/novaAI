@@ -317,6 +317,12 @@ def test_the_work_is_published_as_events(tmp_path):
     m.set_on_event(events.append)
     agent_activity.set_observer(events.append)
     [t] = _settle(m, m.submit("Thesis", _steps()))
+    # _finish sets the terminal status, then publishes the event: under load
+    # the status can be seen a moment before the event lands.
+    deadline = time.time() + 5
+    while not any(e["type"] in ("task.completed", "task.failed", "task.finished") for e in events) \
+            and time.time() < deadline:
+        time.sleep(0.02)
     kinds = [e["type"] for e in events]
     for expected in ("task.created", "task.started", "task.step", "agent.message",
                      "agent.state", "task.progress", "artifact.created",

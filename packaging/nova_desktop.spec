@@ -175,7 +175,7 @@ hidden = [
     # desk modules
     "desk", "desk.bridge", "desk.chat", "desk.voice", "desk.store",
     "desk.settings", "desk.confirm", "desk.projects", "desk.live_session",
-    "desk.win_overlay", "desk.creds",
+    "desk.win_overlay", "desk.creds", "desk.skills_api", "desk.offline_model",
     # Ambient screen awareness. mss resolves its platform backend at import
     # time, so naming it here is what stops the packaged build from reporting
     # "screen sharing unavailable" on a machine where it works fine in source.
@@ -225,7 +225,10 @@ for _pkg in ("actions", "capabilities", "core", "orchestrator", "memory",
              # but not wired in. Listed so the first build after it is wired
              # carries it, rather than the app reporting it missing on a
              # machine where it works from source.
-             "nova_extensions"):
+             "nova_extensions",
+             # Self-extending skills, deferred tools, hooks and error classes:
+             # reached through try/except and function-local imports.
+             "nova_skills", "nova_tools", "nova_core"):
     try:
         hidden += [m for m in collect_submodules(_pkg)
                    if not m.endswith(("._init_", ".__main__", "._smoke_test"))]

@@ -441,9 +441,30 @@ def set_channel(args) -> int:
     return 0
 
 
+def catalog_add(args) -> int:
+    """Add or update capability-catalog entries from a JSON file (one entry or a list)."""
+    import json
+    from pathlib import Path
+    from .api_capabilities import upsert
+    data = json.loads(Path(args.file).read_text(encoding="utf-8"))
+    entries = data if isinstance(data, list) else [data]
+    for e in entries:
+        try:
+            out = upsert(e)
+        except ValueError as err:
+            print(f"Refused {e.get('id') or e.get('name') or '?'}: {err}")
+            return 1
+        print(f"Catalog: {out['id']} ({out['name']})")
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="nova_cloud.manage")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("catalog-add", help="add/update capability catalog entries from JSON")
+    c.add_argument("--file", required=True)
+    c.set_defaults(fn=catalog_add)
 
     c = sub.add_parser("publish-release",
                        help="publish a signed release (from tools/release.py)")

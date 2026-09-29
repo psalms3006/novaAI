@@ -42,6 +42,7 @@ def create_app(cfg=None) -> Flask:
     from .api_instance import bp as instance_bp
     from .api_model import bp as model_bp
     from .api_updates import bp as updates_bp
+    from .api_capabilities import bp as capabilities_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(devices_bp)
@@ -51,6 +52,7 @@ def create_app(cfg=None) -> Flask:
     app.register_blueprint(instance_bp)
     app.register_blueprint(model_bp)
     app.register_blueprint(updates_bp)
+    app.register_blueprint(capabilities_bp)
 
     @app.after_request
     def _headers(resp):

@@ -9,6 +9,7 @@ export type SettingsSectionId =
   | 'identity'
   | 'permissions'
   | 'tools'
+  | 'skills'
   | 'connections'
   | 'account'
   | 'diagnostics'

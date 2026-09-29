@@ -178,3 +178,11 @@ class ExcludesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def test_skills_hooks_and_deferred_tools_are_collected():
+    """Reached only through try/except and function-local imports, so the
+    build must name them or the packaged app silently runs without them."""
+    text = SPEC.read_text(encoding="utf-8")
+    for pkg in ('"nova_skills"', '"nova_tools"', '"nova_core"', '"desk.skills_api"'):
+        assert pkg in text, f"{pkg} is not collected by the spec"

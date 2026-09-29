@@ -127,7 +127,12 @@ def test_the_tool_executor_checks_authorisation_before_the_confirmation_gate():
     agree', and a DENY must never reach a prompt the user has to read."""
     import io
     src = io.open("nova.py", encoding="utf-8").read()
-    body = src[src.index("def _execute_tool_sync("):]
+    # _execute_tool_sync runs hooks and hands every call to _execute_tool_core,
+    # where the gates live; hooks run first, so nothing they pass on skips them.
+    outer = src[src.index("def _execute_tool_sync("):src.index("def _execute_tool_core(")]
+    assert "_execute_tool_core(tool_name, args" in outer
+    assert "check_tool" not in outer and "safety_gate" not in outer
+    body = src[src.index("def _execute_tool_core("):]
     body = body[:body.index("if tool_name ==")]
     perm_at = body.index("check_tool")
     gate_at = body.index("safety_gate")
@@ -140,7 +145,7 @@ def test_a_confirm_verdict_is_passed_to_the_existing_gate_not_re_prompted():
     the conversation with the user."""
     import io
     src = io.open("nova.py", encoding="utf-8").read()
-    body = src[src.index("def _execute_tool_sync("):]
+    body = src[src.index("def _execute_tool_core("):]
     body = body[:body.index("if tool_name ==")]
     assert "Effect.CONFIRM" not in body, \
         "the permission check prompts for confirmation itself, duplicating the gate"

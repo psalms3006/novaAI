@@ -72,6 +72,11 @@ def _no_live_database():
             os.environ.pop(key, None)
         elif key in ("RESEND_API_KEY", "NOVA_ADMIN_PASSWORD") and value:
             os.environ.pop(key, None)
+        # Policy flags from the developer's .env (re-added by any module that
+        # calls load_dotenv) made cloud tests depend on which test imported
+        # nova first. A test that wants them sets them itself.
+        elif key in ("NOVA_REQUIRE_EMAIL_VERIFICATION", "NOVA_ADMIN_REQUIRE_MFA"):
+            os.environ.pop(key, None)
 
     yield
 

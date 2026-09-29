@@ -556,7 +556,7 @@ class VoiceSupervisor:
 #: needs the user's agreement, has an outcome she must not guess at.
 NON_BLOCKING_TOOLS = frozenset({
     "web_search", "learn_resource", "file_processor", "generate_document",
-    "browser_control",
+    "browser_control", "nova_capability",
 })
 
 

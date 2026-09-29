@@ -2715,6 +2715,13 @@ def run_desk_server(meta, port: int | None = None) -> None:
     except Exception as e:
         log.warning("[DESK] offline model surface unavailable: %s", e)
 
+    # NOVA's learned skills: list, connect an account, test, roll back, remove.
+    try:
+        from desk import skills_api
+        skills_api.register(app, require_token)
+    except Exception as e:
+        log.warning("[DESK] skills surface unavailable: %s", e)
+
     # Document library. Registered here so the SPA can list and add documents;
     # the tool path reaches the same library through nova_core.rag.api.
     try:
@@ -2805,6 +2812,11 @@ def run_desk_server(meta, port: int | None = None) -> None:
     _chat_mod._publish_agent_progress = publish_agent_progress
     _chat_mod._publish_agent_done = publish_agent_done
     _chat_mod._publish_orb_state = publish_orb_state
+    try:
+        from desk import skills_api as _skills_api
+        _skills_api.attach_events(publish_event)
+    except Exception as e:
+        log.warning("[DESK] skill events unavailable: %s", e)
 
     @sock.route("/ws/events")
     def ws_events(cws):

@@ -14,6 +14,7 @@ import { PersonalitySection } from './sections/PersonalitySection';
 import { IdentitySection } from './sections/IdentitySection';
 import { PermissionsSection } from './sections/PermissionsSection';
 import { ToolsSection } from './sections/ToolsSection';
+import { SkillsSection } from './sections/SkillsSection';
 import { ConnectionsSection } from './sections/ConnectionsSection';
 import { AccountSection } from './sections/AccountSection';
 import { DiagnosticsSection } from './sections/DiagnosticsSection';
@@ -74,6 +75,8 @@ export const SettingsScreen: React.FC = () => {
         return <PermissionsSection />;
       case 'tools':
         return <ToolsSection />;
+      case 'skills':
+        return <SkillsSection />;
       case 'connections':
         return <ConnectionsSection />;
       case 'account':
