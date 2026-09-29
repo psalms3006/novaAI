@@ -232,3 +232,15 @@ def test_the_helper_survives_being_spawned_the_way_nova_spawns_it(up, tmp_path):
         time.sleep(0.5)
     assert (upd / "update.log").exists(), "the spawned helper never ran"
     assert json.loads((upd / "result.json").read_text(encoding="utf-8-sig"))["result"] == "rolled_back"
+
+
+def test_a_successful_update_leaves_no_rollback_copy_or_installer_behind(up):
+    (up.update_dir() / "rollback" / "1.0.0").mkdir(parents=True)
+    (up.update_dir() / "rollback" / "1.0.0" / "big.bin").write_bytes(b"x" * 1000)
+    (up.update_dir() / "1.1.0").mkdir()
+    (up.update_dir() / "1.1.0" / "NOVA-Setup-1.1.0.exe").write_bytes(b"x")
+    (up.update_dir() / "result.json").write_text(json.dumps(
+        {"version": "1.1.0", "from": "1.0.0", "result": "installed", "error": ""}))
+    up.collect_result()
+    assert not (up.update_dir() / "rollback").exists()
+    assert not (up.update_dir() / "1.1.0").exists()

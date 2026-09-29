@@ -326,6 +326,14 @@ def collect_result() -> dict | None:
     _record(res)
     if res.get("result") == "installed":
         _staged_path().unlink(missing_ok=True)
+        # The helper removes the rollback copy itself, but it runs while the
+        # new NOVA is starting and a locked file can leave it behind (seen in
+        # the real update test: ~530 MB). The new version is proven healthy by
+        # now, so neither the copy nor the downloaded installer is needed.
+        import shutil
+        shutil.rmtree(update_dir() / "rollback", ignore_errors=True)
+        if res.get("version"):
+            shutil.rmtree(update_dir() / str(res["version"]), ignore_errors=True)
     try:
         import nova_account
         acct = nova_account.account()
