@@ -5,6 +5,13 @@ import { ThemeId } from '../types/nova';
 
 export const ThemeSelectorModal: React.FC = () => {
   const { themeModalOpen, setThemeModalOpen, themeId, setThemeId, glassOpacity, setGlassOpacity, addToast, theme } = useNova();
+  // Escape closes it, like every other dialog in NOVA.
+  React.useEffect(() => {
+    if (!themeModalOpen) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setThemeModalOpen(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [themeModalOpen, setThemeModalOpen]);
 
   if (!themeModalOpen) return null;
 

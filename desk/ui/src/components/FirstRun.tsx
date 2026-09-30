@@ -602,7 +602,7 @@ const OfflineStep: React.FC<{ onNext: (o: OfflineOutcome) => void }> = ({ onNext
           {st.total_bytes ? `${pct.toFixed(0)}% · ${formatBytes(st.completed_bytes)} / ${formatBytes(st.total_bytes)}` : st.status_text || 'Starting…'}
         </p>
         <p className="text-[11px]" style={{ color: theme.palette.textMuted }}>Please keep NOVA open.</p>
-        <Secondary theme={theme} onClick={async () => { await cancelOfflineDownload(); onNext('skipped'); }}>Cancel and continue setup</Secondary>
+        <Secondary theme={theme} onClick={async () => { try { await cancelOfflineDownload(); } catch { /* the download may already have stopped */ } finally { onNext('skipped'); } }}>Cancel and continue setup</Secondary>
       </>
     );
   }

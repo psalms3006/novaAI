@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (111):
+Commits in the last 14 days (112):
 
+- c29806e 2026-09-30 Acquire a missing capability from research, with the person's OK asked once
 - 913ce56 2026-09-30 Learning system, permission enforcement, and the UI interaction audit fixes
 - 1e2370d 2026-09-29 Record the partial agentic benchmark run on gemini-flash-latest (1/1 before the daily quota)
 - 4d979b2 2026-09-29 Fix what NOVA's own 2026-09-29 session log showed going wrong
@@ -154,8 +155,7 @@ Commits in the last 14 days (111):
 - 1354510 2026-09-23 Make the nebula the whole app's background, and give core surfaces clay
 - 2545bf0 2026-09-23 Stop losing typed messages after one failed send, and clean up the tree
 - d53c698 2026-09-23 Give the orb a deep-space backdrop, as its own independent layer
-- b56fd02 2026-09-23 Speak offline replies as they generate, not after the whole thing is done
-- ...and 71 more
+- ...and 72 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

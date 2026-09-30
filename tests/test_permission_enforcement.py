@@ -132,6 +132,24 @@ def test_every_acting_tool_answers_to_a_permission(tool, args, scope):
     assert scope_for(tool, args) == scope
 
 
+def test_the_window_is_told_when_a_change_was_not_saved(monkeypatch):
+    """settings.set_many swallowed write errors, so the window said SAVED about
+    changes that never reached the disk."""
+    from desk import bridge
+    from desk import settings as ds
+
+    class Unwritable:
+        def write_text(self, *a, **k):
+            raise PermissionError("settings.json is read-only")
+    monkeypatch.setattr(ds, "last_write_error", "")       # restored after the test
+    monkeypatch.setattr(ds, "settings_path", lambda: Unwritable())
+    monkeypatch.setattr(ds, "_load", lambda: {})
+    monkeypatch.setattr(bridge, "run_token", "t")
+    r = bridge.app.test_client().post("/api/settings", json={"response_style": "concise"}, headers=H)
+    assert r.status_code == 500 and "could not be saved" in r.get_json()["error"]
+    assert "read-only" in ds.last_write_error
+
+
 def test_a_scoped_tool_set_to_never_is_refused(monkeypatch):
     from desk import confirm
     monkeypatch.setattr(confirm, "_permission_for", lambda t, a=None: "deny")

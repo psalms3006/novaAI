@@ -78,6 +78,19 @@ def _gemini_role(role: str) -> str:
     return "model" if role in ("assistant", "model") else "user"
 
 
+#: Current Gemini models think before they answer, and the thinking counts
+#: against max_output_tokens. Callers asked for 1024 -- the router's default --
+#: which a detailed request spends almost entirely on thinking: the stream
+#: then ends with no text at all and the person sees "couldn't produce a
+#: response" (measured 2026-09-30: 581 thinking + 2598 answer tokens for a
+#: design brief). The budget is a ceiling on cost, not a style setting.
+MIN_OUTPUT_TOKENS = 8192
+
+
+def _output_budget(requested: int) -> int:
+    return max(int(requested or 0), MIN_OUTPUT_TOKENS)
+
+
 def _response_text(response: Any) -> str:
     """Read `.text` without letting the SDK's accessor blow up the turn.
 
@@ -255,7 +268,7 @@ class GeminiProvider:
 
         config = gtypes.GenerateContentConfig(
             temperature=temperature,
-            max_output_tokens=max_tokens,
+            max_output_tokens=_output_budget(max_tokens),
         )
         if system:
             config.system_instruction = system
@@ -364,7 +377,7 @@ class GeminiProvider:
         contents = _normalize_contents(contents)
         config = gtypes.GenerateContentConfig(
             temperature=temperature,
-            max_output_tokens=max_tokens,
+            max_output_tokens=_output_budget(max_tokens),
         )
         if system:
             config.system_instruction = system
@@ -392,6 +405,12 @@ class GeminiProvider:
                             emitted = True
                             yield ("text", piece)
 
+                    if not parts_text and not tool_calls:
+                        # Nothing at all is not an answer: try the next model
+                        # rather than show the person an empty reply.
+                        last_error = f"{model} returned an empty response"
+                        log.warning("[GEMINI] %s", last_error)
+                        break
                     latency = (time.time() - t0) * 1000
                     self._health.record_success(latency)
                     yield ("done", GenerateResult(
@@ -459,7 +478,7 @@ class GeminiProvider:
 
         config = gtypes.GenerateContentConfig(
             temperature=temperature,
-            max_output_tokens=max_tokens,
+            max_output_tokens=_output_budget(max_tokens),
         )
         if system:
             config.system_instruction = system

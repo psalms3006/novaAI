@@ -599,6 +599,20 @@ const ProjectsTab: React.FC = () => {
                     {pr.instructions}
                   </div>
                 )}
+                <button
+                  className="block w-full text-left text-[11px] cursor-pointer font-medium mb-1"
+                  style={{ color: s.p.accent }}
+                  onClick={async () => {
+                    // A conversation that belongs to the project, so its
+                    // instructions apply. There used to be no way to make one.
+                    const c = await postJSON<{ id: string }>('/api/conversations', { project_id: pr.id });
+                    await rt.openConversation(c.id);
+                    setCurrentScreen('substrate');
+                  }}
+                >
+                  <i className="fa-solid fa-plus text-[9px] mr-1.5" />
+                  Start a conversation in this project
+                </button>
                 {recent.length === 0 ? (
                   <div className="text-[11px]" style={{ color: s.p.textMuted }}>
                     No conversations in this project yet.

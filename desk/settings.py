@@ -275,12 +275,23 @@ def set_many(updates: dict) -> dict:
                     data["ui_prefs"] = merged
             elif k in _SAFE_KEYS:
                 data[k] = v
+        global last_write_error
         try:
             settings_path().write_text(
                 json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
+            last_write_error = ""
+        except Exception as e:
+            # Recorded, not raised: many callers treat settings as best-effort.
+            # The window's save endpoint reads this so it never says "SAVED"
+            # about a change that did not reach the disk.
+            last_write_error = f"{type(e).__name__}: {e}"
+            import logging
+            logging.getLogger("nova.settings").error("settings were not saved: %s", last_write_error)
         return data
+
+
+#: Why the last write failed ('' when it succeeded).
+last_write_error = ""
 
 
 def all() -> dict:

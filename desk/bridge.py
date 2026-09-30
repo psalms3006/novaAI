@@ -2195,6 +2195,9 @@ def api_settings_post():
         data.pop("permissions", None)
         _enforce_revocations()
     desk_settings.set_many(data)
+    if getattr(desk_settings, "last_write_error", ""):
+        return jsonify({"ok": False, "error": "Your change could not be saved: "
+                                             + desk_settings.last_write_error}), 500
     # The setting has already been applied locally. Syncing it to the account
     # happens afterwards, on a background thread, so changing a preference is
     # never gated on the network.
