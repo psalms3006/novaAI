@@ -10,6 +10,7 @@ export type SettingsSectionId =
   | 'permissions'
   | 'tools'
   | 'skills'
+  | 'knowledge'
   | 'connections'
   | 'account'
   | 'diagnostics'

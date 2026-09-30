@@ -42,8 +42,8 @@ export async function getJSON<T = unknown>(path: string, timeoutMs?: number): Pr
   return (await r.json()) as T;
 }
 
-export async function postJSON<T = unknown>(path: string, body: unknown = {}, method = 'POST'): Promise<T> {
-  const r = await api(path, { method, body: body === undefined ? undefined : JSON.stringify(body) });
+export async function postJSON<T = unknown>(path: string, body: unknown = {}, method = 'POST', timeoutMs?: number): Promise<T> {
+  const r = await api(path, { method, body: body === undefined ? undefined : JSON.stringify(body), timeoutMs });
   let data: unknown = null;
   try {
     data = await r.json();
@@ -51,7 +51,9 @@ export async function postJSON<T = unknown>(path: string, body: unknown = {}, me
     /* empty body */
   }
   if (!r.ok) {
-    const msg = (data as { error?: string } | null)?.error || `${path} → ${r.status}`;
+    // The human sentence when the backend sends one; the code otherwise.
+    const d = data as { error?: string; message?: string } | null;
+    const msg = d?.message || d?.error || `${path} → ${r.status}`;
     throw new ApiError(msg, r.status);
   }
   return data as T;

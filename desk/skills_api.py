@@ -1,11 +1,11 @@
 """desk.skills_api — NOVA's skills, as the person sees and controls them.
 
-    GET    /api/capabilities                     skills, timeline, pending
-    POST   /api/capabilities/<id>/credential     {provider_id, secret}  connect an account
-    POST   /api/capabilities/<id>/test           prove it again
-    POST   /api/capabilities/<id>/rollback       back to the last working version
-    DELETE /api/capabilities/<id>                remove (and forget its stored keys)
-    POST   /api/capabilities/check               re-check every skill's health now
+    GET    /api/skills                     skills, timeline, pending
+    POST   /api/skills/<id>/credential     {provider_id, secret}  connect an account
+    POST   /api/skills/<id>/test           prove it again
+    POST   /api/skills/<id>/rollback       back to the last working version
+    DELETE /api/skills/<id>                remove (and forget its stored keys)
+    POST   /api/skills/check               re-check every skill's health now
 
 The credential route is the only way a key reaches NOVA: typed into the
 window, stored in the OS credential store, never shown to the model and never
@@ -63,14 +63,14 @@ def start_sweeper() -> None:
 
 
 def register(app, require_token, *, sweep: bool = True) -> None:
-    @app.get("/api/capabilities")
+    @app.get("/api/skills")
     @require_token
-    def api_capabilities():
+    def api_skills():
         return jsonify({"ok": True, **_svc().overview()})
 
-    @app.post("/api/capabilities/<cap_id>/credential")
+    @app.post("/api/skills/<cap_id>/credential")
     @require_token
-    def api_capability_credential(cap_id):
+    def api_skill_credential(cap_id):
         body = request.get_json(silent=True) or {}
         provider_id = str(body.get("provider_id") or "").strip()
         secret = str(body.get("secret") or "").strip()
@@ -84,31 +84,31 @@ def register(app, require_token, *, sweep: bool = True) -> None:
         return jsonify({"ok": bool(out.get("ok")), "learned": out.get("learned", False),
                         "health": out.get("health", ""), "detail": out.get("detail", "")})
 
-    @app.post("/api/capabilities/<cap_id>/test")
+    @app.post("/api/skills/<cap_id>/test")
     @require_token
-    def api_capability_test(cap_id):
+    def api_skill_test(cap_id):
         svc = _svc()
         if svc.registry.get(cap_id) is None:
             return jsonify({"ok": False, "error": "unknown capability"}), 404
         return jsonify(svc.test(cap_id))
 
-    @app.post("/api/capabilities/<cap_id>/rollback")
+    @app.post("/api/skills/<cap_id>/rollback")
     @require_token
-    def api_capability_rollback(cap_id):
+    def api_skill_rollback(cap_id):
         try:
             return jsonify(_svc().rollback(cap_id))
         except (KeyError, ValueError) as e:
             return jsonify({"ok": False, "error": str(e).strip("'\"")}), 409
 
-    @app.delete("/api/capabilities/<cap_id>")
+    @app.delete("/api/skills/<cap_id>")
     @require_token
-    def api_capability_remove(cap_id):
+    def api_skill_remove(cap_id):
         out = _svc().remove(cap_id)
         return jsonify(out), (200 if out.get("ok") else 404)
 
-    @app.post("/api/capabilities/check")
+    @app.post("/api/skills/check")
     @require_token
-    def api_capabilities_check():
+    def api_skills_check():
         return jsonify({"ok": True, "changed": _svc().health_sweep()})
 
     if sweep:

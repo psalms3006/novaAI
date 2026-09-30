@@ -125,10 +125,15 @@ TOOL_CATEGORY = {
     "execute": "exec",
     "run_code": "exec",
     "send_message": "network",
+    # Tools that act without a scope used to run unasked whatever the person
+    # chose (the settings screen even showed them as "ask").
+    "generate_document": "file_write",
+    "app_control": "computer_control",
+    "learn_resource": "exec",
 }
 
 # Tools whose memory of the person is NOVA's own business: not a permission.
-_UNGATED = {"remember_fact", "nova_memory"}
+_UNGATED = {"remember_fact", "nova_memory", "nova_learning", "nova_capability"}
 
 _FILE_READ_ACTIONS = {"list", "read", "find", "info", "search", "exists", "stat",
                       "summarize", "summarise", "extract", "open"}
@@ -139,10 +144,22 @@ def scope_for(tool_name: str, args: dict | None = None) -> str:
     """The permission scope this particular call needs ('' = none)."""
     args = args or {}
     action = str(args.get("action") or "").strip().lower()
-    if tool_name in _UNGATED:
+    if tool_name in _UNGATED and tool_name not in ("nova_learning", "nova_capability"):
         return ""
     if tool_name in ("file_controller", "file_processor"):
         return "file_read" if (action in _FILE_READ_ACTIONS or not action) else "file_write"
+    if tool_name == "nova_learning":
+        # Studying a folder reads the person's files; asking what was learned does not.
+        return "file_read" if str(args.get("cmd") or "").lower() == "learn" else ""
+    if tool_name == "nova_capability":
+        # Running or testing a skill can send the person's content to an
+        # outside service; discovering one only searches the web.
+        cmd = str(args.get("cmd") or "").lower()
+        if cmd in ("run", "test", "adopt", "propose", "check"):
+            return "network"
+        return "browser_read" if cmd == "discover" else ""
+    if tool_name.startswith("mcp__") or tool_name in ("use_tool",):
+        return "network"               # a connected service, outside NOVA
     if tool_name == "browser_control":
         return "browser_interact" if action in _BROWSER_INTERACT_ACTIONS else "browser_read"
     return TOOL_CATEGORY.get(tool_name, "")
@@ -153,6 +170,8 @@ def tool_scopes() -> dict:
     out = {t: [s] for t, s in TOOL_CATEGORY.items()}
     out["file_controller"] = out["file_processor"] = ["file_read", "file_write"]
     out["browser_control"] = ["browser_read", "browser_interact"]
+    out["nova_learning"] = ["file_read"]
+    out["nova_capability"] = ["browser_read", "network"]
     return out
 
 

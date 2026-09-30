@@ -36,7 +36,7 @@ interface OfflineKnowledge {
 export const IntelligenceSection: React.FC = () => {
   const { theme, addToast } = useNova();
   const { status } = useRuntime();
-  const { settings, update } = useNovaSettings();
+  const { settings, update, reload: reloadSettings } = useNovaSettings();
   const local = useResource(() => getJSON<LocalStatus>('/api/local-intelligence/status', 10000), [], 15000);
   const models = useResource(() => getJSON<{ models: LocalModel[] }>('/api/local-intelligence/models', 10000));
   const knowledge = useResource(() => getJSON<OfflineKnowledge>('/api/offline-knowledge/status', 10000));
@@ -45,10 +45,14 @@ export const IntelligenceSection: React.FC = () => {
   const act = async (label: string, path: string, body: Record<string, unknown>, done: string) => {
     setBusy(label);
     try {
-      const j = await postJSON<{ ok?: boolean; error?: string }>(path, body);
+      // Downloading a model and testing it run for minutes, not seconds: the
+      // default 20 s abort reported "failed" while the download carried on.
+      const long = /download|test/.test(path);
+      const j = await postJSON<{ ok?: boolean; error?: string }>(path, body, 'POST', long ? 45 * 60 * 1000 : undefined);
       if (j.ok === false) throw new Error(j.error || 'refused');
       addToast(done, undefined, 'success');
-      await Promise.all([local.reload(), models.reload()]);
+      // "In use" reads the settings, which this change just altered.
+      await Promise.all([local.reload(), models.reload(), reloadSettings()]);
     } catch (e) {
       addToast(`${label} failed`, (e as Error).message, 'warning');
     } finally {

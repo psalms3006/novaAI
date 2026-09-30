@@ -225,7 +225,7 @@ interface Runtime {
   pendingConfirm: PendingConfirm | null;
   chatBusy: boolean;
 
-  startVoice: () => Promise<void>;
+  startVoice: (source?: 'user' | 'auto') => Promise<void>;
   stopVoice: () => Promise<void>;
   toggleVoice: () => Promise<void>;
   setMuted: (muted: boolean) => Promise<void>;
@@ -562,9 +562,18 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
   }, [refreshStatus, ambient]);
 
   // ── voice actions ─────────────────────────────────────────────────────────
-  const startVoice = useCallback(async () => {
+  const startVoice = useCallback(async (source: 'user' | 'auto' = 'user') => {
     try {
-      const j = await postJSON<{ ok: boolean; reason?: string; message?: string }>('/api/live/start', {});
+      // `source` lets the backend honour "Microphone: Ask me" -- voice starts
+      // when the person presses the mic, never on its own.
+      const j = await postJSON<{ ok: boolean; reason?: string; message?: string; error?: string }>('/api/live/start', { source });
+      if (!j.ok && j.error === 'microphone_ask') {
+        setVoiceError('');
+        setVoiceState('closed');
+        voiceStateRef.current = 'closed';
+        log('system', j.message || 'Microphone is set to Ask me: press the mic to start voice.');
+        return;
+      }
       if (!j.ok) {
         const why = j.reason || 'Voice could not start';
         setVoiceError(why);
@@ -588,7 +597,14 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
         }, VOICE_READY_TIMEOUT_MS);
       }
     } catch (e) {
-      log('error', `Voice could not start: ${(e as Error).message}`);
+      // Refused (microphone set to Never, no key, ...): say why and settle in a
+      // stopped state. Leaving it at 'connecting' made the mic button act as
+      // mute on a session that did not exist and show "Hearing you".
+      const why = (e as Error).message || 'Voice could not start';
+      setVoiceError(why);
+      setVoiceState('error');
+      voiceStateRef.current = 'error';
+      log('error', `Voice could not start: ${why}`);
     }
   }, [log, syncVoice]);
 
@@ -617,10 +633,10 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
     const t = setTimeout(async () => {
       try {
         const j = await getJSON<{ settings: { voice_enabled?: boolean } }>('/api/settings', 8000);
-        if (!cancelled && j.settings?.voice_enabled !== false) await startVoice();
+        if (!cancelled && j.settings?.voice_enabled !== false) await startVoice('auto');
         else if (!cancelled) setVoiceState('closed');
       } catch {
-        if (!cancelled) await startVoice();
+        if (!cancelled) await startVoice('auto');
       }
     }, 1200);
     return () => {
@@ -754,8 +770,8 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
 
   /**
    * Stop everything the user can see NOVA doing right now: her speech, the
-   * typed reply being written, and the microphone. It does not cancel
-   * background tasks -- the backend has no route for that -- and the label in
+   * typed reply being written, and the microphone. Background tasks are
+   * stopped from their own row (Presence → Tasks → Stop), and the label in
    * the interface says exactly this.
    */
   const halt = useCallback(async () => {

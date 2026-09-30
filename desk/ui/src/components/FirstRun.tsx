@@ -46,6 +46,8 @@ const PERMISSIONS: { id: string; label: string; what: string; icon: string; allo
   { id: 'browser_read', label: 'Browse and research', what: 'Searching the web and reading pages for you.', icon: 'fa-globe', allowByDefault: true },
   { id: 'browser_interact', label: 'Act in the browser', what: 'Closing tabs and downloading on your behalf.', icon: 'fa-arrow-pointer', allowByDefault: false },
   { id: 'computer_control', label: 'Computer control', what: 'Opening apps, settings, mouse and keyboard.', icon: 'fa-laptop-code', allowByDefault: false },
+  { id: 'exec', label: 'Run programs', what: 'Running code and trying out tools you point her to.', icon: 'fa-terminal', allowByDefault: false },
+  { id: 'network', label: 'Send things out', what: 'Using connected services and skills that send your content to them.', icon: 'fa-paper-plane', allowByDefault: false },
 ];
 
 const STARTUP: { id: string; label: string }[] = [
@@ -112,7 +114,7 @@ export const FirstRun: React.FC = () => {
 // ---------------------------------------------------------------------------
 
 const Shell: React.FC<{ theme: Theme; children: React.ReactNode }> = ({ theme, children }) => (
-  <div className="fixed inset-0 z-[58] flex items-center justify-center p-4 backdrop-blur-2xl animate-fade-in" style={{ backgroundColor: theme.palette.bgBase }}>
+  <div data-nova-blocking-overlay="first-run" className="fixed inset-0 z-[58] flex items-center justify-center p-4 backdrop-blur-2xl animate-fade-in" style={{ backgroundColor: theme.palette.bgBase }}>
     <div
       role="dialog"
       aria-modal="true"
@@ -459,7 +461,7 @@ const DeviceSetup: React.FC<{ onDone: () => void }> = ({ onDone }) => {
   if (step === 'permissions') {
     return (
       <>
-        <Title theme={theme} text="Give NOVA access to your computer" sub="You control what NOVA can access. Anything you leave off, she asks before doing. You can change this any time in Settings." />
+        <Title theme={theme} text="Give NOVA access to your computer" sub="You control what NOVA can access. Anything you leave on “Ask me”, she asks before doing — for the microphone, voice waits until you press the mic; for the screen, she only looks when you switch it on. You can change this, or turn anything off completely, any time in Settings → Permissions." />
         <div className="space-y-2">
           {PERMISSIONS.map((p) => {
             const on = perms[p.id];

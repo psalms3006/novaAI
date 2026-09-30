@@ -124,14 +124,16 @@ def _ns(name, default=None):
 
 
 def workspace_dir() -> Path:
+    """The workspace folder, as the setting says *now*.
+
+    It used to be cached on first use, so changing it in Settings did nothing
+    until NOVA restarted while the window said it was saved."""
     global _workspace
-    if _workspace is None:
-        w = (desk_settings.get("workspace_dir") or "").strip()
-        if w:
-            _workspace = Path(w).expanduser()
-        else:
-            _workspace = desk_settings.app_data_dir() / "workspace"
-        _workspace.mkdir(parents=True, exist_ok=True)
+    w = (desk_settings.get("workspace_dir") or "").strip()
+    want = Path(w).expanduser() if w else desk_settings.app_data_dir() / "workspace"
+    if _workspace != want:
+        want.mkdir(parents=True, exist_ok=True)
+        _workspace = want
     return _workspace
 
 
@@ -217,6 +219,16 @@ def _system_prompt(query: str, meta: dict, cid: str | None = None) -> str:
             parts.append("\n\n" + adaptation)
     except Exception as e:
         log.debug("adaptation block unavailable: %s", e)
+
+    # Knowledge the person deliberately taught NOVA (nova_learning), only the
+    # part that bears on this request, with its sources. Separate from memory.
+    try:
+        from nova_learning import retrieve as _learned
+        block = _learned.context_block(query or "", project_id=(proj or {}).get("id", ""))
+        if block:
+            parts.append("\n\n" + block)
+    except Exception as e:
+        log.debug("learned knowledge unavailable: %s", e)
 
     custom = (desk_settings.get("user_system_prompt") or "").strip()
     if custom:
@@ -1048,6 +1060,9 @@ def api_voice_start():
             "reason": "live_session_owns_microphone",
             **desk_voice.status(),
         })
+    if _permission("microphone") == "deny":
+        return jsonify({"ok": False, "error": "microphone_denied",
+                        "message": _MIC_DENIED}), 403
     ok, msg = desk_voice.start_capture()
     return jsonify({"ok": ok, "message": msg, **desk_voice.status()})
 
@@ -1082,14 +1097,32 @@ def api_voice_status():
 
 # ── live (Gemini Live native audio) ───────────────────────────────────────────
 
+_MIC_DENIED = ("The microphone is turned off in NOVA's permissions. "
+               "Turn it on in Settings > Permissions to talk to NOVA.")
+
+
+def _permission(scope: str) -> str:
+    """allow | ask | deny for one permission scope, read fresh every time."""
+    try:
+        return str((desk_settings.get("permissions", {}) or {}).get(scope) or "ask")
+    except Exception:
+        return "ask"
+
+
 @app.post("/api/live/start")
 @require_token
 def api_live_start():
     # The microphone permission governs voice itself, not only the wake word.
-    if (desk_settings.get("permissions", {}) or {}).get("microphone") == "deny":
-        return jsonify({"ok": False, "error": "microphone_denied",
-                        "message": "The microphone is turned off in NOVA's permissions. "
-                                   "Turn it on in Settings > Permissions to talk to NOVA."}), 403
+    #   deny -> never;  ask -> only when the person presses the mic (an
+    #   automatic start on opening the window is not them asking);  allow -> yes.
+    source = str((request.get_json(silent=True) or {}).get("source") or "user")
+    mic = _permission("microphone")
+    if mic == "deny":
+        return jsonify({"ok": False, "error": "microphone_denied", "message": _MIC_DENIED}), 403
+    if mic == "ask" and source == "auto":
+        return jsonify({"ok": False, "error": "microphone_ask",
+                        "message": "Microphone is set to Ask me, so voice waits for you: "
+                                   "press the mic to start."})
     mgr = desk_live.get_live_manager()
     r = mgr.start()
     return jsonify(r)
@@ -1186,9 +1219,17 @@ def api_live_screen():
     """
     data = request.get_json(silent=True) or {}
     mgr = desk_live.get_live_manager()
-    if "watching" in data:
-        return jsonify(mgr.set_screen_share(bool(data.get("watching"))))
-    return jsonify(mgr.set_screen_share(not mgr.screen_status()["watching"]))
+    want = bool(data.get("watching")) if "watching" in data else not mgr.screen_status()["watching"]
+    # "See your screen": deny -> never; ask -> only when the person switches it
+    # on themselves (ambient mode turning it on is not them asking); allow -> yes.
+    if want:
+        perm, source = _permission("screen_read"), str(data.get("source") or "user")
+        if perm == "deny" or (perm == "ask" and source != "user"):
+            why = ("Screen access is turned off in NOVA's permissions." if perm == "deny" else
+                   "Screen access is set to Ask me, so NOVA only looks when you switch it on.")
+            return jsonify({"ok": False, "watching": mgr.screen_status()["watching"],
+                            "error": "screen_" + perm, "message": why}), (403 if perm == "deny" else 200)
+    return jsonify(mgr.set_screen_share(want))
 
 
 @app.get("/api/live/status")
@@ -2115,6 +2156,35 @@ def api_settings_get():
     return jsonify({"settings": desk_settings.all(), "toggles": desk_settings.toggles()})
 
 
+def _enforce_revocations() -> list:
+    """Make a withdrawn permission take effect now, not at the next session.
+
+    The switch in the window and what NOVA can actually do must never differ:
+    turning the microphone to Never stops a running voice session, and
+    turning screen access off (or to Ask me) stops a screen share that the
+    person did not start themselves. Returns what was stopped.
+    """
+    stopped = []
+    try:
+        mgr = desk_live.get_live_manager()
+        if _permission("microphone") == "deny" and getattr(mgr, "owns_microphone", False):
+            mgr.stop()
+            stopped.append("voice")
+        if _permission("screen_read") == "deny" and mgr.screen_status().get("watching"):
+            mgr.set_screen_share(False)
+            stopped.append("screen")
+        if _permission("microphone") == "deny":
+            try:
+                desk_voice.abort_capture()
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning("[DESK] could not apply a permission change immediately: %s", e)
+    if stopped:
+        log.info("[DESK] permission withdrawn; stopped %s", ", ".join(stopped))
+    return stopped
+
+
 @app.post("/api/settings")
 @require_token
 def api_settings_post():
@@ -2123,12 +2193,36 @@ def api_settings_post():
     if isinstance(data.get("permissions"), dict):
         desk_settings.set_many({"permissions": data["permissions"]})
         data.pop("permissions", None)
+        _enforce_revocations()
     desk_settings.set_many(data)
     # The setting has already been applied locally. Syncing it to the account
     # happens afterwards, on a background thread, so changing a preference is
     # never gated on the network.
     desk_account.push_preferences_async(data)
     return jsonify({"ok": True, "settings": desk_settings.all()})
+
+
+@app.get("/api/startup")
+@require_token
+def api_startup_get():
+    from desk import startup
+    return jsonify({"ok": True, "mode": desk_settings.get("startup_mode", "manual") or "manual",
+                    "registered": startup.registered_command(), "modes": list(startup.MODES)})
+
+
+@app.post("/api/startup")
+@require_token
+def api_startup_set():
+    """Start NOVA with Windows: manual | open | background (per user, no admin)."""
+    from desk import startup
+    mode = str((request.get_json(silent=True) or {}).get("mode") or "")
+    try:
+        r = startup.set_mode(mode)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except OSError as e:
+        return jsonify({"ok": False, "error": f"Windows refused the change: {e}"}), 500
+    return jsonify({"ok": True, **r})
 
 
 @app.post("/api/settings/profile")
@@ -2727,6 +2821,10 @@ def run_desk_server(meta, port: int | None = None) -> None:
     try:
         from desk import offline_model
         offline_model.register(app, require_token)
+        # Keep "start with Windows" pointing at this copy of NOVA after an
+        # update moved it (desk.startup's docstring promised this; nothing called it).
+        from desk import startup as _startup
+        _startup.reapply_saved()
     except Exception as e:
         log.warning("[DESK] offline model surface unavailable: %s", e)
 
@@ -2735,7 +2833,14 @@ def run_desk_server(meta, port: int | None = None) -> None:
         from desk import skills_api
         skills_api.register(app, require_token)
     except Exception as e:
-        log.warning("[DESK] skills surface unavailable: %s", e)
+        log.error("[DESK] skills surface unavailable: %s", e)
+
+    # Knowledge the person teaches NOVA: learn a folder, progress, provenance.
+    try:
+        from desk import knowledge_api
+        knowledge_api.register(app, require_token)
+    except Exception as e:
+        log.error("[DESK] knowledge surface unavailable: %s", e)
 
     # Document library. Registered here so the SPA can list and add documents;
     # the tool path reaches the same library through nova_core.rag.api.
@@ -2832,6 +2937,11 @@ def run_desk_server(meta, port: int | None = None) -> None:
         _skills_api.attach_events(publish_event)
     except Exception as e:
         log.warning("[DESK] skill events unavailable: %s", e)
+    try:
+        from desk import knowledge_api as _knowledge_api
+        _knowledge_api.attach_events(publish_event)
+    except Exception as e:
+        log.warning("[DESK] learning events unavailable: %s", e)
 
     @sock.route("/ws/events")
     def ws_events(cws):

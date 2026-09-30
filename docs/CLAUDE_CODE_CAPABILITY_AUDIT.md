@@ -332,7 +332,7 @@ Classification used below:
 
 | Item | Class | Where / what |
 |---|---|---|
-| Self-extending capabilities, versioned, health-checked, test-gated | A | `nova_skills/`, Settings → Skills, `/api/capabilities`, `/v1/capabilities/*` |
+| Self-extending capabilities, versioned, health-checked, test-gated | A | `nova_skills/`, Settings → Skills, `/api/skills`, `/v1/capabilities/*` |
 | Hooks at the tool dispatcher | A | `nova_core/hooks.py`, called from `nova._execute_tool_sync` |
 | Deferred MCP tools + output cap | A | `nova_tools/deferred.py` |
 | Error classes (transient / auth / permission / invalid input / unavailable / internal) | A | `nova_core/errors.py` |

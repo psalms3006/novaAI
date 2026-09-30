@@ -39,6 +39,7 @@ export const SETTINGS_GROUPS: SettingsGroup[] = [
     sections: [
       { id: 'permissions', label: 'Permissions', icon: 'fa-shield-halved', description: 'What NOVA may do on her own, and stopping her', keywords: 'halt stop permission allow ask deny safety confirm' },
       { id: 'tools', label: 'Tools & Tasks', icon: 'fa-toolbox', description: 'Her tools, MCP connectors and background tasks', keywords: 'tools mcp tasks automation capabilities' },
+      { id: 'knowledge', label: 'Knowledge', icon: 'fa-book-open', description: 'Folders you taught NOVA, what she learned and where from', keywords: 'learn study knowledge folder domain teach design principles sources verified' },
       { id: 'skills', label: 'Skills', icon: 'fa-graduation-cap', description: 'What NOVA has learned, its health, and accounts it uses', keywords: 'skills capabilities learned learn connect api provider extend health rollback' },
       { id: 'account', label: 'Account & Access', icon: 'fa-key', description: 'Your Gemini key, offline mode and NOVA Cloud account', keywords: 'key api gemini byok cloud sign in account offline devices' },
       { id: 'connections', label: 'Connections', icon: 'fa-plug', description: 'Network, sign-in mode and connected accounts', keywords: 'network gmail account integrations cloud byok offline knowledge' },

@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (109):
+Commits in the last 14 days (110):
 
+- 1e2370d 2026-09-29 Record the partial agentic benchmark run on gemini-flash-latest (1/1 before the daily quota)
 - 4d979b2 2026-09-29 Fix what NOVA's own 2026-09-29 session log showed going wrong
 - 8e54747 2026-09-29 Self-extending skills, tool hooks, deferred MCP tools, and the Claude Code audit
 - b6d42fb 2026-09-29 Eval: selectable model, fairer confidence rubric, first partial live results
@@ -154,8 +155,7 @@ Commits in the last 14 days (109):
 - d53c698 2026-09-23 Give the orb a deep-space backdrop, as its own independent layer
 - b56fd02 2026-09-23 Speak offline replies as they generate, not after the whole thing is done
 - fc807ad 2026-09-23 Wire the self-knowledge summary into NOVA's actual system prompt
-- 157ad8f 2026-09-23 Give NOVA a living self-knowledge doc, grounded in the code that exists
-- ...and 69 more
+- ...and 70 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

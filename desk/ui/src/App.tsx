@@ -1,3 +1,4 @@
+import { ScreenBoundary } from './components/ScreenBoundary';
 import { useEffect } from 'react';
 import { NovaStateProvider, useNova } from './context/NovaStateContext';
 import { NovaSettingsProvider } from './context/NovaSettingsContext';
@@ -27,6 +28,22 @@ function isTyping(target: EventTarget | null): boolean {
   return tag === 'input' || tag === 'textarea' || tag === 'select' || Boolean(el?.isContentEditable);
 }
 
+/** A focused control that Space / Enter should press. Global shortcuts used to
+ * swallow Space here, so a focused permission switch started the microphone
+ * instead of toggling. */
+const INTERACTIVE_ROLES = new Set(['button', 'switch', 'radio', 'checkbox', 'tab', 'menuitem', 'option', 'link']);
+function isControl(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el) return false;
+  const tag = el.tagName?.toLowerCase();
+  return tag === 'button' || tag === 'a' || INTERACTIVE_ROLES.has(el.getAttribute?.('role') || '');
+}
+
+/** Setup screens own the keyboard while they are up. */
+function overlayOpen(): boolean {
+  return Boolean(document.querySelector('[data-nova-blocking-overlay]'));
+}
+
 function AppContent() {
   const { currentScreen, setCurrentScreen, theme, setCommandPaletteOpen, commandPaletteOpen, themeModalOpen } = useNova();
   const rt = useRuntime();
@@ -45,7 +62,8 @@ function AppContent() {
         setCurrentScreen('runtime');
         return;
       }
-      if (isTyping(e.target) || commandPaletteOpen || themeModalOpen || rt.pendingConfirm) return;
+      if (isTyping(e.target) || commandPaletteOpen || themeModalOpen || rt.pendingConfirm || overlayOpen()) return;
+      if (isControl(e.target) && (e.code === 'Space' || e.key === 'Enter')) return;
       if (e.key === 'Escape' && rt.phase === 'speaking') {
         e.preventDefault();
         rt.interrupt();
@@ -95,13 +113,18 @@ function AppContent() {
       )}
 
       <main className="flex-1 relative w-full h-full min-h-0 overflow-hidden flex items-center justify-center z-10">
-        <div className="absolute left-6 top-6 bottom-8 pointer-events-auto z-20 flex">
+        {/* The column is click-through; only the rail itself takes clicks.
+            A full-height pointer-events-auto wrapper used to cover the left
+            edge of Settings and Library on narrower windows. */}
+        <div className="absolute left-6 top-6 bottom-8 pointer-events-none z-20 flex [&>*]:pointer-events-auto">
           <NavRail />
         </div>
-        {currentScreen === 'substrate' && <PresenceScreen />}
-        {currentScreen === 'runtime' && <SettingsScreen />}
-        {currentScreen === 'synaptic' && <SynapticMapScreen />}
-        {currentScreen === 'library' && <LibraryScreen />}
+        <ScreenBoundary key={currentScreen} name={currentScreen}>
+          {currentScreen === 'substrate' && <PresenceScreen />}
+          {currentScreen === 'runtime' && <SettingsScreen />}
+          {currentScreen === 'synaptic' && <SynapticMapScreen />}
+          {currentScreen === 'library' && <LibraryScreen />}
+        </ScreenBoundary>
         {currentScreen === 'substrate' && <VoicePill />}
       </main>
 

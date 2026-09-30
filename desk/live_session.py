@@ -603,7 +603,7 @@ class VoiceSupervisor:
 #: needs the user's agreement, has an outcome she must not guess at.
 NON_BLOCKING_TOOLS = frozenset({
     "web_search", "learn_resource", "file_processor", "generate_document",
-    "browser_control", "nova_capability",
+    "browser_control", "nova_capability", "nova_learning",
 })
 
 
@@ -2612,6 +2612,15 @@ class LiveManager:
             # What this person has asked of NOVA (Layer B). After identity,
             # before memory: it shapes how she talks, not what she knows.
             sys_prompt += f"\n\n{adaptation}"
+        try:
+            # What the person has taught NOVA (nova_learning): the domains and
+            # their strongest principles; details and sources via the tool.
+            from nova_learning import retrieve as _learned
+            learned = _learned.brief()
+            if learned:
+                sys_prompt += f"\n\n{learned}"
+        except Exception as e:
+            _log("[LIVE] learned knowledge unavailable: %s", e)
         if mem_ctx:
             sys_prompt += f"\n\n[BACKGROUND MEMORY]\n{mem_ctx}"
         tool_decls = _live_tool_declarations(_resolve("TOOL_DECLARATIONS", []))
@@ -3511,6 +3520,12 @@ class LiveManager:
             if refusal is not None:
                 return refusal
             if self._vision_in_session(args):
+                # This path captures the screen or camera itself instead of
+                # going through NOVA's tool gate, so it must honour the same
+                # "See your screen" permission the gate would have.
+                refusal = await self._vision_permission(fc, args)
+                if refusal is not None:
+                    return refusal
                 return await self._look(fc, args)
         t0 = time.time()
         budget = VISION_TIMEOUT_S if name == "vision" else TOOL_TIMEOUT_S
@@ -3550,6 +3565,34 @@ class LiveManager:
                 id=fc.id, name=name, response=response,
                 scheduling=gtypes.FunctionResponseScheduling.WHEN_IDLE)
         return gtypes.FunctionResponse(id=fc.id, name=name, response=response)
+
+    async def _vision_permission(self, fc: Any, args: dict) -> Any:
+        """None to go ahead, or a refusal FunctionResponse. deny -> refuse;
+        ask -> a real "should I look?" question; allow -> go ahead."""
+        try:
+            from desk import settings as desk_settings
+            perm = str((desk_settings.get("permissions", {}) or {}).get("screen_read") or "ask")
+        except Exception:
+            perm = "ask"
+        what = "camera" if str(args.get("angle") or "").lower() == "camera" else "screen"
+        if perm == "allow":
+            return None
+        if perm == "ask":
+            try:
+                from desk.confirm import store
+                yes, _note = await asyncio.to_thread(
+                    store.ask, "vision", dict(args),
+                    f"NOVA wants to look at your {what}. Should she?")
+                if yes is True:
+                    return None
+            except Exception as e:
+                _log("[LIVE] could not ask about looking: %s", e)
+            text = (f"The user did not agree to you looking at their {what}. Say you won't look, "
+                    f"and ask them to describe what they need instead.")
+        else:
+            text = (f"Looking at the user's {what} is turned off in NOVA's permissions. Tell them "
+                    f"plainly, and that they can turn it on in Settings > Permissions.")
+        return gtypes.FunctionResponse(id=fc.id, name=fc.name, response={"output": text})
 
     @staticmethod
     async def _await_tool(task: "asyncio.Future", budget: float) -> Any:

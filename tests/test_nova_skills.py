@@ -451,7 +451,7 @@ def test_voice_runs_skills_without_going_silent():
     assert "nova_capability" in NON_BLOCKING_TOOLS
 
 
-# ── the window's door: /api/capabilities ─────────────────────────────────────
+# ── the window's door: /api/skills ─────────────────────────────────────
 @pytest.fixture
 def desk(reg, store, monkeypatch):
     from flask import Flask, jsonify, request
@@ -480,36 +480,36 @@ H = {"X-NOVA-Desk": "t"}
 
 
 def test_window_needs_the_desk_token(desk):
-    assert desk.get("/api/capabilities").status_code == 401
+    assert desk.get("/api/skills").status_code == 401
 
 
 def test_window_connects_an_account_and_never_gets_the_key_back(desk, store, monkeypatch):
     seen = _http(monkeypatch)
     r = desk.svc.propose_provider(IMG_OPTION, name="Make images", description="d",
                                   workflow=IMG_FLOW, test=IMG_TEST)
-    ov = desk.get("/api/capabilities", headers=H).get_json()
+    ov = desk.get("/api/skills", headers=H).get_json()
     assert ov["pending"][0]["id"] == r["id"]
-    bad = desk.post(f"/api/capabilities/{r['id']}/credential", headers=H,
+    bad = desk.post(f"/api/skills/{r['id']}/credential", headers=H,
                     json={"provider_id": "someone-else", "secret": "K"})
     assert bad.status_code == 404
-    ok = desk.post(f"/api/capabilities/{r['id']}/credential", headers=H,
+    ok = desk.post(f"/api/skills/{r['id']}/credential", headers=H,
                    json={"provider_id": "imgapi", "secret": "WINDOW-SECRET"}).get_json()
     assert ok["ok"] and ok["learned"]
     assert seen[-1]["headers"]["X-Key"] == "WINDOW-SECRET"
-    assert b"WINDOW-SECRET" not in desk.get("/api/capabilities", headers=H).data
+    assert b"WINDOW-SECRET" not in desk.get("/api/skills", headers=H).data
     # Removing the skill forgets the key too.
-    assert desk.delete(f"/api/capabilities/{r['id']}", headers=H).status_code == 200
+    assert desk.delete(f"/api/skills/{r['id']}", headers=H).status_code == 200
     assert store == {}
-    assert desk.get("/api/capabilities", headers=H).get_json()["capabilities"] == []
+    assert desk.get("/api/skills", headers=H).get_json()["capabilities"] == []
 
 
 def test_window_test_rollback_and_unknowns(desk):
     cap = _learned(desk.svc.registry)
-    assert desk.post(f"/api/capabilities/{cap.id}/test", headers=H).get_json()["ok"]
-    assert desk.post(f"/api/capabilities/{cap.id}/rollback", headers=H).status_code == 409
-    assert desk.post("/api/capabilities/nope/test", headers=H).status_code == 404
-    assert desk.delete("/api/capabilities/nope", headers=H).status_code == 404
-    assert desk.post("/api/capabilities/check", headers=H).get_json()["ok"]
+    assert desk.post(f"/api/skills/{cap.id}/test", headers=H).get_json()["ok"]
+    assert desk.post(f"/api/skills/{cap.id}/rollback", headers=H).status_code == 409
+    assert desk.post("/api/skills/nope/test", headers=H).status_code == 404
+    assert desk.delete("/api/skills/nope", headers=H).status_code == 404
+    assert desk.post("/api/skills/check", headers=H).get_json()["ok"]
 
 
 def test_only_catalog_outcomes_are_reported_and_only_id_and_result(reg, store, monkeypatch):

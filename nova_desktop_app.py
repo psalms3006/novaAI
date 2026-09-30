@@ -547,7 +547,7 @@ def main() -> int:
             from desk import bridge as _bridge
             req = urllib.request.Request(
                 f"{DESK_URL}/api/live/screen",
-                data=_json.dumps({"watching": bool(on)}).encode(),
+                data=_json.dumps({"watching": bool(on), "source": "ambient"}).encode(),
                 headers={"Content-Type": "application/json",
                          "X-NOVA-Desk": _bridge.run_token},
                 method="POST")

@@ -92,7 +92,7 @@ export const Onboarding: React.FC = () => {
   const field = { borderColor: theme.palette.glassBorder, color: theme.palette.textPrimary, backgroundColor: theme.palette.glassSurface };
 
   return (
-    <div className="fixed inset-0 z-[55] flex items-center justify-center p-4 backdrop-blur-xl animate-fade-in" style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}>
+    <div data-nova-blocking-overlay="onboarding" className="fixed inset-0 z-[55] flex items-center justify-center p-4 backdrop-blur-xl animate-fade-in" style={{ backgroundColor: 'rgba(0,0,0,0.5)' }}>
       <div
         role="dialog"
         aria-modal="true"

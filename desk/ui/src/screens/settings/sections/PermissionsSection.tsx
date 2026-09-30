@@ -45,7 +45,7 @@ export const PermissionsSection: React.FC = () => {
         <Row
           first
           label="Stop NOVA now"
-          hint="Stops her speaking and any reply being written, and mutes the microphone. Background tasks already running are not cancelled — the backend cannot yet."
+          hint="Stops her speaking and any reply being written, and mutes the microphone. Background tasks keep running — stop those from Presence → Tasks."
         >
           <Button
             tone="danger"
@@ -59,14 +59,10 @@ export const PermissionsSection: React.FC = () => {
           </Button>
         </Row>
         {rt.pendingConfirm && (
-          <Row label="Waiting for you" hint={rt.pendingConfirm.prompt}>
-            <div className="flex gap-2">
-              <Button onClick={() => rt.decide(rt.pendingConfirm!.id, false)}>No</Button>
-              <Button tone="accent" onClick={() => rt.decide(rt.pendingConfirm!.id, true)}>
-                Yes
-              </Button>
-            </div>
-          </Row>
+          // The question itself is answered in the dialog on top of the
+          // window. Buttons here used to sit underneath it, where they could
+          // never be clicked.
+          <Row label="Waiting for you" hint={`${rt.pendingConfirm.prompt} — answer in the dialog.`} />
         )}
       </Card>
 

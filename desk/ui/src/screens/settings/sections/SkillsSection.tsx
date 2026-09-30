@@ -92,7 +92,7 @@ const ConnectForm: React.FC<{ skill: Skill; onDone: () => void }> = ({ skill, on
     setMsg('');
     try {
       const r = await postJSON<{ ok: boolean; learned: boolean; detail: string }>(
-        `/api/capabilities/${encodeURIComponent(skill.id)}/credential`,
+        `/api/skills/${encodeURIComponent(skill.id)}/credential`,
         { provider_id: providerId, secret },
       );
       setSecret('');
@@ -150,7 +150,7 @@ const ConnectForm: React.FC<{ skill: Skill; onDone: () => void }> = ({ skill, on
 
 export const SkillsSection: React.FC = () => {
   const { theme } = useNova();
-  const ov = useResource(() => getJSON<Overview>('/api/capabilities', 10000), [], 15000);
+  const ov = useResource(() => getJSON<Overview>('/api/skills', 10000), [], 15000);
   const [busy, setBusy] = React.useState('');
   const [note, setNote] = React.useState('');
 
@@ -170,7 +170,7 @@ export const SkillsSection: React.FC = () => {
     }
   };
 
-  const skills = ov.data?.capabilities || [];
+  const skills = Array.isArray(ov.data?.capabilities) ? ov.data!.capabilities : [];
   const learned = skills.filter((s) => s.learned);
   const names = Object.fromEntries(skills.map((s) => [s.id, s.name]));
 
@@ -180,7 +180,7 @@ export const SkillsSection: React.FC = () => {
         title="Skills"
         subtitle="What NOVA has learned to do beyond her built-in tools. A skill counts as learned only after it has passed its own test on this computer."
         right={
-          <Button onClick={() => act('check', '/api/capabilities/check')} disabled={!!busy}>
+          <Button onClick={() => act('check', '/api/skills/check')} disabled={!!busy}>
             {busy === 'check' ? 'Checking…' : 'Check health'}
           </Button>
         }
@@ -233,15 +233,15 @@ export const SkillsSection: React.FC = () => {
                         </span>
                       </div>
                       <div className="flex gap-2 mt-2">
-                        <Button onClick={() => act(`test:${s.id}`, `/api/capabilities/${encodeURIComponent(s.id)}/test`)} disabled={!!busy}>
+                        <Button onClick={() => act(`test:${s.id}`, `/api/skills/${encodeURIComponent(s.id)}/test`)} disabled={!!busy}>
                           {busy === `test:${s.id}` ? 'Testing…' : 'Test'}
                         </Button>
                         {canRollBack && (
-                          <Button onClick={() => act(`rb:${s.id}`, `/api/capabilities/${encodeURIComponent(s.id)}/rollback`)} disabled={!!busy}>
+                          <Button onClick={() => act(`rb:${s.id}`, `/api/skills/${encodeURIComponent(s.id)}/rollback`)} disabled={!!busy}>
                             Roll back
                           </Button>
                         )}
-                        <Button tone="danger" onClick={() => act(`rm:${s.id}`, `/api/capabilities/${encodeURIComponent(s.id)}`, 'DELETE')} disabled={!!busy}>
+                        <Button tone="danger" onClick={() => act(`rm:${s.id}`, `/api/skills/${encodeURIComponent(s.id)}`, 'DELETE')} disabled={!!busy}>
                           Remove
                         </Button>
                       </div>

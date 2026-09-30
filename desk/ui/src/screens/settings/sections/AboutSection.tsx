@@ -47,7 +47,7 @@ export const AboutSection: React.FC = () => {
       </Card>
 
       <div className="text-[10px] font-mono opacity-50" style={{ color: theme.palette.textMuted }}>
-        © Omniel. Updates are delivered with new installers; NOVA does not check for updates on its own.
+        © Omniel. NOVA checks for signed updates by herself and installs them when you are not using her; an update never changes your settings, memory or knowledge.
       </div>
     </div>
   );

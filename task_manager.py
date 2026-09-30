@@ -1010,6 +1010,28 @@ class TaskManager:
                                    "fix": ("write it from the research findings"
                                            if has_findings else "needs content from the user"),
                                    "retry": has_findings})
+        # Work that falls in a domain the person taught NOVA is also held to
+        # what they taught (nova_learning, §103). Only verified domains count,
+        # and every issue names the learned principle and the file it came from.
+        for i, s in enumerate(t.steps):
+            content = str(s.args.get("content") or "") if _writes_file(s) else ""
+            if not content or s.status != "VERIFIED" or _placeholder(content):
+                continue
+            try:
+                from nova_learning import retrieve as _learned
+                breaks = _learned.check_against(content, t.title)
+            except Exception as e:
+                log.info("learned-principle review skipped: %s", e)
+                continue
+            if breaks is None:
+                continue                    # nothing the person taught bears on this
+            checked.append(f"step {i + 1}: checked against the principles you taught me")
+            for b in breaks[:5]:
+                issues.append({"step": i, "agent": s.agent,
+                               "problem": (f"it breaks a learned principle: {b['principle']} "
+                                           f"(from {', '.join(b['sources'][:2])}) — {b['why']}"),
+                               "fix": b["fix"] or f"revise it to follow: {b['principle']}",
+                               "retry": True, "learned": b})
         return {"round": rnd, "passed": not issues, "issues": issues,
                 "checked": checked, "ts": time.time()}
 
@@ -1048,6 +1070,14 @@ class TaskManager:
                 step = t.steps[i]
                 if "research" in issue["fix"] and step.tool in WRITER_TOOLS:
                     step.args["content"] = ""       # re-filled from the findings
+                elif issue.get("learned") and step.args.get("content"):
+                    # Rewriting the same text would fail the same check: revise
+                    # it to follow the learned principle it broke.
+                    try:
+                        from nova_learning import retrieve as _learned
+                        step.args["content"] = _learned.revise(step.args["content"], [issue["learned"]])
+                    except Exception as e:
+                        log.info("could not revise to the learned principle: %s", e)
                 self._set_status(t, "RUNNING", f"Revising: {step.description}")
                 with self._lock:
                     step.status, step.result, step.verification = "QUEUED", "", "UNKNOWN"

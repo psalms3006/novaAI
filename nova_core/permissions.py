@@ -313,6 +313,9 @@ TOOL_CAPABILITIES: dict[str, frozenset[Capability]] = {
     # person connected, so it declares NETWORK_WRITE; each tool step inside
     # a skill is dispatched again and checked on its own.
     "nova_capability": _caps(C.MEMORY_READ, C.MEMORY_WRITE, C.NETWORK_READ, C.NETWORK_WRITE),
+    # Learning reads the folder the person named and sends its content to the
+    # model to study; knowledge is written to this account's store.
+    "nova_learning": _caps(C.FILE_READ, C.MEMORY_READ, C.MEMORY_WRITE, C.NETWORK_WRITE),
     "planner": _caps(C.MEMORY_READ),
     "game_updater": _caps(C.NETWORK_READ, C.FILE_WRITE, C.PROCESS_CONTROL),
 }

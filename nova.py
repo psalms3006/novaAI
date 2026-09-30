@@ -819,6 +819,12 @@ Do not use it for something you can simply answer, or for a single quick lookup 
 
 If you are missing a detail, ask for it, or make a reasonable assumption and say which one you made. Do not stall: searching your memory and the user's files repeatedly, finding nothing, and then asking what they meant is the least useful thing you can do with a request. If you genuinely cannot tell what the user is working on, research the general topic they named and say that is what you did.
 
+## Learning what the user teaches you
+
+When the user explicitly asks you to learn or study material ("learn this folder", "study these and learn how I approach design"), call nova_learning with cmd="learn", the path, a short domain name and a scope. Reading, opening or summarising a file is a one-off task for file_processor, not learning: do not learn what the user only asked you to read. If it is unclear whether the knowledge should last (personal), belong to one project, or just be reference material, ask. Learning runs in the background: keep the conversation going, and use cmd="status" when asked how it is going.
+
+Words mean exactly what they say. "Read": you opened it. "Analyzed": you processed it. "Learned": the knowledge was built and passed its verification — only say this when status reports it verified. "Remembered": saved to personal memory. When you apply learned knowledge, say so; when asked why you think something, use nova_learning why and cite the files. If the material disagrees with itself, say so rather than picking a side silently.
+
 ## When you can't do something yet
 
 "I can't do that" is where an investigation starts, not an answer. Before saying it, call nova_capability with cmd="discover" and the user's need: it checks the skills you have already learned, whether your own tools can do it as a workflow, which services NOVA knows about, and what the web suggests — and says honestly which of those it found.
@@ -1250,6 +1256,12 @@ try:
     TOOL_DECLARATIONS.append(_SKILLS_DECLARATION)
 except Exception as _skills_err:          # the rest of NOVA works without it
     log.warning("nova_capability not declared: %s", _skills_err)
+
+try:
+    from nova_learning.model_tool import DECLARATION as _LEARNING_DECLARATION
+    TOOL_DECLARATIONS.append(_LEARNING_DECLARATION)
+except Exception as _learning_err:
+    log.warning("nova_learning not declared: %s", _learning_err)
 
 try:
     from nova_tools.deferred import install_hooks as _install_output_cap
@@ -1926,6 +1938,12 @@ def _execute_tool_core(tool_name: str, args: dict, meta: dict) -> str:
         except Exception as e:
             return f"nova_capability is unavailable: {e}"
         return _skills.execute(args.get("cmd", "list"), args.get("args") or {})
+    if tool_name == "nova_learning":
+        try:
+            from nova_learning import model_tool as _learning
+        except Exception as e:
+            return f"nova_learning is unavailable: {e}"
+        return _learning.execute(args.get("cmd", "list"), args.get("args") or {})
 
     if tool_name == "vision":
         return _vision_analyze(
@@ -2148,6 +2166,7 @@ def _validate_tool_modules() -> Dict[str, bool]:
     available["autostart"]        = True
     available["remember_fact"]    = True
     available["nova_capability"]  = importlib.util.find_spec("nova_skills") is not None
+    available["nova_learning"]    = importlib.util.find_spec("nova_learning") is not None
     return available
 
 

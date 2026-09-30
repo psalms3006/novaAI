@@ -68,7 +68,7 @@ export const ToolsSection: React.FC = () => {
                   </span>
                 </div>
                 <div className="text-[10px] font-mono opacity-50 mt-0.5" style={{ color: theme.palette.textMuted }}>
-                  {t.steps.length} steps{t.progress != null ? ` · ${Math.round(t.progress * 100)}%` : ''}
+                  {t.steps.length} steps{t.progress != null ? ` · ${Math.round(t.progress)}%` : ''}
                   {t.reason_for_stop ? ` · ${t.reason_for_stop}` : ''}
                 </div>
               </div>

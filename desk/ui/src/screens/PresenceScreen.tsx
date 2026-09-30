@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNova } from '../context/NovaStateContext';
+import { useNovaSettings } from '../context/NovaSettingsContext';
 import { useRuntime, fmtAgo, type ActivityKind, type SystemTask } from '../nova/runtime';
 import { SpatialCanvas } from '../components/three/SpatialCanvas';
 import { phaseColor } from '../components/TopHud';
@@ -164,6 +165,7 @@ const TaskRow: React.FC<{ t: SystemTask; open: boolean; onToggle: () => void }> 
 
 export const PresenceScreen: React.FC = () => {
   const { presenceType, setPresenceType, theme, prefs, setCurrentScreen, quality } = useNova();
+  const { setActiveSection } = useNovaSettings();
   const rt = useRuntime();
   const [openAgent, setOpenAgent] = useState<string | null>(null);
   const [openTask, setOpenTask] = useState<string | null>(null);
@@ -305,7 +307,7 @@ export const PresenceScreen: React.FC = () => {
           <div className="mt-2 pt-2 border-t flex items-center justify-between text-[10px] font-sans" style={{ borderColor: theme.palette.glassBorder }}>
             <span style={{ color: theme.palette.textMuted }}>Live from NOVA</span>
             <button
-              onClick={() => setCurrentScreen('runtime')}
+              onClick={() => { setActiveSection('permissions'); setCurrentScreen('runtime'); }}
               className="transition-colors flex items-center gap-1 cursor-pointer font-medium hover:opacity-100"
               style={{ color: theme.palette.accent }}
             >
