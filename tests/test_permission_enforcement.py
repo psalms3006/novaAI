@@ -23,9 +23,10 @@ class FakeLive:
         return {"ok": True, "message": "connecting"}
 
     def stop(self):
+        running = self.started > self.stopped
         self.stopped += 1
         self.owns_microphone = False
-        return {"ok": True}
+        return {"ok": True} if running else {"ok": True, "message": "not running"}
 
     def screen_status(self):
         return {"watching": self.watching}
@@ -95,6 +96,20 @@ def test_withdrawing_a_permission_stops_what_it_allowed(client, monkeypatch):
     client.live.watching = True
     client.post("/api/settings", json={"permissions": {"microphone": "deny", "screen_read": "deny"}}, headers=H)
     assert client.live.stopped == 1 and client.live.watching is False
+
+
+def test_withdrawing_the_microphone_stops_a_session_that_is_still_connecting(client, monkeypatch):
+    """Found against the real app: a session still connecting does not own the
+    microphone yet, so the first version of the check let it go on to stream."""
+    from desk import bridge
+    monkeypatch.setattr(bridge.desk_settings, "set_many", lambda d: client.perms.update(d.get("permissions", {})))
+    monkeypatch.setattr(bridge.desk_account, "push_preferences_async", lambda d: None)
+    monkeypatch.setattr(bridge.desk_settings, "all", lambda: {"permissions": dict(client.perms)})
+    client.perms.update(microphone="allow")
+    client.post("/api/live/start", json={"source": "user"}, headers=H)
+    client.live.owns_microphone = False                   # connecting: no microphone yet
+    client.post("/api/settings", json={"permissions": {"microphone": "deny"}}, headers=H)
+    assert client.live.stopped == 1
 
 
 def test_in_session_vision_obeys_the_screen_permission(monkeypatch):

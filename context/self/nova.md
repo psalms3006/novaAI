@@ -113,8 +113,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (112):
+Commits in the last 14 days (113):
 
+- 81abe0e 2026-09-30 Fix empty chat replies; say when settings were not saved; finish the UI audit fixes
 - c29806e 2026-09-30 Acquire a missing capability from research, with the person's OK asked once
 - 913ce56 2026-09-30 Learning system, permission enforcement, and the UI interaction audit fixes
 - 1e2370d 2026-09-29 Record the partial agentic benchmark run on gemini-flash-latest (1/1 before the daily quota)
@@ -154,8 +155,7 @@ Commits in the last 14 days (112):
 - 25f0ce6 2026-09-23 Make the Concurrent Task Manager actually concurrent
 - 1354510 2026-09-23 Make the nebula the whole app's background, and give core surfaces clay
 - 2545bf0 2026-09-23 Stop losing typed messages after one failed send, and clean up the tree
-- d53c698 2026-09-23 Give the orb a deep-space backdrop, as its own independent layer
-- ...and 72 more
+- ...and 73 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

@@ -2167,9 +2167,13 @@ def _enforce_revocations() -> list:
     stopped = []
     try:
         mgr = desk_live.get_live_manager()
-        if _permission("microphone") == "deny" and getattr(mgr, "owns_microphone", False):
-            mgr.stop()
-            stopped.append("voice")
+        # Any session that is not idle -- including one still connecting, which
+        # does not own the microphone *yet* and was missed by the first version
+        # of this check (caught against the real app: it went on to stream).
+        if _permission("microphone") == "deny":
+            r = mgr.stop()
+            if isinstance(r, dict) and r.get("message") != "not running":
+                stopped.append("voice")
         if _permission("screen_read") == "deny" and mgr.screen_status().get("watching"):
             mgr.set_screen_share(False)
             stopped.append("screen")
