@@ -44,7 +44,8 @@ class CapabilityService:
                  planner: Optional[Callable] = None, catalog: Optional[Callable[[], list]] = None,
                  search: Optional[Callable[[str], list]] = None,
                  registry: Optional[CapabilityRegistry] = None,
-                 reporter: Optional[Callable[[str, bool], None]] = None):
+                 reporter: Optional[Callable[[str, bool], None]] = None,
+                 approver: Optional[Callable] = None):
         self.tool_exec = tool_exec
         self.declarations = declarations or []
         self.planner = planner
@@ -54,6 +55,10 @@ class CapabilityService:
         #: Tells the backend catalog that a listed provider passed/failed here.
         #: Only the provider id and the outcome -- never inputs or outputs.
         self.reporter = reporter
+        #: Asks the *person* (never the model) to agree before a capability
+        #: that costs money, uses their account or sends their content out
+        #: runs for the first time: fn(capability, [what]) -> True | False | None.
+        self.approver = approver or _window_approver
 
     # ── the investigation ──────────────────────────────────────────────────────
     def discover(self, need: str) -> Report:
@@ -100,6 +105,10 @@ class CapabilityService:
                                 permissions=list(option.get("permissions", [])))
         needs = list(ev.needs_approval)
         needs_key = bool(option.get("requires_account") or setup.get("auth_header"))
+        if needs:
+            with self.registry._lock:                                      # noqa: SLF001
+                self.registry._data["capabilities"][cap.id]["approval_required"] = needs  # noqa: SLF001
+                self.registry._save()                                      # noqa: SLF001
         _emit("pending", capability_id=cap.id, name=name, needs=needs, needs_credential=needs_key)
         return {"ok": True, "id": cap.id, "provider_id": pid, "needs_approval": needs,
                 "needs_credential": needs_key,
@@ -124,7 +133,31 @@ class CapabilityService:
         return self.test(cap_id)
 
     # ── proving, using, keeping healthy ─────────────────────────────────────────
+    def _approved(self, cap_id: str) -> tuple:
+        """(ok, why). The first run of a capability that needs the person's OK
+        waits for it; the answer is kept, so it is asked once, not every time."""
+        cap = self.registry.get(cap_id)
+        if cap is None or not cap.approval_required or cap.approved_at:
+            return True, ""
+        why = ""
+        try:
+            yes = self.approver(cap, list(cap.approval_required))
+        except Exception as e:
+            yes, why = None, f"could not ask: {e}"
+        if yes is True:
+            self.registry.approve(cap_id, list(cap.approval_required))
+            _emit("approved", capability_id=cap_id, name=cap.name)
+            return True, ""
+        what = "; ".join(cap.approval_required)
+        return False, why or (f"the person did not agree ({what})" if yes is False else
+                              f"needs the person's OK in NOVA's window first ({what})")
+
     def test(self, cap_id: str) -> dict:
+        ok, why = self._approved(cap_id)
+        if not ok:
+            cap = self.registry.get(cap_id)
+            return {"ok": False, "learned": bool(cap and cap.learned), "health": cap.health if cap else "",
+                    "detail": why}
         passed, detail = runner.verify(self.registry, cap_id, self.tool_exec)
         cap = self.registry.get(cap_id)
         if cap and cap.source == "catalog" and self.reporter:
@@ -139,6 +172,9 @@ class CapabilityService:
                 "detail": detail}
 
     def use(self, cap_id: str, inputs: dict) -> dict:
+        ok, why = self._approved(cap_id)
+        if not ok:
+            return {"ok": False, "output": "", "error": why, "failed_step": None}
         res = runner.use(self.registry, cap_id, inputs, self.tool_exec)
         _emit("used", capability_id=cap_id, ok=res.ok)
         out = {"ok": res.ok, "output": res.text()[:4000], "error": res.error,
@@ -197,6 +233,20 @@ class CapabilityService:
         return {"capabilities": [c.public() for c in caps],
                 "timeline": self.registry.timeline(40),
                 "pending": [c.public() for c in caps if not c.learned]}
+
+
+def _window_approver(cap, what: list):
+    """The person answers in NOVA's window (the same dialog as every other
+    "should I proceed?"). Without the desktop there is no one to ask: None."""
+    try:
+        from desk.confirm import store
+    except Exception:
+        return None
+    provs = ", ".join(p.get("name", "") for p in cap.providers) or cap.name
+    prompt = (f"NOVA wants to start using {provs} for “{cap.name}”. That means: "
+              f"{'; '.join(what)}. Allow it?")
+    yes, _note = store.ask("nova_capability", {"capability": cap.id, "needs": what}, prompt)
+    return yes
 
 
 __all__ = ["CapabilityService", "on_event"]

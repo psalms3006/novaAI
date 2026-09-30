@@ -28,6 +28,8 @@ def reg(tmp_path, monkeypatch):
     monkeypatch.setenv("NOVA_ACCOUNT_ID", "alice")
     monkeypatch.delenv("NOVA_ALLOW_HTTP_PROVIDERS", raising=False)
     monkeypatch.setattr(service, "_listeners", [])
+    # The person's answer in NOVA's window; tests that check refusal replace it.
+    monkeypatch.setattr(service, "_window_approver", lambda cap, what: True)
     return CapabilityRegistry()
 
 

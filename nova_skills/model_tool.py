@@ -39,6 +39,10 @@ DECLARATION = {
         "test it, 'propose' {option_id, name, description, workflow, test} to set up a provider "
         "found by discover, 'test' {capability_id}, 'run' {capability_id, inputs}, "
         "'check' (re-check health), 'history', 'rollback' {capability_id}. "
+        "When discover only finds web leads, 'read' {url, need} a lead's documentation page to "
+        "turn it into an option (then 'propose' it). Research freely; the user is only asked when "
+        "something costs money, uses their account or sends their content out, and NOVA's window "
+        "asks them, not you. "
         "workflow is [{tool, args}] or [{provider, method, path, body}]; '{name}' in args is "
         "filled from inputs and '{step1}' from an earlier step's output. test is "
         "{inputs, expect: {contains | min_length | json}}. A skill is learned ONLY when its "
@@ -50,10 +54,10 @@ DECLARATION = {
         "type": "OBJECT",
         "properties": {
             "cmd": {"type": "STRING",
-                    "description": "list | discover | adopt | propose | test | run | check | history | rollback"},
+                    "description": "list | discover | read | adopt | propose | test | run | check | history | rollback"},
             "args": {"type": "OBJECT",
-                     "description": "discover: {need}; adopt: {name, description, workflow, test}; "
-                                    "propose: {option_id, name, description, workflow, test}; "
+                     "description": "discover: {need}; read: {url, need}; adopt: {name, description, workflow, test}; "
+                                    "propose: {option_id, name, description, workflow?, test?, test_input?}; "
                                     "test/rollback: {capability_id}; run: {capability_id, inputs}"},
         },
         "required": ["cmd"],
@@ -179,17 +183,50 @@ def execute(cmd: str, args: dict | None = None, svc: CapabilityService | None = 
                                      str(a.get("description") or ""), wf, a.get("test") or {})
             return _fmt({**res, "say": ("Learned and tested." if res["learned"]
                                         else f"Saved but NOT learned: {res['detail']}")})
+        if cmd == "read":
+            from . import research
+            url = str(a.get("url") or "").strip()
+            need = str(a.get("need") or "").strip()
+            if not url or not need:
+                return "Error: read takes {url, need}: a lead's documentation page, and what it is for."
+            opt = research.read_lead(url, need)
+            if not opt.get("usable"):
+                return _fmt({"usable": False, "why_not": opt.get("why_not"),
+                             "red_flags": opt.get("red_flags", [])})
+            _offered[opt["id"]] = opt
+            return _fmt({"usable": True, "option_id": opt["id"], "name": opt["name"],
+                         "description": opt["description"], "cost": opt["cost"],
+                         "requires_account": opt["requires_account"], "docs": opt["docs_url"],
+                         "evidence": opt["evidence"], "evidence_found_on_page": opt["evidence_found_on_page"],
+                         "red_flags": opt["red_flags"], "evaluation": opt["evaluation"]["summary"],
+                         "next": ("propose it (NOVA's window will ask the user for any OK it needs "
+                                  "before its first use), or read another lead to compare")})
         if cmd == "propose":
             oid = str(a.get("option_id") or "")
             option = _offered.get(oid)
             if option is None:
-                return ("Error: propose takes an option_id from the last 'discover'. Web leads "
-                        "can't be proposed directly.")
+                return ("Error: propose takes an option_id from 'discover' (catalog) or from 'read' "
+                        "(a lead whose documentation NOVA has read). An unread lead can't be proposed.")
+            workflow, test = a.get("workflow") or [], a.get("test") or {}
+            step = option.get("suggested_step")
+            if not workflow and step:
+                from .registry import slug as _slug
+                workflow = [{"provider": _slug(option["id"]),
+                             **{k: v for k, v in step.items() if v is not None}}]
+            if not test and step:
+                expect = ({"contains": "Saved image"} if option.get("output") == "image" else
+                          {"json": True} if option.get("output") == "json" else {"min_length": 20})
+                test = {"inputs": {"input": str(a.get("test_input") or option.get("description")
+                                                or "test")[:120]}, "expect": expect}
             res = svc.propose_provider(option, name=str(a.get("name") or option["name"]),
                                        description=str(a.get("description") or option.get("description") or ""),
-                                       workflow=a.get("workflow") or [], test=a.get("test") or {})
-            if res.get("ok") and not res.get("needs_credential") and not res.get("needs_approval"):
+                                       workflow=workflow, test=test)
+            if res.get("ok") and not res.get("needs_credential"):
+                # Testing is the first use: anything that needs the person's OK
+                # is asked for in NOVA's window now, not by the model.
                 res["test"] = svc.test(res["id"])
+                res["say"] = ("Connected and tested — it is now a skill NOVA has." if res["test"]["learned"]
+                              else f"Not connected: {res['test']['detail']}")
             return _fmt(res)
         if cmd == "test":
             return _fmt(svc.test(str(a.get("capability_id") or a.get("id") or "")))

@@ -104,6 +104,8 @@ class Capability:
     owner_scope: str = "user"                            # capabilities here are this person's
     limitations: str = ""
     staged_providers: dict = field(default_factory=dict)  # {"<version>": [Provider]} awaiting a test
+    approval_required: list = field(default_factory=list)  # what the person must agree to first
+    approved_at: float = 0.0                               # when they did (0 = not yet)
 
     def public(self) -> dict:
         d = asdict(self)
@@ -293,6 +295,13 @@ class CapabilityRegistry:
             self._event("rolled_back", cap_id, f"back to v{v['number']}")
             self._save()
             return _cap(raw)
+
+    def approve(self, cap_id: str, what: list) -> None:
+        with self._lock:
+            raw = self._data["capabilities"][cap_id]
+            raw["approved_at"] = time.time()
+            self._event("approved", cap_id, "; ".join(what))
+            self._save()
 
     def remove(self, cap_id: str) -> None:
         with self._lock:

@@ -44,8 +44,19 @@ class RunResult:
 
 
 def _fill(value: Any, ctx: dict) -> Any:
+    """`{name}` from inputs / earlier steps; `{name|url}` URL-encoded, for a
+    value that goes into a path or query string."""
     if isinstance(value, str):
-        return re.sub(r"\{(\w+)\}", lambda m: str(ctx.get(m.group(1), m.group(0))), value)
+        def one(m):
+            key, filt = m.group(1), m.group(2)
+            if key not in ctx:
+                return m.group(0)
+            v = str(ctx[key])
+            if filt == "url":
+                from urllib.parse import quote
+                v = quote(v, safe="")
+            return v
+        return re.sub(r"\{(\w+)(?:\|(url))?\}", one, value)
     if isinstance(value, dict):
         return {k: _fill(v, ctx) for k, v in value.items()}
     if isinstance(value, list):

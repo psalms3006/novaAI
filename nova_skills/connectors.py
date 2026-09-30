@@ -54,9 +54,33 @@ def forget_credential(ref: str) -> None:
         st.delete_secret(ref)
 
 
+def output_dir(kind: str):
+    """Where a provider's files (a generated image, a document) are kept."""
+    from pathlib import Path
+    home = Path(os.path.expanduser("~"))
+    base = home / ("Pictures" if kind == "image" else "Documents") / "NOVA"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+_BINARY = ("image/", "audio/", "video/", "application/pdf", "application/octet-stream",
+           "application/zip")
+_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif",
+        "audio/mpeg": ".mp3", "audio/wav": ".wav", "video/mp4": ".mp4", "application/pdf": ".pdf"}
+
+
 def _default_http(method, url, headers, body, timeout):
+    """(status, text). A file-shaped answer (an image, a PDF, audio) is saved
+    and described -- the person gets the file, the model gets where it is."""
     import requests
-    r = requests.request(method, url, headers=headers, json=body, timeout=timeout)
+    r = requests.request(method, url, headers=headers,
+                         json=body if method not in ("GET", "HEAD") else None, timeout=timeout)
+    ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if 200 <= r.status_code < 300 and ctype.startswith(_BINARY):
+        kind = ctype.split("/")[0]
+        path = output_dir(kind) / f"nova-{int(time.time())}{_EXT.get(ctype, '.bin')}"
+        path.write_bytes(r.content)
+        return r.status_code, f"Saved {kind} file ({ctype}, {len(r.content) // 1024} KB) to {path}"
     return r.status_code, r.text[:20000]
 
 

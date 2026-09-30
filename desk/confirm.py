@@ -157,7 +157,7 @@ def scope_for(tool_name: str, args: dict | None = None) -> str:
         cmd = str(args.get("cmd") or "").lower()
         if cmd in ("run", "test", "adopt", "propose", "check"):
             return "network"
-        return "browser_read" if cmd == "discover" else ""
+        return "browser_read" if cmd in ("discover", "read") else ""
     if tool_name.startswith("mcp__") or tool_name in ("use_tool",):
         return "network"               # a connected service, outside NOVA
     if tool_name == "browser_control":
