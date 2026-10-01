@@ -1187,7 +1187,7 @@ class TaskManager:
                 if t.artifacts:
                     paths = ", ".join(a["path"] for a in t.artifacts)
                     outcome += f" Artifacts: {paths}"
-                mem.remember(outcome, source="system", confirmed=False, importance=0.55)
+                mem.remember_task_outcome(outcome)
         except Exception:
             pass
 

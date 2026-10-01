@@ -104,6 +104,15 @@ _TRANSIENT_PATTERNS = [
     re.compile(r"\b(?:dialog|prompt|window|popup|modal|tab) is\b", re.I),
     re.compile(r"\b(?:right now|at the moment|just now|at present)\b", re.I),
     re.compile(r"\buser (?:opened|clicked|is viewing|is looking at)\b", re.I),
+    # What someone is in the middle of doing, or how they felt about one
+    # moment. Both were stored on 2026-09-30 by the conversation extractor
+    # ("The user is trying to change their location to download an app",
+    # "The user is unhappy with a situation where someone sat at the table")
+    # and then offered back as facts about them.
+    re.compile(r"\buser is (?:currently |now )?(?:trying|attempting|about|going|working|planning) to\b", re.I),
+    re.compile(r"\buser (?:is|was|feels|felt|seems|seemed) (?:a bit |very |quite )?"
+               r"(?:unhappy|upset|annoyed|angry|frustrated|irritated|tired|sad|bored|stressed|happy|excited)\b",
+               re.I),
 ]
 
 # keywords that raise importance
@@ -436,8 +445,12 @@ class LivingMemory:
             }
             self._records.append(rec)
             self._metrics["stored"] += 1
-            # mirror plain text into legacy FAISS semantic store (best-effort)
-            self._mirror(rec["text"])
+            # mirror plain text into legacy FAISS semantic store (best-effort).
+            # Only what is about a person: a two-thousand-character research
+            # report and "Task ... ended as COMPLETED" were mirrored there and
+            # came back in every chat as things known about the user.
+            if self.is_personal(rec):
+                self._mirror(rec["text"])
             self._save()
             return rec
 
@@ -451,6 +464,30 @@ class LivingMemory:
                 add_memory_fact(text, {})
         except Exception:
             pass
+
+    #: Record types that are NOVA's own work, not knowledge about a person.
+    #: Kept and searchable on purpose (recall_research, task history), but
+    #: never offered to the model as "what you know about the user".
+    NOT_PERSONAL_TYPES = ("research", "task")
+
+    @classmethod
+    def is_personal(cls, record: Dict[str, Any]) -> bool:
+        if (record or {}).get("type") in cls.NOT_PERSONAL_TYPES:
+            return False
+        return not str((record or {}).get("subject_id") or "").startswith("nova:")
+
+    TASK_SUBJECT = "nova:tasks"
+
+    def remember_task_outcome(self, text: str) -> Dict[str, Any]:
+        """How one of NOVA's tasks ended, kept so "what happened with X" has
+        an answer -- filed as NOVA's own history, not as a fact about the
+        user, which is where task_manager used to put it."""
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("nothing to record")
+        return self._upsert(text, type="task", source="system", confirmed=False,
+                            project="", importance=0.55, explicit=False,
+                            subject_id=self.TASK_SUBJECT, author_id="nova")
 
     @staticmethod
     def subject_of(record: Dict[str, Any]) -> str:
@@ -561,6 +598,19 @@ class LivingMemory:
         old["superseded_by"] = new_text[:120]
         old["updated"] = time.time()
         self._metrics["deleted"] = 0  # versioned, not deleted
+        self._unmirror([old.get("text", "")])
+
+    def _unmirror(self, texts: List[str]) -> None:
+        """Take facts that are no longer believed out of the legacy store too.
+        Superseding "Asogwara" with "Asagwara" left the old spelling there,
+        where it was still searched and offered to the model."""
+        if not self.mirror:
+            return
+        try:
+            from memory_extra import remove_memory_facts
+            remove_memory_facts([t for t in texts if t])
+        except Exception:
+            pass
 
     def forget(self, predicate: str) -> int:
         """Delete all live records matching a text/subject (explicit command)."""
@@ -575,6 +625,7 @@ class LivingMemory:
                 if low in r["text"].lower():
                     r["decay"] = {"active": True, "expires": time.time()}
                     r["confirmed"] = False
+                    self._unmirror([r["text"]])
                     n += 1
                     keep.append(r)
                 else:
@@ -689,6 +740,7 @@ class LivingMemory:
                       top_k: Optional[int] = None) -> str:
         results = self.search(query, top_k=top_k, project=project) if query else \
             [r for r in self._records if not r.get("superseded_by")][:self.top_k]
+        results = [r for r in results if self.is_personal(r)]
         if not results:
             return ""
         lines = []

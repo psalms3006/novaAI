@@ -1981,12 +1981,16 @@ def _execute_tool_core(tool_name: str, args: dict, meta: dict) -> str:
     if tool_name == "remember_fact":
         fact = args.get("fact", "").strip()
         try:
-            if fact:
-                add_memory_fact(fact, meta)
+            # The checks first, then the writes. The legacy store used to be
+            # written before living memory refused a passing observation, so
+            # "setup screen ... prompt is visible" was kept for ever while
+            # NOVA told the user it could not be saved.
             if fact and nova_state._living_memory:
                 nova_state._living_memory.remember(
                     fact, source="explicit", importance=0.7,
                 )
+            if fact:
+                add_memory_fact(fact, meta)
             return f"Remembered: {fact}" if fact else "No fact provided."
         except Exception as _re:
             # Never claim a durable write that did not happen — the user acts on

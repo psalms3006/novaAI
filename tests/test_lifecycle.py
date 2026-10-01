@@ -257,4 +257,6 @@ def test_a_permission_change_takes_effect_on_the_next_call(lc, monkeypatch, tmp_
     blocked = confirm._ui_safety_gate("file_controller", {"action": "delete", "path": "x"})
     assert blocked and "turned off" in blocked
     settings.set_many({"permissions": {"file_write": "allow"}})
-    assert confirm._ui_safety_gate("file_controller", {"action": "delete", "path": "x"}) is None
+    # A reversible write: deleting always asks, whatever the setting
+    # (test_irreversible_and_withdrawn).
+    assert confirm._ui_safety_gate("file_controller", {"action": "move", "path": "x"}) is None

@@ -115,7 +115,7 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 <!-- AUTO-START: recent_activity -->
 Commits in the last 14 days (115):
 
-- 6e7287d 2026-10-01 ï»¿Always confirm irreversible actions; never run a withdrawn call; open Settings pages directly
+- b101410 2026-10-01 Always confirm irreversible actions; never run a withdrawn call; open Settings pages directly
 - 8702b0c 2026-09-30 Stop a still-connecting voice session when the microphone is withdrawn; learning and UI audit docs
 - 81abe0e 2026-09-30 Fix empty chat replies; say when settings were not saved; finish the UI audit fixes
 - c29806e 2026-09-30 Acquire a missing capability from research, with the person's OK asked once

@@ -114,20 +114,114 @@ def _embed(text: str) -> np.ndarray:
     return nova_state._embedder.encode([text], normalize_embeddings=True).astype(np.float32)
 
 
+def remove_memory_facts(texts: List[str]) -> int:
+    """Remove these exact facts (no longer believed: superseded, forgotten)."""
+    gone = {t for t in texts if t}
+    with _memory_lock:
+        keep = [t for t in nova_state._memory_texts if t not in gone]
+        n = len(nova_state._memory_texts) - len(keep)
+        if n:
+            nova_state._memory_texts = keep
+            _rebuild_index()
+            _atomic_save_memory({})
+            log.info("Memory removed %d fact(s) no longer believed", n)
+        return n
+
+
+def _no_longer_believed() -> set:
+    """Texts living memory has superseded or forgotten and does not also
+    hold as a live record."""
+    lm = getattr(nova_state, "_living_memory", None)
+    if lm is None:
+        return set()
+    try:
+        records = list(getattr(lm, "_records", []) or [])
+    except Exception:
+        return set()
+    dead = {r.get("text") for r in records
+            if r.get("superseded_by") or (r.get("decay") or {}).get("active")}
+    live = {r.get("text") for r in records
+            if not r.get("superseded_by") and not (r.get("decay") or {}).get("active")}
+    return {t for t in dead - live if t}
+
+
+def _drop_unfit_facts(meta: dict) -> None:
+    """Remove stored facts that would be refused today (passing remarks,
+    NOVA's own reports) or that living memory no longer believes, once, with
+    the old file kept beside it. The checks in add_memory_fact stop new ones;
+    this cleans what got in before them."""
+    dead = _no_longer_believed()
+    keep = [t for t in nova_state._memory_texts
+            if isinstance(t, str) and not refusal_reason(t) and t not in dead]
+    if len(keep) == len(nova_state._memory_texts):
+        return
+    dropped = [t for t in nova_state._memory_texts if t not in keep]
+    try:
+        backup = MEMORY_TEXTS_FILE.with_name(f"memory_texts.before-cleanup.{int(time.time())}.json")
+        shutil.copy2(str(MEMORY_TEXTS_FILE), str(backup))
+    except Exception as e:
+        log.warning("Not cleaning memory: could not back it up first (%s)", e)
+        return
+    for t in dropped:
+        why = ("no longer believed" if t in dead else refusal_reason(t)) if isinstance(t, str) else "not text"
+        log.info("Memory removed (%s): %s", why, str(t)[:80])
+    nova_state._memory_texts = keep
+    _rebuild_index()
+    _atomic_save_memory(meta)
+
+
+def _collapse_preferences(embs: np.ndarray) -> np.ndarray:
+    """Keep only the newest of preferences that say nearly the same thing.
+
+    add_memory_fact does this for new ones; this does it for those stored
+    before it did. Returns the embeddings of what is kept."""
+    texts = nova_state._memory_texts
+    prefs = [i for i, t in enumerate(texts) if isinstance(t, str) and _PREFERENCE_RE.search(t)]
+    drop = {i for n, i in enumerate(prefs) for j in prefs[n + 1:]
+            if float(embs[i] @ embs[j]) >= PREFERENCE_REPLACE_SIMILARITY}
+    if not drop:
+        return embs
+    try:
+        backup = MEMORY_TEXTS_FILE.with_name(f"memory_texts.before-cleanup.{int(time.time())}.json")
+        if MEMORY_TEXTS_FILE.exists() and not backup.exists():
+            shutil.copy2(str(MEMORY_TEXTS_FILE), str(backup))
+    except Exception as e:
+        log.warning("Not merging repeated preferences: could not back up first (%s)", e)
+        return embs
+    for i in sorted(drop):
+        log.info("Memory preference replaced by a newer one: %s", texts[i][:80])
+    keep = [i for i in range(len(texts)) if i not in drop]
+    nova_state._memory_texts = [texts[i] for i in keep]
+    return embs[keep]
+
+
+#: The encoder the current index was built with (None: zero vectors).
+_index_encoder = None
+
+
 def _rebuild_index() -> None:
-    global _faiss_index
+    global _faiss_index, _index_encoder
     _faiss_index = _new_index()
+    _index_encoder = nova_state._embedder
     if nova_state._memory_texts and nova_state._embedder is not None:
         embs = nova_state._embedder.encode(nova_state._memory_texts, normalize_embeddings=True).astype(np.float32)
+        before = len(nova_state._memory_texts)
+        embs = _collapse_preferences(embs)
         _faiss_index.add(embs)
+        if len(nova_state._memory_texts) != before:
+            _atomic_save_memory({})
         log.info(
             "Rebuilt memory index — %d facts (%s)",
             len(nova_state._memory_texts), "faiss" if HAS_FAISS else "numpy",
         )
+    elif nova_state._memory_texts:
+        # Row i must stay fact i, or the next add_memory_fact puts its vector
+        # at row 0 and search answers with the wrong fact.
+        _faiss_index.add(np.zeros((len(nova_state._memory_texts), DIMENSION), dtype=np.float32))
 
 
 def load_memory() -> dict:
-    global _faiss_index
+    global _faiss_index, _index_encoder
     meta: Dict[str, str] = {"user_name": "", "user_gender": ""}
     if MEMORY_META_FILE.exists():
         try:
@@ -144,6 +238,7 @@ def load_memory() -> dict:
     except Exception:
         pass
 
+    previous = list(nova_state._memory_texts or [])
     nova_state._memory_texts = []
     if MEMORY_TEXTS_FILE.exists():
         try:
@@ -152,6 +247,15 @@ def load_memory() -> dict:
         except json.JSONDecodeError as e:
             log.error(f"Corrupted memory_texts.json: {e}")
             shutil.move(str(MEMORY_TEXTS_FILE), f"{MEMORY_TEXTS_FILE}.corrupted.{int(time.time())}")
+    _drop_unfit_facts(meta)
+
+    # The voice session calls this for every tool call and every turn. With
+    # nothing changed on disk and the index built by the current encoder,
+    # re-embedding every fact each time was pure cost.
+    if (nova_state._memory_texts == previous and _faiss_index is not None
+            and _faiss_index.ntotal == len(previous)
+            and _index_encoder is nova_state._embedder):
+        return meta
 
     _faiss_index = _new_index()
     if HAS_FAISS and nova_state._embedder and MEMORY_INDEX_FILE.exists() and nova_state._memory_texts:
@@ -159,6 +263,7 @@ def load_memory() -> dict:
             loaded_idx = faiss.read_index(str(MEMORY_INDEX_FILE))
             if loaded_idx.ntotal == len(nova_state._memory_texts):
                 _faiss_index = loaded_idx
+                _index_encoder = nova_state._embedder
                 log.info(f"Memory loaded — {len(nova_state._memory_texts)} facts.")
             else:
                 log.warning("Index/text mismatch. Rebuilding...")
@@ -176,6 +281,14 @@ def load_memory() -> dict:
 
 
 def _atomic_save_memory(meta: dict) -> None:
+    # Callers without the person's profile pass {} (living memory's mirror
+    # does), and writing that replaced memory_meta.json -- their name and
+    # gender -- with nothing.
+    if not meta and MEMORY_META_FILE.exists():
+        try:
+            meta = json.loads(MEMORY_META_FILE.read_text(encoding="utf-8")) or {}
+        except Exception:
+            meta = {}
     with _memory_lock:
         temp_files: List[str] = []
         try:
@@ -203,6 +316,35 @@ def _atomic_save_memory(meta: dict) -> None:
             raise
 
 
+#: NOVA's own output, not a fact about anyone: a research report heading, a
+#: task's ending. Both reached this store on 2026-09-30.
+_NOT_A_FACT_RE = re.compile(r"^\s*(?:#{1,6}\s|Task '.*' ended as\b)", re.S)
+
+#: Statements of what someone likes or wants. Two of these that mean nearly
+#: the same thing are one preference said twice, or a preference that changed;
+#: either way the newer one is the one to keep. Three paraphrases of "give me
+#: five pages with sources when I ask for something extensive" sat side by side
+#: in the real store, at 0.70-0.78 similarity; unrelated facts there peaked at 0.51.
+_PREFERENCE_RE = re.compile(
+    r"\b(?:prefer\w*|dislikes?|likes?|wants?|expects?|hates?|loves?)\b", re.I)
+PREFERENCE_REPLACE_SIMILARITY = 0.68
+
+
+def refusal_reason(text: str) -> str:
+    """Why *text* must not be stored as a durable fact, or ""."""
+    try:
+        from living_memory import LivingMemory
+        if LivingMemory.is_sensitive(text):
+            return "it looks like a secret"
+        if LivingMemory.is_transient(text):
+            return "it describes a moment, not something durable"
+    except Exception:
+        pass
+    if _NOT_A_FACT_RE.match(text):
+        return "it is NOVA's own output, not a fact about the user"
+    return ""
+
+
 def add_memory_fact(text: str, meta: dict) -> bool:
     """Store a fact. Returns True if it was written.
 
@@ -216,18 +358,39 @@ def add_memory_fact(text: str, meta: dict) -> bool:
     text = (text or "").strip()
     if not text:
         return False
+    why = refusal_reason(text)
+    if why:
+        log.info("Memory not stored (%s): %s", why, text[:80])
+        return False
     with _memory_lock:
         if text in nova_state._memory_texts:
             return False
         if _faiss_index is None:
             _faiss_index = _new_index()
         if nova_state._embedder is not None:
-            # Near-duplicate suppression, so paraphrases don't pile up.
+            vec = _embed(text)
+            replaced = []
             if _faiss_index.ntotal > 0:
-                scores, _ = _faiss_index.search(_embed(text), 1)
+                k = min(5, _faiss_index.ntotal)
+                scores, idx = _faiss_index.search(vec, k)
+                # Near-duplicate suppression, so paraphrases don't pile up.
                 if scores.size and scores[0][0] > 0.95:
                     return False
-            _faiss_index.add(_embed(text))
+                if _PREFERENCE_RE.search(text):
+                    replaced = [int(i) for s, i in zip(scores[0], idx[0])
+                                if s >= PREFERENCE_REPLACE_SIMILARITY
+                                and 0 <= i < len(nova_state._memory_texts)
+                                and _PREFERENCE_RE.search(nova_state._memory_texts[int(i)])]
+            if replaced:
+                for i in sorted(replaced, reverse=True):
+                    log.info("Memory preference replaced: %s", nova_state._memory_texts[i][:80])
+                    del nova_state._memory_texts[i]
+                nova_state._memory_texts.append(text)
+                _rebuild_index()
+                _atomic_save_memory(meta)
+                log.info(f"Memory stored: {text[:80]}")
+                return True
+            _faiss_index.add(vec)
         else:
             # Row i of the index must stay aligned with _memory_texts[i] —
             # search() maps result indices straight back into that list. A zero
@@ -296,7 +459,9 @@ def build_memory_context(meta: dict, query: str = "") -> str:
     try:
         _lm = nova_state._living_memory
         if _lm is not None:
-            for rec in _lm.search(query or "", top_k=4):
+            for rec in _lm.search(query or "", top_k=6):
+                if not _lm.is_personal(rec):
+                    continue
                 _txt = (rec or {}).get("text", "").strip()
                 if _txt and _txt not in lines:
                     tag = "confirmed" if rec.get("confirmed") else "recalled"
@@ -315,7 +480,7 @@ def get_all_memory_text(meta: dict) -> str:
     try:
         _lm = nova_state._living_memory
         if _lm is not None:
-            for rec in _lm.all()[-15:]:
+            for rec in [r for r in _lm.all() if _lm.is_personal(r)][-15:]:
                 _txt = (rec or {}).get("text", "").strip()
                 if _txt and _txt not in nova_state._memory_texts:
                     lines.append(f"- {_txt}")

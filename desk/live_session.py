@@ -3643,13 +3643,9 @@ class LiveManager:
         meta = _load_meta()
         if cancel is not None:
             meta = {**meta, "_cancel": cancel}
-        result = _nova._execute_tool_sync(name, args, meta)
-        if name == "remember_fact" and args.get("fact"):
-            try:
-                _nova.add_memory_fact(args["fact"], meta)
-            except Exception:
-                pass
-        return result
+        # remember_fact stores through NOVA Core like every other tool; a
+        # second write here skipped its checks (2026-09-30 log).
+        return _nova._execute_tool_sync(name, args, meta)
 
     async def _video_sender(self, session: Any) -> None:
         """Stream the screen to the model on the realtime video channel.
