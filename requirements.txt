@@ -109,6 +109,8 @@ mutagen>=1.47.0             # Audio metadata
 # ── Optional — Document generation ─────────────────────────────────────────────
 python-docx>=1.1.0          # Word document creation
 python-pptx>=0.6.23         # PowerPoint creation
+youtube-transcript-api>=1.2  # fetch_url: transcripts of YouTube videos
+pypdf>=4.0                   # research_report: count the pages of the PDF it wrote
 pymupdf>=1.23.0             # PDF reading (fitz)
 
 # ── Optional — Browser automation ─────────────────────────────────────────────

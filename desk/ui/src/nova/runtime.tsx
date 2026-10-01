@@ -424,6 +424,11 @@ export const NovaRuntimeProvider: React.FC<{ ambient?: boolean; children: React.
         case 'task_activity':
           setTaskBusy(Boolean(ev.busy));
           break;
+        case 'reminder':
+          // Due now (planner): also spoken or put in the transcript, and sent
+          // as a Windows notification by the backend.
+          log('task', String(ev.text || 'Reminder'));
+          break;
         case 'task.created':
           log('task', `Queued: ${String((ev.task as { title?: string })?.title || '')}`);
           pokeSystem.current();

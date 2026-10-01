@@ -607,6 +607,7 @@ class VoiceSupervisor:
 NON_BLOCKING_TOOLS = frozenset({
     "web_search", "learn_resource", "file_processor", "generate_document",
     "browser_control", "nova_capability", "nova_learning", "research_report",
+    "fetch_url", "email_search",
 })
 
 
@@ -2624,6 +2625,14 @@ class LiveManager:
                 sys_prompt += f"\n\n{learned}"
         except Exception as e:
             _log("[LIVE] learned knowledge unavailable: %s", e)
+        try:
+            # Where earlier sessions left off (desk/continuity.py).
+            from desk import continuity as _cont
+            left_off = _cont.last_time()
+            if left_off:
+                sys_prompt += f"\n\n{left_off}"
+        except Exception as e:
+            _log("[LIVE] continuity unavailable: %s", e)
         if mem_ctx:
             sys_prompt += f"\n\n[BACKGROUND MEMORY]\n{mem_ctx}"
         tool_decls = _live_tool_declarations(_resolve("TOOL_DECLARATIONS", []))

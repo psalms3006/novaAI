@@ -57,16 +57,19 @@ see `offline_extra._select_pyttsx3_voice`.
 | `file_processor` | Processes any file the user wants to work with |
 | `app_control` | Work *inside* an application that is already open: find its controls by name, click them, type in... |
 | `generate_document` | Create a real document file and save it |
+| `fetch_url` | Read one web page the user names, or a YouTube video's transcript, and get its text: 'summarise t... |
+| `recall_conversations` | Search the user's past conversations with you -- typed and spoken -- by topic and date, and quote... |
+| `email_search` | Search the user's Gmail (read-only) when they ask about their mail: 'find the emails from Ada abo... |
 | `research_report` | Research a topic on the web and write an EXTENSIVE report file: it plans the angles, searches the... |
 | `learn_resource` | Look at a folder on this computer that the user has pointed you at, and say whether it could beco... |
 | `self_editor` | Read NOVA's own source, and propose changes to it |
-| `planner` | Manage reminders and scheduled tasks |
+| `planner` | Reminders and recurring automations |
 | `autostart` | Control whether NOVA automatically starts when Windows boots |
 | `remember_fact` | Save ONE important personal fact about the user to long-term memory |
 | `nova_memory` | Query or manage NOVA's living memory (living_memory) |
 | `nova_task` | Work on something in the background while the conversation continues |
 
-19 tools declared in `nova.py`'s `TOOL_DECLARATIONS`, plus whatever MCP servers extend it with at runtime (`nova_state._mcp_bridge.gemini_declarations()`).
+22 tools declared in `nova.py`'s `TOOL_DECLARATIONS`, plus whatever MCP servers extend it with at runtime (`nova_state._mcp_bridge.gemini_declarations()`).
 <!-- AUTO-END: capabilities -->
 
 ## Sub-agents
@@ -114,8 +117,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (112):
+Commits in the last 14 days (110):
 
+- 6f9280d 2026-10-01 Ignore the dev-run knowledge store
 - dbfb924 2026-10-01 Learned knowledge keeps its exact values and is used; honest fallback when the quota runs out
 - 907048c 2026-10-01 Thinking-orbs presence: states in the window, a see-through ambient orb, no humanoid
 - 1927731 2026-10-01 Extensive research reports with sources and pictures; narrate computer work
@@ -155,8 +159,7 @@ Commits in the last 14 days (112):
 - 92c9d07 2026-09-25 Make the ambient orb react to the voice, move and click, and see in real time
 - 5a6c02c 2026-09-24 React to the user's voice, not to sound
 - 90b390c 2026-09-24 Stop room noise from cutting NOVA off mid-sentence
-- 5892f11 2026-09-24 Let NOVA talk while she works, and let the user talk over her
-- ...and 72 more
+- ...and 70 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

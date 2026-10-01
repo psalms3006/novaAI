@@ -119,6 +119,12 @@ class GmailConnector:
     # ── reading ─────────────────────────────────────────────────────────────
     def messages_since(self, since_epoch: float, limit: int = 40) -> list[Message]:
         """Metadata for mail received since a moment. Never bodies."""
+        return self.search(f"after:{int(since_epoch)}", limit=limit)
+
+    def search(self, query: str, limit: int = 20) -> list[Message]:
+        """Metadata for mail matching a Gmail query ("from:ada subject:invoice
+        newer_than:7d", "is:unread"). Read-only, never bodies -- the snippet
+        Gmail returns is the most of a message NOVA sees."""
         try:
             service = self._service_factory()
         except GmailUnavailable:
@@ -127,7 +133,6 @@ class GmailConnector:
             self._note_auth_failure(exc)
             raise GmailUnavailable(f"Could not reach Gmail: {exc}") from exc
 
-        query = f"after:{int(since_epoch)}"
         try:
             listing = service.users().messages().list(
                 userId="me", q=query, maxResults=int(limit)).execute()

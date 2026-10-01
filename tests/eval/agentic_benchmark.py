@@ -40,6 +40,11 @@ def _fresh_service(exec_fn, **kw):
     from nova_skills.registry import CapabilityRegistry
     from nova_skills.service import CapabilityService
     d = tempfile.mkdtemp(prefix="nova-bench-skills-")
+    # The person's one-time OK for a new capability (service._window_approver)
+    # needs a window to ask in; a benchmark has none, and asking there waited
+    # for an answer that never came. Consent has its own tests
+    # (test_capability_acquisition); here it is given.
+    kw.setdefault("approver", lambda cap, what: True)
     return CapabilityService(exec_fn, registry=CapabilityRegistry(Path(d) / "capabilities.json"), **kw)
 
 

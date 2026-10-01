@@ -274,6 +274,8 @@ TOOL_CAPABILITIES: dict[str, frozenset[Capability]] = {
     # FILE_WRITE, so untrusted content cannot make NOVA write files.
     "generate_document": _caps(C.FILE_WRITE),
     "research_report": _caps(C.NETWORK_READ, C.FILE_WRITE),
+    "recall_conversations": _caps(C.MEMORY_READ),
+    "email_search": _caps(C.NETWORK_READ),
     # Drives an application the user asked to be driven. Looking at a window
     # is a read; clicking and typing inside it is not, so it declares
     # PROCESS_CONTROL and the action-aware resolver lets inspection through

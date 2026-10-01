@@ -167,7 +167,12 @@ def irreversible(tool_name: str, args: dict | None) -> bool:
 
 
 # Tools whose memory of the person is NOVA's own business: not a permission.
-_UNGATED = {"remember_fact", "nova_memory", "nova_learning", "nova_capability"}
+_UNGATED = {"remember_fact", "nova_memory", "nova_learning", "nova_capability",
+            # The person's own conversations with NOVA.
+            "recall_conversations",
+            # Read-only mail: connecting Gmail (read-only scope) is the
+            # consent, and disconnecting it in Settings takes it back.
+            "email_search"}
 
 _FILE_READ_ACTIONS = {"list", "read", "find", "info", "search", "exists", "stat",
                       "summarize", "summarise", "extract", "open"}

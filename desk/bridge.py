@@ -230,6 +230,20 @@ def _system_prompt(query: str, meta: dict, cid: str | None = None) -> str:
         known = _learned.brief(per_domain=2)
         if known:
             parts.append("\n\n" + known)
+    except Exception as e:
+        log.debug("learned domains unavailable: %s", e)
+    # Where the last sessions left off -- only when this conversation is new.
+    try:
+        convo = desk_store.get_conversation(cid) if cid else None
+        if not convo or len(convo.get("messages") or []) <= 1:
+            from desk import continuity as _cont
+            lt = _cont.last_time(exclude_cid=cid or "")
+            if lt:
+                parts.append("\n\n" + lt)
+    except Exception as e:
+        log.debug("continuity unavailable: %s", e)
+    try:
+        from nova_learning import retrieve as _learned
         block = _learned.context_block(query or "", project_id=(proj or {}).get("id", ""))
         if block:
             parts.append("\n\n" + block)

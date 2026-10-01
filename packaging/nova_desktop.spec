@@ -206,6 +206,9 @@ hidden = [
     # search + offline knowledge — both resolved via importlib at call time,
     # so static analysis misses them
     "ddgs", "duckduckgo_search", "libzim",
+    # Imported inside functions: fetch_url's YouTube transcripts, and the
+    # research report's page count of the PDF it made.
+    "youtube_transcript_api", "pypdf",
     # misc runtime
     "psutil", "sqlite3",
 ]

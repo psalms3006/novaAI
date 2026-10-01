@@ -63,6 +63,8 @@ TAINTING_TOOLS = frozenset({
     "web_search", "fetch_url", "browser_read", "browser_control",
     "file_processor", "read_file", "file_read", "knowledge_search",
     "zim_search", "rag_search", "rag_add", "document_search",
+    # mail previews are written by whoever sent the mail
+    "email_search",
 })
 
 

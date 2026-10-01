@@ -56,6 +56,7 @@ _EXACT = {
     "close_app": "computer", "computer_settings": "computer", "file_controller": "computer",
     "autostart": "computer",
     "generate_document": "creative", "research_report": "research",
+    "fetch_url": "research", "email_search": "research", "recall_conversations": "memory",
     "file_processor": "code", "self_editor": "code",
     "vision": "vision",
     "remember_fact": "memory", "nova_memory": "memory",

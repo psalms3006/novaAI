@@ -34,6 +34,8 @@ const BUS_TYPES = new Set([
   // window switching. Neither is ever relayed through the live socket.
   'task_activity',
   'ambient',
+  // A reminder or automation that is due now (planner).
+  'reminder',
 ]);
 
 /** The orchestration's own events: task.*, agent.*, artifact.*, review.* --
