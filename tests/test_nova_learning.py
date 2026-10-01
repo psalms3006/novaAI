@@ -202,6 +202,40 @@ def test_updating_the_folder_reprocesses_only_what_changed(folder, svc, fake):
     assert {x["rel"] for x in ws["support"]} == {"brand-guidelines.md"}
 
 
+def test_a_request_naming_the_domain_gets_its_knowledge_in_depth(folder, svc, fake):
+    """'Audit these animations the way the improve-animations skill says' --
+    plural, and naming the source folder, not the domain."""
+    from nova_learning import retrieve
+    svc.learn(str(folder), domain="Design", background=False)
+    store = svc.store
+    n = len([i for i in store.knowledge(store.find_domain("Design")["id"])["items"] if i["status"] == "active"])
+    block = retrieve.context_block("review these designs for me", store=store)
+    assert block.count("\n- [Design]") == min(n, retrieve.NAMED_DOMAIN_LIMIT)
+    assert retrieve._terms("animations skills") == ["animation", "skill"]
+    brief = retrieve.brief(store=store)
+    assert "learned from the folder" in brief
+
+
+def test_a_better_extractor_relearns_unchanged_files(folder, svc, fake, monkeypatch):
+    """2026-10-01: the improve-animations skill was learned without its exact
+    values. Once extraction keeps them, learning the same folder again must
+    re-read it -- the files did not change, the extractor did."""
+    from nova_learning import extract
+    svc.learn(str(folder), domain="Design", background=False)
+    first = fake.extract_calls
+    did = svc.store.find_domain("Design")["id"]
+    files = svc.store.knowledge(did)["files"]
+    assert all(f.get("extractor") == extract.EXTRACTOR_VERSION for f in files.values()
+               if f["status"] == "processed")
+    monkeypatch.setattr(extract, "EXTRACTOR_VERSION", extract.EXTRACTOR_VERSION + 1)
+    s = svc.status(svc.learn(str(folder), domain="Design", background=False)["id"])
+    assert s["counts"]["changed"] == s["counts"]["discovered"] - s["counts"]["skipped"]
+    assert fake.extract_calls > first
+    again = fake.extract_calls
+    s = svc.status(svc.learn(str(folder), domain="Design", background=False)["id"])
+    assert s["counts"]["to_process"] == 0 and fake.extract_calls == again
+
+
 def test_model_outage_stops_resumably_and_never_claims_success(folder, svc, fake):
     fake.fail_after = 0
     s = svc.status(svc.learn(str(folder), domain="Design", background=False)["id"])

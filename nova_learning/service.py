@@ -199,7 +199,10 @@ class LearningService:
         prev = k.get("files", {})
         now = {f.rel: f for f in files if f.status != "skipped"}
         new = [r for r in now if r not in prev]
-        changed = [r for r in now if r in prev and prev[r].get("checksum") != now[r].checksum]
+        changed = [r for r in now if r in prev and (
+            prev[r].get("checksum") != now[r].checksum
+            or (prev[r].get("status") == "processed"
+                and prev[r].get("extractor", 1) < extract.EXTRACTOR_VERSION))]
         deleted = [r for r in prev if r not in now and prev[r].get("status") == "processed"]
         todo = [now[r] for r in sorted(new + changed) if now[r].checksum not in s["extracted"]]
         s["skipped"] = {f.rel: f.reason for f in files if f.status == "skipped"}
@@ -284,7 +287,9 @@ class LearningService:
                              "status": "failed", "reason": s["failed"][rel]}
             elif f.checksum in done or rel not in prev or prev[rel].get("checksum") == f.checksum:
                 prev[rel] = {"checksum": f.checksum, "mtime": f.mtime, "kind": f.kind,
-                             "status": "processed", "reason": ""}
+                             "status": "processed", "reason": "",
+                             "extractor": extract.EXTRACTOR_VERSION if f.checksum in done
+                             else prev.get(rel, {}).get("extractor", 1)}
         k = {"items": merged + retired, "contradictions": contradictions, "files": prev}
         active = [i for i in merged if i["status"] == "active"]
         self._phase(s, PHASES[7],

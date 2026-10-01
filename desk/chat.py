@@ -12,6 +12,7 @@ This is an ADDITIVE layer. No brain code is modified.
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 from typing import Any, Dict, List, Tuple
@@ -415,6 +416,7 @@ def run_turn(
     if not final_text:
         final_text = "NOVA couldn't complete that request. Please try again."
 
+    final_text = _unbacked_claim_note(final_text, tool_events)
     yield _ev("assistant", text=final_text)
     yield _ev("done", latency=round(time.time() - started, 2), tools=tool_events)
 
@@ -424,6 +426,29 @@ def run_turn(
     # Publish thinking agent done if it was started
     if not tool_calls and _publish_agent_done:
         _publish_agent_done("thinking-" + task_id, ok=True, summary="Response generated")
+
+
+#: A reply saying NOVA did something to the computer. 2026-10-01: with the
+#: cloud quota spent, the local fallback (tinyllama, which cannot call tools)
+#: answered "Yes, I did change the file" about a file nothing had touched.
+_ACTION_CLAIM = re.compile(
+    r"\bI(?:'ve| have| did| just| already)?\s+(?:already\s+|just\s+|now\s+|successfully\s+)?"
+    r"(?:changed|modified|edited|updated|created|saved|deleted|removed|moved|renamed|sent|emailed|"
+    r"opened|closed|installed|uninstalled|wrote|written|downloaded|scheduled|launched|executed)\b"
+    r"|\bI did (?:change|modify|edit|update|create|save|delete|remove|send|open|install)\b",
+    re.I)
+
+
+def _unbacked_claim_note(text: str, tool_events: list) -> str:
+    """Say so when a reply claims an action no tool performed. NOVA's own rule
+    is never to claim a change that did not happen; a model that cannot call
+    tools does not follow it, so the turn checks the claim against what ran."""
+    if any(t.get("ok") for t in tool_events or []):
+        return text
+    if _ACTION_CLAIM.search(text or ""):
+        return (text + "\n\n_(No tool ran for this reply, so nothing on your computer "
+                "was actually changed.)_")
+    return text
 
 
 def _first_round(messages, stop_event, streaming):

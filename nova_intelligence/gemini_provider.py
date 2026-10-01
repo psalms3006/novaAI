@@ -163,7 +163,10 @@ class GeminiProvider:
     # fall through to a stable pinned model before giving up.
     MAX_RETRIES = 3
     RETRY_DELAYS = (1.0, 2.0, 4.0)
-    FALLBACK_MODELS = ("gemini-2.5-flash",)
+    #: flash-lite has its own free-tier quota. Without it, a day's chat quota
+    #: spent on the two flash models went straight to the local fallback --
+    #: on this PC tinyllama, which cannot call tools (2026-10-01).
+    FALLBACK_MODELS = ("gemini-2.5-flash", "gemini-flash-lite-latest")
 
     @staticmethod
     def _is_retryable(err: str) -> bool:

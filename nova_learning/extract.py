@@ -22,7 +22,15 @@ from typing import Optional
 from . import model
 
 TEXT_PER_FILE = 12_000
-BATCH_CHARS = 60_000
+#: Smaller batches keep the model thorough: three skill files (23 KB) in one
+#: 60 KB batch came back as 17 abstract items with every exact value dropped
+#: (2026-10-01, skills-main/improve-animations).
+BATCH_CHARS = 16_000
+
+#: Bumped when extraction gets materially better. Files learned by an older
+#: extractor count as changed, so "learn it again" re-reads them instead of
+#: keeping the weaker knowledge because the files themselves did not change.
+EXTRACTOR_VERSION = 2
 BATCH_IMAGES = 6
 KINDS = ("principle", "preference", "rule", "pattern", "fact")
 CONF = {"high": 0.85, "medium": 0.65, "low": 0.45}
@@ -99,7 +107,10 @@ Extract reusable knowledge from it -- the ideas someone would need to work the w
 - "preference" / "rule": explicit wishes or musts ("always", "never", "I prefer", "avoid").
 - "pattern": something the examples or images consistently show (say what they show, e.g. "Examples consistently use a single accent color on a neutral background").
 - "fact": a specific definition or value worth keeping (a color code, a type scale, a name).
-Write each statement as one clear, general, actionable sentence. 5 to 30 items.
+Write each statement as one clear, actionable sentence.
+KEEP EVERY EXACT VALUE. When the material gives a specific value -- a number, duration, size, ratio, colour code, curve such as cubic-bezier(...), threshold, setting, name, command or code snippet -- the statement MUST contain that value copied verbatim, and say what it applies to (e.g. "Dropdowns and selects animate in 150-250ms", "Strong UI ease-out is cubic-bezier(0.23, 1, 0.32, 1)"). Never generalise a value away: "keep it short" in place of "under 300ms" loses the knowledge. A table of values becomes one item per row.
+SKIP SCRIPTED REPLIES: lines that tell some assistant exactly what to say ("respond only with ...", a fixed greeting, "do not provide any other information until asked") are packaging for another tool, not knowledge; do not turn them into items.
+COVER EVERYTHING: every section and heading of every source, including workflows, step lists, templates and checklists (one item per step or required part). Scale the number of items to the material -- roughly one per distinct rule, value or step, up to 80; do not stop early.
 Extract from EVERY source, including sources that disagree with the others or look less authoritative (tutorials, old notes). Do not resolve disagreements yourself and do not drop the losing side: keep each source's guidance as its own item, and report the conflict under "contradictions". NOVA weighs the sources later.
 Every item MUST list the source labels it comes from; never cite a source that does not support it; never add anything the sources do not support.
 For a text source give "quote": a short exact phrase copied from that source that supports the item. For an image-only item leave quote "".

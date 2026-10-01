@@ -224,6 +224,12 @@ def _system_prompt(query: str, meta: dict, cid: str | None = None) -> str:
     # part that bears on this request, with its sources. Separate from memory.
     try:
         from nova_learning import retrieve as _learned
+        # Which domains exist at all, every turn: without it typed chat did
+        # not know a folder had been learned and answered "the skill has not
+        # been learned" from nova_capability (2026-10-01). Voice had this.
+        known = _learned.brief(per_domain=2)
+        if known:
+            parts.append("\n\n" + known)
         block = _learned.context_block(query or "", project_id=(proj or {}).get("id", ""))
         if block:
             parts.append("\n\n" + block)
