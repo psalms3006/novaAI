@@ -207,3 +207,4 @@ desk/ui/node_modules/
 # Browser-automation screenshots and snapshots from local UI testing.
 .playwright-mcp/
 desk/ui/tsconfig.tsbuildinfo
+memory_texts.before-cleanup.*.json

@@ -331,6 +331,26 @@ def _noop_agent_progress(agent_id, action="", tool=""): pass
 def _noop_agent_done(agent_id, ok=True, summary=""): pass
 def _noop_orb(state): pass
 publish_event = _noop_event
+
+#: In-process listeners on the event bus (the native ambient orb). Called
+#: with every event the window's websocket gets; a failing listener is
+#: skipped for that event, never allowed to break publishing.
+_event_listeners: list = []
+
+
+def add_event_listener(fn) -> None:
+    if fn not in _event_listeners:
+        _event_listeners.append(fn)
+
+
+def _notify_listeners(event: dict) -> None:
+    for fn in list(_event_listeners):
+        try:
+            fn(event)
+        except Exception:
+            pass
+
+
 publish_voice_state = _noop_str
 publish_transcript = _noop_str
 publish_task_start = _noop_task
@@ -2885,6 +2905,7 @@ def run_desk_server(meta, port: int | None = None) -> None:
     _event_lock = threading.Lock()
 
     def publish_event(event: dict):
+        _notify_listeners(event)
         msg = json.dumps(event, ensure_ascii=False)
         with _event_lock:
             dead = []

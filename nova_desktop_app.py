@@ -356,11 +356,10 @@ def main() -> int:
     # by real Win32 window state. Nothing else calls show()/hide() on it, so
     # "main visible => ambient off" cannot drift out of sync.
     #
-    # Shape: pywebview's transparent=True throws inside InitCoreWebView2Async
-    # on this backend (verified in isolation), and a layered colour key both
-    # fails to make WebView2 transparent and blocks all mouse input. The
-    # window is clipped to a circle instead (_round_window), so it stays
-    # round, draggable and clickable.
+    # Shape: a WebView2 window cannot be see-through here (transparent=True
+    # painted an opaque square; a colour key never reached WebView2 and also
+    # swallowed mouse input), so the orb is drawn natively with per-pixel
+    # alpha -- desk/ambient_native.py.
     #
     # desk.win_overlay.AmbientOverlay is NOT used: it creates a layered Win32
     # window with no WM_PAINT handler and never draws anything.
@@ -383,25 +382,69 @@ def main() -> int:
     AMBIENT_PX = 44
     AMBIENT_W = AMBIENT_H = AMBIENT_PX
 
+    # The orb is thinking-orbs drawn natively into a layered window
+    # (desk/ambient_native.py): the desktop shows through between its dots.
+    # A WebView2 page cannot be transparent here -- measured, it painted an
+    # opaque square -- so the ambient orb is no longer a web page.
+    def _orb_dark() -> bool:
+        try:
+            from desk import settings as _ds
+            return (_ds.get("ui_prefs") or {}).get("theme_id", "obsidian") != "pearl"
+        except Exception:
+            return True
+
+    def _orb_clicked():
+        # A click is "bring her back", always. Asking the bridge alone did
+        # nothing when the person had minimised the window themselves: the
+        # bridge still thought the mode was "full", saw no change, and never
+        # ran its restore hook (the old web orb had the same dead click).
+        try:
+            loading_window.restore()
+            try:
+                import ctypes
+                hwnd = ctypes.windll.user32.FindWindowW(None, "NOVA")
+                if hwnd:
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+            _log("Ambient orb clicked: main window restored")
+        except Exception as e:
+            _log(f"ambient click restore failed: {e}")
+        # ...and keep the bridge's idea of the mode right.
+        try:
+            import json as _json
+            import urllib.request
+            from desk import bridge as _bridge
+            req = urllib.request.Request(
+                f"{DESK_URL}/api/ambient", data=_json.dumps({"mode": "full"}).encode(),
+                headers={"Content-Type": "application/json", "X-NOVA-Desk": _bridge.run_token},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=3) as r:
+                r.read()
+        except Exception as e:
+            _log(f"ambient click: bridge not told ({e})")
+
     ambient_window = None
     try:
-        ambient_window = webview.create_window(
-            "NOVA_AMBIENT",                      # distinct title so we can find the HWND
-            url=f"{DESK_URL}/?mode=ambient",
-            width=AMBIENT_W, height=AMBIENT_H,
-            # pywebview defaults min_size to (200,100), which silently floors
-            # the window and clipped the orb — the requested 72px was ignored
-            # and SetWindowPos could move it but never shrink it.
-            min_size=(1, 1),
-            frameless=True,
-            easy_drag=True,
-            on_top=True,
-            resizable=False,
-            hidden=True,
-            background_color="#000000",          # the colour-key
-        )
-        _log(f"Ambient window created ({AMBIENT_W}x{AMBIENT_H}, hidden)")
+        from desk.ambient_native import AmbientOrbWindow, OrbStateTracker, attach_live_events
+        _orb_tracker = OrbStateTracker()
+        attach_live_events(_orb_tracker)
+
+        def _hook_bus():
+            for _ in range(240):
+                try:
+                    import desk.bridge as _br
+                    _br.add_event_listener(_orb_tracker.on_bus)
+                    return
+                except Exception:
+                    time.sleep(0.5)
+        threading.Thread(target=_hook_bus, daemon=True).start()
+        ambient_window = AmbientOrbWindow(AMBIENT_PX, _orb_tracker, on_click=_orb_clicked, dark=_orb_dark)
+        if not ambient_window.hwnd:
+            raise RuntimeError("the window could not be created")
+        _log(f"Ambient orb created ({AMBIENT_PX}px, native, see-through, hidden)")
     except Exception as e:
+        ambient_window = None
         _log(f"Ambient window unavailable: {e}")
 
     _amb_pos_file = Path.home() / ".nova" / "ambient_pos.json"
@@ -457,25 +500,6 @@ def main() -> int:
         except Exception:
             return 64, 64
 
-    def _place_ambient(hwnd):
-        """Force the true window bounds and restore the user's chosen position."""
-        try:
-            import ctypes
-            u = ctypes.windll.user32
-            saved = _load_amb_pos()
-            if saved is None:
-                # Default: top-right, inset from the edge, on the primary display.
-                sw = u.GetSystemMetrics(0)
-                x, y = sw - AMBIENT_W - 48, 64
-            else:
-                x, y = saved
-            x, y = _clamp_to_desktop(x, y, AMBIENT_W, AMBIENT_H)
-            HWND_TOPMOST, SWP_NOACTIVATE = -1, 0x0010
-            u.SetWindowPos(hwnd, HWND_TOPMOST, x, y, AMBIENT_W, AMBIENT_H, SWP_NOACTIVATE)
-            _log(f"Ambient placed at ({x},{y}) {AMBIENT_W}x{AMBIENT_H}")
-        except Exception as e:
-            _log(f"Ambient placement failed: {e}")
-
     def _remember_ambient_pos(hwnd):
         try:
             import ctypes
@@ -489,40 +513,6 @@ def main() -> int:
                 _save_amb_pos(r.l, r.t)
         except Exception:
             pass
-
-    def _round_window(hwnd, px) -> bool:
-        """Clip the ambient window to a circle.
-
-        WebView2 renders through DirectComposition, which bypasses layered-
-        window colour keying — SetLayeredWindowAttributes(LWA_COLORKEY) reports
-        success but the black corners still paint (measured: corner (0,0,0)
-        against a (243,243,243) backdrop). pywebview's transparent=True also
-        throws on this backend.
-
-        SetWindowRgn works at the window-manager level, so the compositor
-        cannot ignore it: the corners stop being part of the window at all.
-        They are not drawn, and clicks there fall through to whatever is
-        underneath — which is also the click-through behaviour we want.
-        """
-        try:
-            import ctypes
-            u, g = ctypes.windll.user32, ctypes.windll.gdi32
-            rgn = g.CreateEllipticRgn(0, 0, px + 1, px + 1)
-            ok = u.SetWindowRgn(hwnd, rgn, True)
-            _log(f"Ambient clipped to circle ({px}px): {bool(ok)}")
-            return bool(ok)
-        except Exception as e:
-            _log(f"Ambient clip failed: {e}")
-            return False
-
-    # No colour key. The ambient window used to be made layered and keyed on
-    # pure black "so only the orb shows". Under WebView2 that never made
-    # anything transparent (DirectComposition paints past it; see
-    # _round_window) -- but it did make the window swallow input: with the
-    # key applied, a real mouse drag left the orb where it was and a click
-    # reached the page not at all (0 pointer events). Without it the same
-    # drag moved it 120 px and the click opened the full dashboard. The
-    # circular clip alone gives the round shape.
 
     def _find_hwnd(title: str):
         try:
@@ -620,27 +610,15 @@ def main() -> int:
                     if want:
                         _log("Ambient ON (main minimised=%s foreground=%s)" % (minimised, nova_fg))
                         _set_screen_watching(True)
-                        ambient_window.show()
-                        # Geometry and the circular clip must be re-asserted
-                        # AFTER show(): pywebview re-applies its own window size
-                        # on show, which overrode the small bounds.
-                        # Size/position go through pywebview's own API, not
-                        # SetWindowPos: the WinForms backend re-lays-out the
-                        # Form and silently overrode raw Win32 geometry (the
-                        # window kept snapping back to 120x33 and clipped the
-                        # orb).
+                        # The native orb is exactly its size and has no
+                        # corners to clip: place it, then show it.
                         try:
                             x, y = _ambient_target_xy()
-                            time.sleep(0.12)
-                            ambient_window.resize(AMBIENT_W, AMBIENT_H)
                             ambient_window.move(x, y)
-                            _log(f"Ambient sized {AMBIENT_W}x{AMBIENT_H} at ({x},{y})")
+                            _log(f"Ambient at ({x},{y}) {AMBIENT_PX}px")
                         except Exception as e:
-                            _log(f"Ambient sizing failed: {e}")
-                        if amb_hwnd:
-                            for _ in range(4):
-                                time.sleep(0.10)
-                                _round_window(amb_hwnd, AMBIENT_PX)
+                            _log(f"Ambient placement failed: {e}")
+                        ambient_window.show()
                     else:
                         _log("Ambient OFF (main window is visible)")
                         # Back in the full interface, NOVA stops watching the

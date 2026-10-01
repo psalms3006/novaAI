@@ -17,7 +17,7 @@ interface Command {
 
 /** Ctrl+K. Every command here does something real; typing anything else asks NOVA. */
 export const CommandPalette: React.FC = () => {
-  const { commandPaletteOpen, setCommandPaletteOpen, setCurrentScreen, setPresenceType, setThemeId, theme, addToast } = useNova();
+  const { commandPaletteOpen, setCommandPaletteOpen, setCurrentScreen, setThemeId, theme, addToast } = useNova();
   const { setActiveSection } = useNovaSettings();
   const rt = useRuntime();
   const [query, setQuery] = useState('');
@@ -64,8 +64,6 @@ export const CommandPalette: React.FC = () => {
       { id: 'set-knowledge', category: 'Settings', title: 'Knowledge NOVA has learned', icon: 'fa-book-open', run: settings('knowledge') },
       { id: 'set-diag', category: 'Settings', title: 'Diagnostics & event stream', icon: 'fa-heart-pulse', run: settings('diagnostics') },
       { id: 'set-appearance', category: 'Settings', title: 'Appearance', icon: 'fa-palette', run: settings('appearance') },
-      { id: 'presence-orb', category: 'Presence', title: 'Show the orb', icon: 'fa-atom', run: () => setPresenceType('orb') },
-      { id: 'presence-figure', category: 'Presence', title: 'Show her figure', icon: 'fa-user-astronaut', run: () => setPresenceType('humanoid') },
       ...Object.values(NOVA_THEMES).map((t) => ({
         id: `theme-${t.id}`,
         category: 'Theme',

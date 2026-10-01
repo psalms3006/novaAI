@@ -9,7 +9,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { getJSON, postJSON } from '../nova/api';
 import { NOVA_THEMES } from '../theme/themes';
-import type { NotificationToast, PresenceType, ScreenMode, ThemeDefinition, ThemeId } from '../types/nova';
+import type { NotificationToast, ScreenMode, ThemeDefinition, ThemeId } from '../types/nova';
 
 export type GlassQuality = 'quality' | 'balanced' | 'performance';
 
@@ -24,7 +24,6 @@ export interface UiPrefs {
   quality: GlassQuality;
   landing_view: ScreenMode;
   time_format: '12h' | '24h';
-  presence: PresenceType;
   show_transcript: boolean;
 }
 
@@ -46,7 +45,6 @@ const DEFAULT_PREFS: UiPrefs = {
   quality: defaultQuality(),
   landing_view: 'substrate',
   time_format: '12h',
-  presence: 'orb',
   show_transcript: true,
 };
 
@@ -84,8 +82,6 @@ function renderTheme(base: ThemeDefinition, prefs: UiPrefs): ThemeDefinition {
 interface NovaStateContextType {
   currentScreen: ScreenMode;
   setCurrentScreen: (screen: ScreenMode) => void;
-  presenceType: PresenceType;
-  setPresenceType: (presence: PresenceType) => void;
 
   theme: ThemeDefinition;
   themeId: ThemeId;
@@ -251,8 +247,6 @@ export const NovaStateProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const value: NovaStateContextType = {
     currentScreen,
     setCurrentScreen,
-    presenceType: prefs.presence,
-    setPresenceType: (v) => setPref('presence', v),
     theme,
     themeId: prefs.theme_id,
     setThemeId: (v) => setPref('theme_id', v),

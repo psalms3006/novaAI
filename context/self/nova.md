@@ -114,8 +114,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (116):
+Commits in the last 14 days (112):
 
+- 1927731 2026-10-01 Extensive research reports with sources and pictures; narrate computer work
 - a507b14 2026-10-01 Keep passing moments, NOVA's own reports and dead facts out of memory
 - b101410 2026-10-01 Always confirm irreversible actions; never run a withdrawn call; open Settings pages directly
 - 8702b0c 2026-09-30 Stop a still-connecting voice session when the microphone is withdrawn; learning and UI audit docs
@@ -155,8 +156,7 @@ Commits in the last 14 days (116):
 - 5892f11 2026-09-24 Let NOVA talk while she works, and let the user talk over her
 - 8d7ed20 2026-09-24 Make a stalled voice session actually reconnect, and keep tools off its path
 - 7a73928 2026-09-24 Keep the window attached to the voice session, and let Gmail sign-in finish
-- ae03887 2026-09-24 Show real task progress, and remember what research found
-- ...and 76 more
+- ...and 72 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNova } from '../context/NovaStateContext';
 import { useNovaSettings } from '../context/NovaSettingsContext';
 import { useRuntime, fmtAgo, type ActivityKind, type SystemTask } from '../nova/runtime';
-import { SpatialCanvas } from '../components/three/SpatialCanvas';
+import { NovaOrb } from '../components/NovaOrb';
 import { phaseColor } from '../components/TopHud';
 
 const AGENT_ICON: Record<string, string> = {
@@ -164,7 +164,7 @@ const TaskRow: React.FC<{ t: SystemTask; open: boolean; onToggle: () => void }> 
 };
 
 export const PresenceScreen: React.FC = () => {
-  const { presenceType, setPresenceType, theme, prefs, setCurrentScreen, quality } = useNova();
+  const { theme, prefs, setCurrentScreen, quality } = useNova();
   const { setActiveSection } = useNovaSettings();
   const rt = useRuntime();
   const [openAgent, setOpenAgent] = useState<string | null>(null);
@@ -322,21 +322,11 @@ export const PresenceScreen: React.FC = () => {
         <div className="relative w-72 h-72 md:w-[380px] md:h-[380px] flex items-center justify-center entity-float bg-transparent">
           <div className="absolute inset-4 rounded-full blur-3xl ambient-glow pointer-events-none transition-all duration-700" style={{ backgroundColor: `${theme.palette.accent}0a` }} />
           <div className="absolute inset-0 z-10 pointer-events-none">
-            <SpatialCanvas presenceType={presenceType} theme={theme} frame={rt.frame} quality={quality} still={!prefs.ambient_motion} />
+            <NovaOrb theme={theme} frame={rt.frame} fps={quality.fps} still={!prefs.ambient_motion} />
           </div>
-          <div className="absolute inset-8 rounded-full border pointer-events-none transition-colors duration-500 opacity-20" style={{ borderColor: theme.palette.orbWireframe }} />
         </div>
 
-        <div className="flex items-center space-x-2.5 -mt-2 pointer-events-auto z-20">
-          <button
-            onClick={() => setPresenceType(presenceType === 'orb' ? 'humanoid' : 'orb')}
-            className="w-6 h-6 rounded-full border flex items-center justify-center text-[10px] transition-all hover:scale-105 cursor-pointer"
-            style={{ backgroundColor: theme.palette.glassSurface, borderColor: theme.palette.glassBorder, color: theme.palette.textSecondary }}
-            title={presenceType === 'orb' ? 'Show her figure' : 'Show the orb'}
-            aria-label="Switch presence"
-          >
-            <i className="fa-solid fa-chevron-left" />
-          </button>
+        <div className="flex items-center -mt-2 pointer-events-auto z-20">
           <div
             className="flex items-center space-x-2 px-3.5 py-1.5 rounded-full border backdrop-blur-2xl text-[10px] font-sans shadow-md"
             style={{ ...panel, color: theme.palette.textPrimary }}
@@ -345,15 +335,6 @@ export const PresenceScreen: React.FC = () => {
             <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: color }} />
             <span className="tracking-wide">{rt.visualLabel}</span>
           </div>
-          <button
-            onClick={() => setPresenceType(presenceType === 'orb' ? 'humanoid' : 'orb')}
-            className="w-6 h-6 rounded-full border flex items-center justify-center text-[10px] transition-all hover:scale-105 cursor-pointer"
-            style={{ backgroundColor: theme.palette.glassSurface, borderColor: theme.palette.glassBorder, color: theme.palette.textSecondary }}
-            title={presenceType === 'orb' ? 'Show her figure' : 'Show the orb'}
-            aria-label="Switch presence"
-          >
-            <i className="fa-solid fa-chevron-right" />
-          </button>
         </div>
 
         {prefs.show_transcript && (

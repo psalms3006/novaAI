@@ -105,8 +105,10 @@ def test_reading_the_screen_is_shown_in_both_windows():
     runtime = _read("nova/runtime.tsx")
     assert "case 'VISION':\n        return 'looking';" in runtime
     assert "looking: 'Looking at the screen'" in runtime
-    canvas = _read("components/three/SpatialCanvas.tsx")
-    assert "p?.vision" in canvas, "the orb ignores the vision state"
+    orb = _read("components/NovaOrb.tsx")
+    assert "VISION: 'searching'" in orb, "the orb ignores the vision state"
+    native = (ROOT / "desk" / "ambient_native.py").read_text(encoding="utf-8")
+    assert '"vision_capture"' in native, "the ambient orb ignores the vision state"
     # The ambient window takes every bus event, including vision_capture.
     assert "opts.liveSocket ? isBusType : () => true" in _read("nova/events.ts")
 

@@ -1,6 +1,5 @@
 export type ScreenMode = 'substrate' | 'runtime' | 'synaptic' | 'library';
 
-export type PresenceType = 'orb' | 'humanoid';
 
 export type ThemeId = 'obsidian' | 'titanium' | 'warm-graphite' | 'deep-ocean' | 'pearl';
 

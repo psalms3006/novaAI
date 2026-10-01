@@ -160,7 +160,6 @@ _UI_PREFS = {
     "quality": ("quality", "balanced", "performance"),
     "landing_view": ("substrate", "synaptic", "runtime", "library"),
     "time_format": ("12h", "24h"),
-    "presence": ("orb", "humanoid"),
     "show_transcript": bool,
 }
 

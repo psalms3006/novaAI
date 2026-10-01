@@ -35,9 +35,11 @@ def test_there_is_one_live_manager_for_the_process():
 
 
 def test_the_ambient_window_is_the_same_page_not_another_app():
+    """One runtime: the native orb lives in NOVA's own process and hears the
+    same voice session and event bus the window does."""
     desktop = (ROOT / "nova_desktop_app.py").read_text(encoding="utf-8")
-    assert "?mode=ambient" in desktop, (
-        "the ambient orb is no longer a view of the same interface")
+    assert "attach_live_events(" in desktop, "the orb does not hear the voice session"
+    assert "add_event_listener(" in desktop, "the orb does not hear the event bus"
 
 
 def test_screen_awareness_uses_the_conversation_already_in_progress():

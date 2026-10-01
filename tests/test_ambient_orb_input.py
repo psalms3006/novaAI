@@ -39,10 +39,15 @@ def test_the_ambient_window_is_not_colour_keyed():
 
 
 def test_the_ambient_window_is_draggable_and_round():
+    """Now a native layered window (desk/ambient_native.py): it moves itself
+    on a drag, and only its circle takes the mouse -- the corners are alpha 0,
+    which Windows treats as not part of the window."""
     code = _code(SHELL)
-    amb = code[code.index('"NOVA_AMBIENT"'):]
-    amb = amb[:amb.index("hidden=True")]
-    assert "easy_drag=True" in amb
-    assert "CreateEllipticRgn" in code, "the orb is shaped by a circular clip"
+    assert "AmbientOrbWindow(" in code
+    from desk import ambient_native as an
+    src = (ROOT / "desk" / "ambient_native.py").read_text(encoding="utf-8")
+    assert "WM_MOUSEMOVE" in src and "DRAG_PX" in src and "self.move(" in src
+    img = an.render_orb("breathing", 1.0, 44)
+    assert img[0, 0, 3] == 0 and img[22, 22, 3] >= 1
 
 
