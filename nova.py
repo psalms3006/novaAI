@@ -727,11 +727,28 @@ Perform this process silently.
 
 Only speak conclusions, questions, confirmations, or results.
 
+## Working the computer
+
+The silence above is for your reasoning, not your work. When a task on the
+computer takes several steps, say in one short line what you are starting,
+give a few words of progress as you go ("Settings is open, finding Accounts"),
+and if a step fails, say so and what you will try instead -- never go quiet
+through a dozen clicks. To reach a Windows Settings page, use
+computer_settings open_settings with the page name (accounts, your info,
+other users, wifi, bluetooth, display, installed apps ...) instead of clicking
+through the Settings sidebar. To remove a program, use computer_settings
+uninstall_app; it asks the user first.
+
 ## Making things
 
 When the user asks for a document, report, letter, summary, spreadsheet or
 deck, make the file. Write the content yourself, then call generate_document
-to put it on disk, and tell them where it went. Do not hand them text to paste
+to put it on disk, and tell them where it went. When they want research --
+"extensive", "in depth", "detailed", a number of pages, sources, citations or
+pictures -- call research_report instead: it searches, reads the sources,
+finds pictures and writes at the length asked for, which you cannot do in one
+tool call. "Extensive" means at least five pages; summarise only when they say
+"summarise" or "brief". Do not hand them text to paste
 into Word and treat that as the task being done — they asked for a file.
 
 If they say where it should go, put it there; "my Documents folder", "the
@@ -1101,6 +1118,34 @@ TOOL_DECLARATIONS = [
                 "path": {"type": "STRING", "description": "Where to save: a folder ('documents', 'desktop', 'downloads') or a full file path. Defaults to the user's Documents folder."}
             },
             "required": ["content"]
+        }
+    },
+    {
+        "name": "research_report",
+        "description": (
+            "Research a topic on the web and write an EXTENSIVE report file: "
+            "it plans the angles, searches them, reads the source pages, "
+            "finds and downloads real pictures, writes every section from the "
+            "sources with [n] citations, checks the length, and saves a DOCX "
+            "or PDF with the pictures and a References list. Use it whenever "
+            "the user asks for extensive, detailed, in-depth or multi-page "
+            "research, a research document, or a report with sources, "
+            "citations or images -- not generate_document, which only "
+            "formats text you already wrote. Takes a few minutes; say you "
+            "have started, and report what it returns (words, pages, "
+            "pictures, sources) truthfully, including anything it says did "
+            "not work."),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "topic": {"type": "STRING", "description": "What to research, naming exactly which thing is meant -- many products share a name. Use what the conversation already established, e.g. 'Zoey OS (the multi-agent AI operating system) vs Trillion AI (the voice-first AI co-founder): makers, features, pricing, reception'"},
+                "pages": {"type": "NUMBER", "description": "Pages wanted (about 500 words each). Default 5; 'extensive' means at least 5."},
+                "format": {"type": "STRING", "description": "docx | pdf (default docx)"},
+                "focus": {"type": "STRING", "description": "Optional: what the user most wants answered"},
+                "images": {"type": "BOOLEAN", "description": "Include pictures (default true)"},
+                "path": {"type": "STRING", "description": "Optional folder or file path; default Documents"}
+            },
+            "required": ["topic"]
         }
     },
     {
@@ -2164,7 +2209,7 @@ def _validate_tool_modules() -> Dict[str, bool]:
     tool_modules = [
         "open_app", "close_app", "web_search", "file_controller",
         "computer_settings", "browser_control", "file_processor",
-        "generate_document", "app_control",
+        "generate_document", "app_control", "research_report",
     ]
     available: Dict[str, bool] = {}
     if importlib.util.find_spec("actions") is None:

@@ -57,6 +57,7 @@ see `offline_extra._select_pyttsx3_voice`.
 | `file_processor` | Processes any file the user wants to work with |
 | `app_control` | Work *inside* an application that is already open: find its controls by name, click them, type in... |
 | `generate_document` | Create a real document file and save it |
+| `research_report` | Research a topic on the web and write an EXTENSIVE report file: it plans the angles, searches the... |
 | `learn_resource` | Look at a folder on this computer that the user has pointed you at, and say whether it could beco... |
 | `self_editor` | Read NOVA's own source, and propose changes to it |
 | `planner` | Manage reminders and scheduled tasks |
@@ -65,7 +66,7 @@ see `offline_extra._select_pyttsx3_voice`.
 | `nova_memory` | Query or manage NOVA's living memory (living_memory) |
 | `nova_task` | Work on something in the background while the conversation continues |
 
-18 tools declared in `nova.py`'s `TOOL_DECLARATIONS`, plus whatever MCP servers extend it with at runtime (`nova_state._mcp_bridge.gemini_declarations()`).
+19 tools declared in `nova.py`'s `TOOL_DECLARATIONS`, plus whatever MCP servers extend it with at runtime (`nova_state._mcp_bridge.gemini_declarations()`).
 <!-- AUTO-END: capabilities -->
 
 ## Sub-agents
@@ -113,8 +114,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (115):
+Commits in the last 14 days (116):
 
+- a507b14 2026-10-01 Keep passing moments, NOVA's own reports and dead facts out of memory
 - b101410 2026-10-01 Always confirm irreversible actions; never run a withdrawn call; open Settings pages directly
 - 8702b0c 2026-09-30 Stop a still-connecting voice session when the microphone is withdrawn; learning and UI audit docs
 - 81abe0e 2026-09-30 Fix empty chat replies; say when settings were not saved; finish the UI audit fixes
@@ -154,8 +156,7 @@ Commits in the last 14 days (115):
 - 8d7ed20 2026-09-24 Make a stalled voice session actually reconnect, and keep tools off its path
 - 7a73928 2026-09-24 Keep the window attached to the voice session, and let Gmail sign-in finish
 - ae03887 2026-09-24 Show real task progress, and remember what research found
-- 25f0ce6 2026-09-23 Make the Concurrent Task Manager actually concurrent
-- ...and 75 more
+- ...and 76 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

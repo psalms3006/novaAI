@@ -69,8 +69,26 @@ def _write_markdown(path: Path, content: str, title: str) -> None:
     path.write_text(body, encoding="utf-8")
 
 
+#: A picture on its own line: ![caption](C:/path/figure.jpg or https://...).
+#: Asked for "images if you found images" on 2026-09-30, NOVA could only say it
+#: had none -- this writer turned every line into text.
+_IMAGE_LINE = re.compile(r"^!\[(?P<alt>[^\]]*)\]\((?P<ref>[^)]+)\)$")
+
+
+def _image_file(ref: str):
+    """A local picture file for *ref* (a path, or an http(s) URL fetched now)."""
+    ref = (ref or "").strip()
+    if re.match(r"^https?://", ref, re.I):
+        import tempfile
+        from actions.research_report import download_image
+        return download_image(ref, Path(tempfile.gettempdir()) / "nova_doc_images")
+    p = Path(ref)
+    return p if p.is_file() else None
+
+
 def _write_docx(path: Path, content: str, title: str) -> None:
     from docx import Document
+    from docx.shared import Inches, Pt
 
     doc = Document()
     if title:
@@ -78,6 +96,20 @@ def _write_docx(path: Path, content: str, title: str) -> None:
     for line in _split_lines(content):
         stripped = line.strip()
         if not stripped:
+            continue
+        pic = _IMAGE_LINE.match(stripped)
+        if pic:
+            f = _image_file(pic.group("ref"))
+            if f is not None:
+                try:
+                    doc.add_picture(str(f), width=Inches(6))
+                except Exception as e:
+                    log.warning("picture %s not added: %s", f, e)
+                    f = None
+            cap = doc.add_paragraph()
+            run = cap.add_run(pic.group("alt") if f is not None
+                              else f"[picture unavailable] {pic.group('alt')}")
+            run.italic, run.font.size = True, Pt(9)
             continue
         # Markdown headings and bullets carry structure worth keeping; a wall
         # of identical paragraphs is not a document.
@@ -117,10 +149,31 @@ def _write_pdf(path: Path, content: str, title: str) -> None:
             flow.append(Spacer(1, 6))
             bullets.clear()
 
+    caption = ParagraphStyle("caption", parent=body, fontSize=9, leading=12,
+                             textColor="#555555", spaceAfter=10)
     for line in _split_lines(content):
         stripped = line.strip()
         if not stripped:
             flush_bullets()
+            continue
+        pic = _IMAGE_LINE.match(stripped)
+        if pic:
+            flush_bullets()
+            f = _image_file(pic.group("ref"))
+            if f is not None:
+                try:
+                    from PIL import Image as _PIL
+                    from reportlab.lib.units import cm
+                    from reportlab.platypus import Image as RLImage
+                    with _PIL.open(f) as im:
+                        w, h = im.size
+                    width = min(16 * cm, w)
+                    flow.append(RLImage(str(f), width=width, height=width * h / w))
+                except Exception as e:
+                    log.warning("picture %s not added: %s", f, e)
+                    f = None
+            alt = pic.group("alt") if f is not None else f"[picture unavailable] {pic.group('alt')}"
+            flow.append(Paragraph("<i>" + _escape(alt) + "</i>", caption))
             continue
         if stripped.startswith("#"):
             flush_bullets()

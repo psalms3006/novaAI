@@ -80,10 +80,15 @@ def _default_generate(prompt: str, *, images: Optional[list] = None, want_json: 
                       allow_local: bool = True) -> tuple:
     try:
         return _gemini(prompt, images or [], want_json)
-    except ModelUnavailable:
+    except ModelUnavailable as cloud:
         if images or not allow_local:
             raise
-    return _ollama(prompt, want_json)
+        try:
+            return _ollama(prompt, want_json)
+        except ModelUnavailable as local:
+            # Both reasons: "the local model is not running" alone hid that
+            # Gemini had stopped answering (quota), which is the one to fix.
+            raise ModelUnavailable(f"{cloud}; and {local}") from None
 
 
 #: Replaceable: fn(prompt, *, images=None, want_json=True, allow_local=True) -> (text, model)

@@ -273,6 +273,7 @@ TOOL_CAPABILITIES: dict[str, frozenset[Capability]] = {
     # not a destructive act, so it does not stop to confirm; it still declares
     # FILE_WRITE, so untrusted content cannot make NOVA write files.
     "generate_document": _caps(C.FILE_WRITE),
+    "research_report": _caps(C.NETWORK_READ, C.FILE_WRITE),
     # Drives an application the user asked to be driven. Looking at a window
     # is a read; clicking and typing inside it is not, so it declares
     # PROCESS_CONTROL and the action-aware resolver lets inspection through

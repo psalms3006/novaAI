@@ -141,6 +141,7 @@ TOOL_CATEGORY = {
     # Tools that act without a scope used to run unasked whatever the person
     # chose (the settings screen even showed them as "ask").
     "generate_document": "file_write",
+    "research_report": "file_write",
     "app_control": "computer_control",
     "learn_resource": "exec",
 }
