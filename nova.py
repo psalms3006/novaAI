@@ -976,12 +976,12 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "computer_settings",
-        "description": "Controls the computer system. Actions: screenshot, volume_up, volume_down, volume_mute, brightness_up, brightness_down, lock, shutdown, cancel_shutdown, restart, type, hotkey, sleep.",
+        "description": "Controls the computer system. Actions: screenshot, volume_up, volume_down, volume_mute, brightness_up, brightness_down, lock, shutdown, cancel_shutdown, restart, type, hotkey, sleep, open_settings (value = the Settings page, e.g. 'accounts', 'your info', 'other users', 'wifi', 'vpn', 'bluetooth', 'display', 'installed apps' -- use this instead of clicking through the Settings app), list_apps (value = part of a program's name), uninstall_app (value = the program's name). Shutdown, restart, sleep, sign-out and uninstall always ask the user first.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action": {"type": "STRING", "description": "screenshot | volume_up | volume_down | volume_mute | brightness_up | brightness_down | lock | shutdown | restart | cancel_shutdown | type | hotkey | sleep"},
-                "value": {"type": "STRING", "description": "Optional: text to type, key combo (ctrl+c), or delay in seconds"}
+                "action": {"type": "STRING", "description": "screenshot | volume_up | volume_down | volume_mute | brightness_up | brightness_down | lock | shutdown | restart | cancel_shutdown | type | hotkey | sleep | open_settings | list_apps | uninstall_app"},
+                "value": {"type": "STRING", "description": "Optional: text to type, key combo (ctrl+c), delay in seconds, a Settings page name, or a program name"}
             },
             "required": ["action"]
         }
@@ -1066,7 +1066,7 @@ TOOL_DECLARATIONS = [
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action": {"type": "STRING", "description": "list_windows | wait_for | focus | inspect | click | type | press"},
+                "action": {"type": "STRING", "description": "list_windows | wait_for | focus | inspect | click | type | press | scroll (direction up/down, amount)"},
                 "window": {"type": "STRING", "description": "Part of the window title, e.g. 'Spotify'. Matched case-insensitively."},
                 "control": {"type": "STRING", "description": "Name of the control to click or type into, as shown by 'inspect'"},
                 "control_type": {"type": "STRING", "description": "Optional: Button, Edit, ListItem, TabItem, MenuItem..."},
@@ -1863,6 +1863,14 @@ def _execute_tool_sync(tool_name: str, args: dict, meta: dict) -> str:
 
 
 def _execute_tool_core(tool_name: str, args: dict, meta: dict) -> str:
+    try:
+        from nova_core import cancel as _cancel
+        if isinstance(meta, dict) and "_cancel" in meta:
+            _cancel.set_current(meta.get("_cancel"))
+        if _cancel.cancelled():
+            return _cancel.WITHDRAWN
+    except ImportError:
+        _cancel = None
     # ── One user of the desktop / browser at a time ──────────────────────────
     # The voice session and up to three background tasks all dispatch here.
     # Two of them moving the mouse or typing into the same window at once
@@ -1929,6 +1937,11 @@ def _execute_tool_core(tool_name: str, args: dict, meta: dict) -> str:
             return _gate   # user declined — return reason string to model
     except ImportError:
         pass
+
+    # The last moment before anything happens: a call the model withdrew
+    # while it waited for the gate (or a confirmation) does not run.
+    if _cancel is not None and _cancel.cancelled():
+        return _cancel.WITHDRAWN
 
     if tool_name == "learn_resource":
         return _execute_learn_resource(args)

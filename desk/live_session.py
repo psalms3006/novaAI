@@ -145,6 +145,9 @@ SURFACE_WAIT_S = 2.5
 #: it has to be long enough for a web search and short enough that a wedged
 #: tool does not take the session with it.
 TOOL_TIMEOUT_S = 30.0
+#: Camera capture and saved pictures go through NOVA Core, which opens the
+#: camera and writes a file; 12 s was not enough (timed out twice, 2026-09-30).
+VISION_CORE_TIMEOUT_S = 30.0
 
 #: ...except for looking at something, which is a conversational act.
 #:
@@ -3301,6 +3304,12 @@ class LiveManager:
         ids = [i for i in (ids or []) if i]
         if ids:
             self._cancelled_tool_ids.update(ids)
+            # Stop them, not only their answers: a withdrawn call that is still
+            # waiting (for a lock, a confirmation) must not go on to run.
+            events = getattr(self, "_cancel_events", {})
+            for i in ids:
+                if i in events:
+                    events[i].set()
             _log("[LIVE] tool call(s) withdrawn by the model: %s", ", ".join(ids))
 
     async def _handle_tool_calls(self, session: Any, tool_call: Any) -> None:
@@ -3529,13 +3538,25 @@ class LiveManager:
                 return await self._look(fc, args)
         t0 = time.time()
         budget = VISION_TIMEOUT_S if name == "vision" else TOOL_TIMEOUT_S
+        if name == "vision" and (args.get("save") or args.get("save_reference")
+                                 or str(args.get("angle") or "").lower() == "camera"):
+            # Opening the camera and saving a picture takes longer than a
+            # screenshot: this path timed out twice at 12 s in real use.
+            budget = VISION_CORE_TIMEOUT_S
+        if not hasattr(self, "_cancel_events"):
+            self._cancel_events = {}
+        cancel_ev = threading.Event()
+        if getattr(fc, "id", None):
+            self._cancel_events[fc.id] = cancel_ev
+            if fc.id in self._cancelled_tool_ids:
+                cancel_ev.set()
         # The agent that owns this tool is working until it answers -- the
         # Agents panel reads this, whichever path (voice, chat, task) ran it.
         work = agent_activity.begin(agent_activity.agent_for_tool(name),
                                     _tool_action(name, args), source="voice")
         try:
             result = await self._await_tool(
-                asyncio.ensure_future(asyncio.to_thread(self._execute_tool, name, args)),
+                asyncio.ensure_future(asyncio.to_thread(self._execute_tool, name, args, cancel_ev)),
                 budget)
         except asyncio.TimeoutError:
             # Say it failed, and say not to try again.
@@ -3616,10 +3637,12 @@ class LiveManager:
                 raise asyncio.TimeoutError()
 
     @staticmethod
-    def _execute_tool(name: str, args: dict) -> Any:
+    def _execute_tool(name: str, args: dict, cancel: "threading.Event | None" = None) -> Any:
         """NOVA Core owns what tools are and what they do; this only calls it."""
         import nova as _nova
         meta = _load_meta()
+        if cancel is not None:
+            meta = {**meta, "_cancel": cancel}
         result = _nova._execute_tool_sync(name, args, meta)
         if name == "remember_fact" and args.get("fact"):
             try:

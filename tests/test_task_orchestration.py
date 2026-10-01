@@ -296,7 +296,7 @@ def test_a_voice_tool_call_lights_its_agent(monkeypatch):
     from desk import live_session as ls
     seen = {}
 
-    def execute(name, args):
+    def execute(name, args, cancel=None):
         seen["during"] = _row("research")["state"]
         return "Results: ok"
 

@@ -54,9 +54,22 @@ class ConfirmationStore:
                 "event": evt,
             }
         timeout = timeout if timeout is not None else self.timeout
-        evt.wait(timeout=timeout)
+        try:
+            from nova_core import cancel as _cancel
+        except Exception:
+            _cancel = None
+        deadline = time.time() + timeout
+        withdrawn = False
+        while not evt.wait(timeout=0.25):
+            if _cancel is not None and _cancel.cancelled():
+                withdrawn = True            # the request was withdrawn: stop asking
+                break
+            if time.time() >= deadline:
+                break
         with self._lock:
             rec = self._pending.pop(req_id, None)
+        if withdrawn:
+            return False, "The request was withdrawn before you answered."
         if rec is None or rec["decision"] is None:
             return None, "No confirmation received in time; action cancelled."
         return rec["decision"], rec["note"]
@@ -131,6 +144,26 @@ TOOL_CATEGORY = {
     "app_control": "computer_control",
     "learn_resource": "exec",
 }
+
+#: Actions that cannot be taken back. They are asked about every time, even
+#: when their permission scope is set to Allow: "Allow computer control" means
+#: NOVA may open apps and change the volume unasked, not that she may switch
+#: the computer off. On 2026-09-30 a shutdown ran on Allow without a question.
+IRREVERSIBLE = {
+    "computer_settings": {"shutdown", "restart", "reboot", "sleep", "hibernate", "logoff",
+                          "log_off", "sign_out", "signout", "uninstall_app"},
+    "computer_control": {"shutdown", "restart", "reboot", "sleep", "hibernate", "logoff",
+                         "log_off", "sign_out", "signout"},
+    "desktop_control": {"shutdown", "restart", "sleep", "logoff"},
+    "file_controller": {"delete", "remove", "rmdir", "delete_folder", "empty_trash"},
+    "self_editor": {"apply"},
+}
+
+
+def irreversible(tool_name: str, args: dict | None) -> bool:
+    action = str((args or {}).get("action") or "").strip().lower()
+    return action in IRREVERSIBLE.get(tool_name, set())
+
 
 # Tools whose memory of the person is NOVA's own business: not a permission.
 _UNGATED = {"remember_fact", "nova_memory", "nova_learning", "nova_capability"}
@@ -217,7 +250,7 @@ def _ui_safety_gate(tool_name: str, args: dict, get_confirmation=None, speak_fn=
         what = _SCOPE_WORDS.get(scope, "that")
         return (f"I can't do that — {what} is turned off in your permission "
                 f"settings. Turn it on to let me help with this.")
-    if perm == "allow":
+    if perm == "allow" and not irreversible(tool_name, args):
         if _is_consequential:
             _log(f"PERM: auto-approved consequential {tool_name} (scope {scope} allowed)")
         return None

@@ -274,7 +274,7 @@ def test_the_shared_declarations_are_not_modified():
 
 def test_a_non_blocking_result_waits_for_her_to_finish_speaking():
     m = _bare_manager()
-    m._execute_tool = lambda name, args: "found it"
+    m._execute_tool = lambda name, args, cancel=None: "found it"
 
     async def run(name):
         return await m._run_tool(SimpleNamespace(name=name, id="c", args={}))

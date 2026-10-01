@@ -62,7 +62,7 @@ class ToolDispatchTests(unittest.TestCase):
         self.m = manager()
         self.calls = []
 
-        def fake_exec(name, args):
+        def fake_exec(name, args, cancel=None):
             self.calls.append((name, args))
             return f"{name} done"
 
@@ -98,7 +98,7 @@ class ToolDispatchTests(unittest.TestCase):
 
     def test_a_failing_tool_still_produces_a_response(self):
         """NOVA should say the tool failed, not go quiet."""
-        def boom(name, args):
+        def boom(name, args, cancel=None):
             raise RuntimeError("no network")
         self.m._execute_tool = boom
         s = FakeSession()
@@ -117,7 +117,7 @@ class ToolDispatchTests(unittest.TestCase):
         """
         done = threading.Event()
 
-        def sleepy(name, args):
+        def sleepy(name, args, cancel=None):
             done.wait(5)
             return "eventually"
 

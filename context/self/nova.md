@@ -113,8 +113,10 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (113):
+Commits in the last 14 days (115):
 
+- 6e7287d 2026-10-01 ï»¿Always confirm irreversible actions; never run a withdrawn call; open Settings pages directly
+- 8702b0c 2026-09-30 Stop a still-connecting voice session when the microphone is withdrawn; learning and UI audit docs
 - 81abe0e 2026-09-30 Fix empty chat replies; say when settings were not saved; finish the UI audit fixes
 - c29806e 2026-09-30 Acquire a missing capability from research, with the person's OK asked once
 - 913ce56 2026-09-30 Learning system, permission enforcement, and the UI interaction audit fixes
@@ -153,9 +155,7 @@ Commits in the last 14 days (113):
 - 7a73928 2026-09-24 Keep the window attached to the voice session, and let Gmail sign-in finish
 - ae03887 2026-09-24 Show real task progress, and remember what research found
 - 25f0ce6 2026-09-23 Make the Concurrent Task Manager actually concurrent
-- 1354510 2026-09-23 Make the nebula the whole app's background, and give core surfaces clay
-- 2545bf0 2026-09-23 Stop losing typed messages after one failed send, and clean up the tree
-- ...and 73 more
+- ...and 75 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

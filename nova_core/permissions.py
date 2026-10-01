@@ -343,7 +343,7 @@ _ACTION_AWARE_TOOLS: frozenset[str] = frozenset({
 READ_ONLY_ACTIONS: frozenset[str] = frozenset({
     "battery", "get_volume", "get_brightness", "get_settings", "status",
     "info", "list", "read", "find", "search", "inspect", "get", "screenshot",
-    "active_window", "list_windows", "system_info", "processes",
+    "active_window", "list_windows", "system_info", "processes", "list_apps",
 })
 
 #: Adjustments the user is plainly authorising by asking for them. "Turn the
@@ -355,7 +355,7 @@ LOW_RISK_ACTIONS: frozenset[str] = frozenset({
     # Driving an application the user just asked to be driven. Clicking a
     # button inside Spotify is not a system-level act, and confirming each
     # one would make a multi-step task unusable by voice.
-    "focus", "click", "type", "type_text", "press", "hotkey",
+    "focus", "click", "type", "type_text", "press", "hotkey", "scroll", "open_settings",
 })
 
 #: ...and the ones that genuinely warrant stopping to ask, whatever the user
@@ -378,6 +378,7 @@ ALWAYS_CONFIRM_ACTIONS: dict[str, Capability] = {
     "format": Capability.FILE_DELETE,
     "kill": Capability.PROCESS_CONTROL,
     "terminate": Capability.PROCESS_CONTROL,
+    "uninstall_app": Capability.SYSTEM_SETTINGS,
 }
 
 

@@ -270,8 +270,26 @@ def _controls(window, limit: int = 60) -> list[dict]:
     return out
 
 
+_TYPE_PREFIX = {"button": "Button", "listitem": "ListItem", "menuitem": "MenuItem", "text": "Text",
+                "hyperlink": "Hyperlink", "tabitem": "TabItem", "checkbox": "CheckBox",
+                "radiobutton": "RadioButton", "edit": "Edit", "combobox": "ComboBox",
+                "treeitem": "TreeItem", "group": "Group", "pane": "Pane"}
+
+
+def _split_typed(name: str, kind: str) -> tuple:
+    """'ListItem: Accounts' -> ('Accounts', 'ListItem'). The model copies names
+    from `inspect`, which prints them with their type; searching for the
+    whole string found nothing ("couldn't find 'ListItem: Accounts'")."""
+    import re as _re
+    m = _re.match(r"^\s*([A-Za-z]+)\s*:\s*(.+)$", name or "")
+    if m and m.group(1).lower() in _TYPE_PREFIX:
+        return m.group(2).strip(), kind or _TYPE_PREFIX[m.group(1).lower()]
+    return name, kind
+
+
 def _match(window, name: str, kind: str = ""):
     """Find one control by name, preferring an exact match over a substring."""
+    name, kind = _split_typed(name, kind)
     want = (name or "").strip().lower()
     if not want:
         return None
@@ -698,6 +716,36 @@ def _act_press(args: dict) -> str:
                                 f" in {_foreground_title()!r}.")
 
 
+def _act_scroll(args: dict) -> str:
+    """Scroll inside a window (the mouse wheel over its middle).
+
+    The model asked for this ("scroll to accounts") and got "Unknown action",
+    then fell back to pressing Page Down blind."""
+    title = args.get("window") or args.get("app") or ""
+    found = _find_handle(title) if title else None
+    if title and found is None:
+        return _not_found(title)
+    direction = str(args.get("direction") or "down").lower()
+    try:
+        amount = max(1, min(20, int(args.get("amount") or 5)))
+    except (TypeError, ValueError):
+        amount = 5
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    handle = found[0] if found else user32.GetForegroundWindow()
+    rect = wintypes.RECT()
+    user32.GetWindowRect(handle, ctypes.byref(rect))
+    x, y = (rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2
+    if found:
+        _raise(handle)
+        time.sleep(0.2)
+    from pywinauto import mouse
+    mouse.scroll(coords=(x, y), wheel_dist=(-amount if direction == "down" else amount))
+    where = found[1] if found else _foreground_title()
+    return f"Scrolled {direction} {amount} steps in {where!r}."
+
+
 def _act_wait_for(args: dict) -> str:
     title = args.get("window") or args.get("app") or ""
     timeout = float(args.get("timeout", LAUNCH_TIMEOUT_S))
@@ -717,6 +765,7 @@ _ACTIONS = {
     "press": _act_press,
     "hotkey": _act_press,
     "wait_for": _act_wait_for,
+    "scroll": _act_scroll,
 }
 
 
