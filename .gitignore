@@ -208,3 +208,4 @@ desk/ui/node_modules/
 .playwright-mcp/
 desk/ui/tsconfig.tsbuildinfo
 memory_texts.before-cleanup.*.json
+/knowledge/
