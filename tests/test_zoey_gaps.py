@@ -123,6 +123,20 @@ def test_email_says_how_to_connect_when_not_connected(monkeypatch):
     assert "Gmail isn't connected" in email_search.execute({"query": "from:ada"})
 
 
+def test_an_expired_gmail_token_says_where_to_reconnect(monkeypatch):
+    from integrations.gmail import GmailUnavailable
+
+    class Expired:
+        def health(self):
+            return {"can_read": True}
+
+        def search(self, q, limit=10):
+            raise GmailUnavailable("Could not list messages: ('invalid_grant: Token has been expired or revoked.')")
+    monkeypatch.setattr(email_search, "_connector", lambda: Expired())
+    out = email_search.execute({"query": "is:unread"})
+    assert "expired or was revoked" in out and "Settings > Connections" in out
+
+
 def test_email_search_lists_matching_mail(monkeypatch):
     from integrations.email_importance import Message
 

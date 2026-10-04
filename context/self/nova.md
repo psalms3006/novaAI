@@ -117,8 +117,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (111):
+Commits in the last 14 days (65):
 
+- 65f4717 2026-10-01 Zoey audit: item-by-item comparison and verdicts
 - df317f8 2026-10-01 From the Zoey self-audit: reminders that arrive, automations, recall, page reading, mail search, continuity
 - 6f9280d 2026-10-01 Ignore the dev-run knowledge store
 - dbfb924 2026-10-01 Learned knowledge keeps its exact values and is used; honest fallback when the quota runs out
@@ -158,8 +159,7 @@ Commits in the last 14 days (111):
 - ae5a4ef 2026-09-26 Port setup, account, library and ambient into the new UI; retire desk/static
 - 191901e 2026-09-26 Replace NOVA's desktop UI with the new design, wired to the real backend
 - 92c9d07 2026-09-25 Make the ambient orb react to the voice, move and click, and see in real time
-- 5a6c02c 2026-09-24 React to the user's voice, not to sound
-- ...and 71 more
+- ...and 25 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

@@ -15,6 +15,20 @@ from __future__ import annotations
 import time
 
 
+#: Where the person reconnects Gmail. On the first live run the model, given
+#: only "invalid_grant", told the user to reconnect "in the Skills panel".
+WHERE = "Settings > Connections (Gmail)"
+
+
+def _explain(message: str) -> str:
+    """Turn Google's error into what the person should do."""
+    low = message.lower()
+    if "invalid_grant" in low or "expired" in low or "revoked" in low or "reauth" in low:
+        return ("Your Gmail connection has expired or was revoked, so I can't read your mail "
+                f"right now. Reconnect it in {WHERE}, then ask again.")
+    return message
+
+
 def _connector():
     from integrations.gmail import GmailConnector
     return GmailConnector()
@@ -33,16 +47,17 @@ def execute(args: dict) -> str:
         return f"Mail isn't available on this computer ({type(e).__name__})."
     h = gm.health()
     if not h.get("can_read"):
-        return ("Gmail isn't connected, so I can't read your mail. You can connect it in "
-                "Settings -> Accounts (read-only access); after that I can search it.")
+        return ("Gmail isn't connected, so I can't read your mail. Connect it in "
+                f"{WHERE} (read-only access); after that I can search it.")
     from integrations.gmail import GmailUnavailable
     try:
         if mode == "important":
             days = int(args.get("days") or 1)
-            return gm.summarise_since(time.time() - days * 86400)
+            out = gm.summarise_since(time.time() - days * 86400)
+            return _explain(out) if out.startswith("I couldn't") else out
         msgs = gm.search(query, limit=limit)
     except GmailUnavailable as e:
-        return f"I couldn't search your mail: {e}"
+        return _explain(f"I couldn't search your mail: {e}")
     if not msgs:
         return f"No mail matches {query!r}."
     lines = [f"{len(msgs)} message(s) matching {query!r} (newest first; sender, subject, Gmail's preview):"]
