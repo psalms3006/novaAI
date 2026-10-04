@@ -1,0 +1,9 @@
+# HTTPS for NOVA Cloud. Caddy gets a Let's Encrypt certificate for the domain
+# in NOVA_DOMAIN (set in .env) as soon as DNS points at this server.
+{$NOVA_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy api:8080 {
+		# Streamed model answers must not be buffered.
+		flush_interval -1
+	}
+}

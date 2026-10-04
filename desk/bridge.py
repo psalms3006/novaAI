@@ -20,7 +20,11 @@ Endpoints (all under /api, guarded by a per-run random token):
 from __future__ import annotations
 
 import io
+import functools
 import json
+import logging
+import queue
+import re
 import os
 import secrets
 import tempfile
@@ -32,6 +36,7 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, request
 from flask_sock import Sock
 
+import agent_activity
 import nova as _nova
 import nova_state
 import nova_safety
@@ -41,17 +46,26 @@ from . import confirm as desk_confirm
 from . import projects as desk_projects
 from . import settings as desk_settings
 from . import store as desk_store
+from . import trace as desk_trace
 from . import voice as desk_voice
 from . import live_session as desk_live
+from . import account_api as desk_account
 
 log = _nova.log
-APP_VERSION = "1.0.0"
+from nova_version import APP_VERSION
 
 _META: dict = {}
 run_token: str = secrets.token_hex(16)
 _started_at = time.time()
 _stop_events: dict = {}
 _brain_ready: bool = False  # Set by nova_desktop_app after nova.main() completes
+
+# Live command-centre state, maintained by the event-bus publishers below so
+# /api/system reports what actually happened rather than a plausible guess.
+# Which agent is working is kept by agent_activity -- one registry that the
+# voice session, the chat path and the task manager all report to.
+_last_voice_state: str = 'idle'
+_last_turn_ms: float = 0.0
 
 _workspace: Path | None = None
 
@@ -110,14 +124,16 @@ def _ns(name, default=None):
 
 
 def workspace_dir() -> Path:
+    """The workspace folder, as the setting says *now*.
+
+    It used to be cached on first use, so changing it in Settings did nothing
+    until NOVA restarted while the window said it was saved."""
     global _workspace
-    if _workspace is None:
-        w = (desk_settings.get("workspace_dir") or "").strip()
-        if w:
-            _workspace = Path(w).expanduser()
-        else:
-            _workspace = desk_settings.app_data_dir() / "workspace"
-        _workspace.mkdir(parents=True, exist_ok=True)
+    w = (desk_settings.get("workspace_dir") or "").strip()
+    want = Path(w).expanduser() if w else desk_settings.app_data_dir() / "workspace"
+    if _workspace != want:
+        want.mkdir(parents=True, exist_ok=True)
+        _workspace = want
     return _workspace
 
 
@@ -138,6 +154,7 @@ def _meta_dict() -> dict:
     # The desktop's own identity source is authoritative: default is the neutral
     # "User" (never an inherited developer name); a name set in Settings persists.
     m["user_name"] = desk_settings.get("user_name") or "User"
+    m["user_name_pronunciation"] = desk_settings.get("user_name_pronunciation") or ""
     m.setdefault("user_gender", "")
     m.setdefault("channel", "desktop")
     return m
@@ -182,15 +199,56 @@ def _system_prompt(query: str, meta: dict, cid: str | None = None) -> str:
             f"{proj.get('instructions') or 'none'}"
         )
 
-    style = desk_settings.get("response_style", "balanced")
-    if style == "concise":
-        parts.append("\n\n## Response style\n"
-                     "Be concise: short, direct answers. Use lists sparingly. "
-                     "Skip pleasantries.")
-    elif style == "detailed":
-        parts.append("\n\n## Response style\n"
-                     "Be thorough: explain reasoning, include examples and "
-                     "supporting detail where useful.")
+    # Who NOVA is talking to -- the same block the voice session uses. Typed
+    # chat used to go without it, so NOVA knew the person's name and what
+    # they had told her about themselves only when spoken to.
+    try:
+        identity = desk_live._identity_block()
+        if identity:
+            parts.append("\n\n" + identity)
+    except Exception as e:
+        log.debug("identity block unavailable: %s", e)
+
+    # Layer B of nova_personality: what this person has asked of NOVA, with
+    # the Response style setting folded in (it used to be its own block).
+    try:
+        import nova_personality
+        adaptation = nova_personality.adaptation_block(
+            str(desk_settings.get("response_style", "balanced") or ""))
+        if adaptation:
+            parts.append("\n\n" + adaptation)
+    except Exception as e:
+        log.debug("adaptation block unavailable: %s", e)
+
+    # Knowledge the person deliberately taught NOVA (nova_learning), only the
+    # part that bears on this request, with its sources. Separate from memory.
+    try:
+        from nova_learning import retrieve as _learned
+        # Which domains exist at all, every turn: without it typed chat did
+        # not know a folder had been learned and answered "the skill has not
+        # been learned" from nova_capability (2026-10-01). Voice had this.
+        known = _learned.brief(per_domain=2)
+        if known:
+            parts.append("\n\n" + known)
+    except Exception as e:
+        log.debug("learned domains unavailable: %s", e)
+    # Where the last sessions left off -- only when this conversation is new.
+    try:
+        convo = desk_store.get_conversation(cid) if cid else None
+        if not convo or len(convo.get("messages") or []) <= 1:
+            from desk import continuity as _cont
+            lt = _cont.last_time(exclude_cid=cid or "")
+            if lt:
+                parts.append("\n\n" + lt)
+    except Exception as e:
+        log.debug("continuity unavailable: %s", e)
+    try:
+        from nova_learning import retrieve as _learned
+        block = _learned.context_block(query or "", project_id=(proj or {}).get("id", ""))
+        if block:
+            parts.append("\n\n" + block)
+    except Exception as e:
+        log.debug("learned knowledge unavailable: %s", e)
 
     custom = (desk_settings.get("user_system_prompt") or "").strip()
     if custom:
@@ -215,13 +273,19 @@ def _system_prompt(query: str, meta: dict, cid: str | None = None) -> str:
 
 def _persist_turn(cid: str, user_text: str, events: list, started: float):
     """Save the assistant message + tool meta; set an automatic title."""
-    assistant_parts = []
+    # The turn emits streamed "token" events AND a final "assistant" event that
+    # already carries the complete text. Concatenating both stored every reply
+    # twice ("ALPHA" -> "ALPHAALPHA"), which is what the conversation history
+    # then replayed back to the user. The assistant event is authoritative;
+    # tokens are only a fallback for a turn that never emitted one.
+    streamed_parts = []
+    final_text = None
     tools = []
     for ev in events:
         if ev.get("type") == "token":
-            assistant_parts.append(ev.get("text", ""))
+            streamed_parts.append(ev.get("text", ""))
         elif ev.get("type") == "assistant":
-            assistant_parts.append(ev.get("text", ""))
+            final_text = ev.get("text", "")
         elif ev.get("type") == "tool_start":
             tools.append({
                 "name": ev.get("name"), "label": ev.get("label"),
@@ -230,8 +294,20 @@ def _persist_turn(cid: str, user_text: str, events: list, started: float):
         elif ev.get("type") == "tool_done":
             if tools:
                 tools[-1].update({"ok": bool(ev.get("ok")), "summary": ev.get("summary", "")})
-    content = "".join(assistant_parts).strip()
+    content = (final_text if final_text is not None else "".join(streamed_parts)).strip()
     mid = desk_store.upsert_last_assistant(cid, content, {"tools": tools, "latency": round(time.time() - started, 2)})
+    # The session archive is what NOVA reads to know what you talked about
+    # last time; typed turns never reached it, so every desktop session was
+    # archived as "Empty session".
+    try:
+        _mem = getattr(_nova, "_nova_memory", None)
+        if _mem is not None:
+            if (user_text or "").strip():
+                _mem.log_turn("user", user_text.strip())
+            if content:
+                _mem.log_turn("assistant", content)
+    except Exception as e:
+        log.warning("[DESK] session archive not updated: %s", e)
     convo = desk_store.get_conversation(cid)
     if convo and convo["title"] in ("New chat", ""):
         title = (user_text or "New chat").strip().splitlines()[0][:48]
@@ -248,11 +324,14 @@ def _check_desk_token() -> bool:
 
 
 def require_token(fn):
+    # functools.wraps rather than copying __name__ by hand: it also sets
+    # __wrapped__, so inspect.getsource on an endpoint shows the endpoint
+    # instead of this wrapper, and tracebacks name the right function.
+    @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         if not _check_desk_token():
             return jsonify({"error": "unauthorized"}), 401
         return fn(*args, **kwargs)
-    wrapper.__name__ = fn.__name__
     return wrapper
 
 
@@ -272,6 +351,26 @@ def _noop_agent_progress(agent_id, action="", tool=""): pass
 def _noop_agent_done(agent_id, ok=True, summary=""): pass
 def _noop_orb(state): pass
 publish_event = _noop_event
+
+#: In-process listeners on the event bus (the native ambient orb). Called
+#: with every event the window's websocket gets; a failing listener is
+#: skipped for that event, never allowed to break publishing.
+_event_listeners: list = []
+
+
+def add_event_listener(fn) -> None:
+    if fn not in _event_listeners:
+        _event_listeners.append(fn)
+
+
+def _notify_listeners(event: dict) -> None:
+    for fn in list(_event_listeners):
+        try:
+            fn(event)
+        except Exception:
+            pass
+
+
 publish_voice_state = _noop_str
 publish_transcript = _noop_str
 publish_task_start = _noop_task
@@ -282,12 +381,32 @@ publish_agent_done = _noop_agent_done
 publish_orb_state = _noop_orb
 
 
+UI_INDEX = STATIC_DIR / "ui" / "index.html"
+
+
 @app.get("/")
 def index():
-    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    """The desktop interface: desk/ui's build, with this run's token in it.
+
+    Serves the same page for the main window and the ambient strip
+    (`/?mode=ambient`); the page picks its layout from the query string.
+    """
+    if not UI_INDEX.is_file():
+        # A source checkout that was never built, or a bundle missing its
+        # interface: say exactly that instead of a traceback or a blank window.
+        return Response(
+            "<!doctype html><title>NOVA</title><body style='font:14px sans-serif;"
+            "background:#0a0b10;color:#cbd5e1;padding:40px'><h2>NOVA's interface is not built</h2>"
+            "<p>Run <code>npm install</code> and <code>npm run build</code> in <code>desk/ui</code>, "
+            "then restart NOVA.</p></body>", status=503, mimetype="text/html")
+    html = UI_INDEX.read_text(encoding="utf-8")
     html = html.replace("__DESK_TOKEN__", run_token)
     html = html.replace("__DESK_VERSION__", APP_VERSION)
-    return Response(html, mimetype="text/html")
+    resp = Response(html, mimetype="text/html")
+    # The page carries a per-run token: never let the webview reuse a copy
+    # from an earlier run.
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 # ── status / meta ─────────────────────────────────────────────────────────────
@@ -337,6 +456,22 @@ def api_status():
         if runtime:
             local_intel["runtime_state"] = runtime.state.name
             local_intel["ollama_running"] = runtime.is_running
+        # Ask the registered provider what is actually installed. Reading only
+        # the runtime state reported "available: false / installed: []" while a
+        # model was present and being routed to, which made the offline story
+        # look broken in the UI when it was not.
+        _r = getattr(nova, "_nova_router", None)
+        if _r is not None:
+            for _pname, _prov in getattr(_r, "_providers", {}).items():
+                if "ollama" not in _pname.lower():
+                    continue
+                local_intel["model"] = getattr(_prov, "model", "") or ""
+                local_intel["available"] = bool(_prov.is_available())
+                try:
+                    local_intel["installed"] = [m.get("name", "") for m in _prov.list_models()]
+                except Exception:
+                    pass
+                break
     except Exception:
         pass
 
@@ -387,7 +522,16 @@ def api_status():
         "online": online,
         "connectivity": connectivity,
         "degraded": bool(_resolve("_rest_backoff_until") or False),
-        "model": _VISION_MODEL,
+        # Name the model that will actually answer, not the one we would
+        # prefer. Without a key NOVA falls back to the local model, and
+        # reporting the cloud model anyway turned "why is this taking
+        # eighteen seconds?" into an unanswerable question: the window said
+        # ONLINE and named a Gemini model while a 1.5B model on the user's
+        # own CPU was doing the work.
+        "model": (_VISION_MODEL if _GEMINI_KEY
+                  else (local_intel.get("model") or "local")),
+        "preferred_model": _VISION_MODEL,
+        "serving": "cloud" if _GEMINI_KEY else "local",
         "has_key": bool(_GEMINI_KEY),
         "gemini": bool(_HAS_GEMINI),
         "tools": tools,
@@ -399,11 +543,26 @@ def api_status():
         "local_intelligence": local_intel,
         "brain_ready": _brain_ready,
         "router_state": router_state,
+        "tls": _tls_status(),
         "user": _meta_dict().get("user_name", "User"),
         "auth": auth,
         "uptime": round(time.time() - _started_at, 1),
         "version": APP_VERSION,
     })
+
+
+def _tls_status() -> dict:
+    """Outbound TLS trust posture.
+
+    Surfaced in /api/status because a broken trust store is invisible to every
+    other health signal: DNS resolves, TCP connects, connectivity reads
+    "online" — and every model call still fails.
+    """
+    try:
+        import nova_tls
+        return nova_tls.status()
+    except Exception as e:
+        return {"applied": False, "method": "unknown", "error": str(e)}
 
 
 def _auth_status() -> dict:
@@ -412,9 +571,16 @@ def _auth_status() -> dict:
         from desk import creds as desk_creds
         return desk_creds.resolve()
     except Exception as e:
-        return {"mode": "unknown", "onboarded": False, "has_credential": False,
-                "cloud_configured": False, "byok_present": False,
-                "byok_masked": "", "cloud_error": str(e)[:120]}
+        # Deliberately no "onboarded" or "has_credential" key.
+        #
+        # This used to report both as False, which is an assertion that the
+        # user has never set NOVA up -- and the interface believed it and
+        # reopened the first-run screen. A failure to read the credential
+        # posture is not evidence about the user; it is the absence of
+        # evidence, and saying so lets the interface leave things alone.
+        return {"mode": "unknown", "cloud_configured": False,
+                "byok_present": False, "byok_masked": "",
+                "cloud_error": str(e)[:120]}
 
 
 @app.get("/api/capabilities")
@@ -465,7 +631,24 @@ def api_capabilities():
 
 @app.get("/api/health")
 def api_health():
-    return jsonify({"ok": True})
+    try:
+        import nova
+        ready = getattr(nova, "_nova_router", None) is not None
+    except Exception:
+        ready = False
+    # Waiting for sign-in is a ready state for the window: it has something to
+    # show (the sign-in screen), and the brain will not start until then.
+    auth_required = (os.environ.get("NOVA_AUTH_GATE") == "1"
+                     and not (ready or _brain_ready))
+    try:
+        import nova_runtime
+        brain = nova_runtime.brain_state()
+    except Exception:
+        brain = {}
+    return jsonify({"ok": True, "ready": ready, "brain_ready": _brain_ready,
+                    "auth_required": auth_required,
+                    "brain_starting": bool(brain.get("started")) and not brain.get("ready"),
+                    "brain_error": brain.get("error", "")})
 
 
 # ── tools ─────────────────────────────────────────────────────────────────────
@@ -550,11 +733,68 @@ def api_delete_conversation(cid):
 
 # ── chat ──────────────────────────────────────────────────────────────────────
 
+def _persona_filter(events):
+    """Strip filler openers ("Great question!", "Absolutely!") from replies.
+
+    The start of each stretch of streamed text is held back briefly -- until
+    a sentence ends or enough has arrived to judge -- cleaned once, and then
+    everything after it streams untouched. The final assistant text is
+    cleaned the same way, so what is stored matches what was shown.
+    """
+    import nova_personality
+    buf, holding = [], True
+
+    def flush():
+        text = "".join(buf)
+        buf.clear()
+        return {"type": "token", "text": nova_personality.clean_reply(text)} if text else None
+
+    for ev in events:
+        typ = ev.get("type")
+        if typ == "token" and holding:
+            buf.append(ev.get("text") or "")
+            joined = "".join(buf)
+            if len(joined) >= 60 or (len(joined) > 12 and any(c in joined for c in ".!?\n")):
+                holding = False
+                out = flush()
+                if out:
+                    yield out
+            continue
+        if typ != "token":
+            out = flush() if buf else None
+            if out:
+                yield out
+            holding = True          # the next stretch of text starts a new reply
+            if typ == "assistant" and ev.get("text"):
+                ev = dict(ev, text=nova_personality.clean_reply(ev["text"]))
+        yield ev
+    out = flush() if buf else None
+    if out:
+        yield out
+
+
 def _run_chat(cid, message, image_path, streaming):
+    try:
+        import nova_personality
+        changed = nova_personality.learn_from_message(message or "")
+        if changed:
+            log.info("[CHAT] adapted to the user: %s", ", ".join(changed))
+    except Exception:
+        pass
+    return _persona_filter(_run_chat_raw(cid, message, image_path, streaming))
+
+
+def _run_chat_raw(cid, message, image_path, streaming):
     meta = _meta_dict()
     msgs = [{"role": "system", "content": _system_prompt(message, meta, cid)}]
     msgs += _history_messages(cid, int(desk_settings.get("history_turns", 10)))
-    msgs.append({"role": "user", "content": message})
+    # api_chat() already stored this user message before calling us, so
+    # _history_messages() above has just returned it. Appending it again
+    # sent every prompt to the model TWICE — which inflated context on
+    # every turn and made the model echo itself ("ALPHA" -> "ALPHAALPHA").
+    if not (msgs and msgs[-1].get("role") == "user"
+            and (msgs[-1].get("content") or "").strip() == (message or "").strip()):
+        msgs.append({"role": "user", "content": message})
     ev = stop_event(cid)
     ev.clear()
     return desk_chat.run_turn(msgs, meta, image_path=image_path or "",
@@ -583,13 +823,28 @@ def api_chat():
     events_accum: list = []
     started = time.time()
 
+    rid = desk_trace.start(f"chat cid={cid[:8]} streaming={streaming_on} chars={len(message)}")
+    desk_trace.mark("http_receive")
+
     # Publish orb state: thinking when chat starts
     publish_event({"type": "orb_state", "state": "thinking", "ts": time.time()})
 
     def event_gen():
+        first_emit = True
         try:
+            # Hand the request id to the browser so a UI trace can be
+            # correlated with server-side stage timings for the same turn.
+            yield 'data: ' + json.dumps({'type': 'meta', 'rid': rid}) + '\n\n'
+
             for ev in _run_chat(cid, message, image_path, streaming_on):
                 events_accum.append(ev)
+                if first_emit:
+                    desk_trace.mark("first_event_emitted", type=ev.get("type"))
+                    first_emit = False
+                # Step aside for desktop work so the user can watch it happen,
+                # and only for tools where seeing the screen is the point.
+                if ev.get("type") == "tool_start" and ev.get("name") in _DESKTOP_TOOLS:
+                    set_ambient_mode("ambient")
                 yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
                 # Update orb state based on events
                 if ev.get("type") == "tool_start":
@@ -606,8 +861,15 @@ def api_chat():
         finally:
             # Return orb to idle
             publish_event({"type": "orb_state", "state": "idle", "ts": time.time()})
+            desk_trace.mark("stream_end", events=len(events_accum))
+            if _ambient_mode == "ambient":
+                set_ambient_mode("full")
             if message or image_path:
                 _persist_turn(cid, message, events_accum, started)
+            global _last_turn_ms
+            _last_turn_ms = round((time.time() - started) * 1000, 1)
+            desk_trace.mark("persisted")
+            log.info("[TRACE %s] SUMMARY %s", rid, desk_trace.summary())
 
     resp = Response(event_gen(), mimetype="text/event-stream")
     resp.headers["Cache-Control"] = "no-cache"
@@ -824,6 +1086,23 @@ def api_vision():
 @app.post("/api/voice/start")
 @require_token
 def api_voice_start():
+    # Push-to-talk is the fallback for when the live session cannot run. It is
+    # not a second way to listen *while* it is running: that would be two
+    # capture streams on one device, which on Windows generally succeeds and
+    # then splits the input between them, so NOVA mishears intermittently with
+    # nothing anywhere reporting a fault.
+    if desk_live.get_live_manager().owns_microphone:
+        return jsonify({
+            "ok": False,
+            "message": ("NOVA is already listening through the live voice "
+                        "session, so push-to-talk is not needed. Stop the "
+                        "voice session first if you want to record."),
+            "reason": "live_session_owns_microphone",
+            **desk_voice.status(),
+        })
+    if _permission("microphone") == "deny":
+        return jsonify({"ok": False, "error": "microphone_denied",
+                        "message": _MIC_DENIED}), 403
     ok, msg = desk_voice.start_capture()
     return jsonify({"ok": ok, "message": msg, **desk_voice.status()})
 
@@ -858,9 +1137,32 @@ def api_voice_status():
 
 # ── live (Gemini Live native audio) ───────────────────────────────────────────
 
+_MIC_DENIED = ("The microphone is turned off in NOVA's permissions. "
+               "Turn it on in Settings > Permissions to talk to NOVA.")
+
+
+def _permission(scope: str) -> str:
+    """allow | ask | deny for one permission scope, read fresh every time."""
+    try:
+        return str((desk_settings.get("permissions", {}) or {}).get(scope) or "ask")
+    except Exception:
+        return "ask"
+
+
 @app.post("/api/live/start")
 @require_token
 def api_live_start():
+    # The microphone permission governs voice itself, not only the wake word.
+    #   deny -> never;  ask -> only when the person presses the mic (an
+    #   automatic start on opening the window is not them asking);  allow -> yes.
+    source = str((request.get_json(silent=True) or {}).get("source") or "user")
+    mic = _permission("microphone")
+    if mic == "deny":
+        return jsonify({"ok": False, "error": "microphone_denied", "message": _MIC_DENIED}), 403
+    if mic == "ask" and source == "auto":
+        return jsonify({"ok": False, "error": "microphone_ask",
+                        "message": "Microphone is set to Ask me, so voice waits for you: "
+                                   "press the mic to start."})
     mgr = desk_live.get_live_manager()
     r = mgr.start()
     return jsonify(r)
@@ -874,11 +1176,165 @@ def api_live_stop():
     return jsonify(r)
 
 
+@app.post("/api/live/mute")
+@require_token
+def api_live_mute():
+    """Mute/unmute the microphone.
+
+    A secondary control, not the way NOVA is operated: the mic is hot from the
+    moment initialisation finishes and stays that way. Default is unmuted and
+    mute is not persisted across restarts.
+    """
+    data = request.get_json(silent=True) or {}
+    mgr = desk_live.get_live_manager()
+    if "muted" in data:
+        return jsonify(mgr.set_muted(bool(data.get("muted"))))
+    return jsonify(mgr.set_muted(not mgr.muted))
+
+
+@app.post("/api/live/interrupt")
+@require_token
+def api_live_interrupt():
+    """Stop NOVA talking, because the user said so.
+
+    Being unable to cut an assistant off mid-sentence is the difference
+    between a conversation and a recital, and the microphone cannot do it
+    here: the shipped voice policy is half-duplex, so NOVA is deaf for
+    exactly as long as she is the one speaking. That leaves the surfaces to
+    provide the interruption, and this is the one path they all use — the
+    same one the automatic detector uses, so a deliberate interruption and a
+    detected one leave NOVA in identical states.
+
+    Harmless when she is already silent; the caller does not have to know.
+    """
+    mgr = desk_live.get_live_manager()
+    data = request.get_json(silent=True) or {}
+    # The caller that is about to send the user's words asks us not to tell
+    # the model, because those words will. See LiveManager.barge_in.
+    notify = bool(data.get("notify_model", True))
+    return jsonify(mgr.barge_in(notify_model=notify))
+
+
+@app.post("/api/live/text")
+@require_token
+def api_live_text():
+    """Type into the live conversation instead of speaking into it.
+
+    Typing and talking were two separate conversations: text went to the REST
+    model and came back as text on screen, voice went to the live session and
+    came back as sound, and neither knew the other had happened. So a question
+    typed mid-conversation got a silent answer, and NOVA had no memory of it
+    the moment you spoke again.
+
+    Sent this way the typed words join the same session the voice is in. The
+    answer is spoken *and* arrives as a transcript, which is what "reply in
+    both" means, and the turn is part of one conversation either way.
+
+    Returns not-connected when no session is live; the caller falls back to
+    the REST path, which is the right behaviour when voice is simply off.
+    """
+    data = request.get_json(silent=True) or {}
+    text = (data.get("message") or data.get("text") or "").strip()
+    if not text:
+        return jsonify({"ok": False, "reason": "empty"}), 400
+    mgr = desk_live.get_live_manager()
+    result = mgr.send_text(text)
+    if result.get("ok"):
+        # Echo the user's own line to the surfaces straight away. The model
+        # transcribes what it *hears*, so a typed turn would otherwise leave
+        # NOVA's reply on screen with nothing above it.
+        publish_transcript(text, role="user")
+    return jsonify(result)
+
+
+@app.post("/api/live/screen")
+@require_token
+def api_live_screen():
+    """Turn NOVA's screen awareness on or off.
+
+    Off unless explicitly switched on, and switched off again whenever the
+    voice session ends. Screen contents are the most sensitive thing NOVA can
+    be given, so this is never implicit: nothing here is enabled by opening
+    ambient mode, only by asking for it.
+    """
+    data = request.get_json(silent=True) or {}
+    mgr = desk_live.get_live_manager()
+    want = bool(data.get("watching")) if "watching" in data else not mgr.screen_status()["watching"]
+    # "See your screen": deny -> never; ask -> only when the person switches it
+    # on themselves (ambient mode turning it on is not them asking); allow -> yes.
+    if want:
+        perm, source = _permission("screen_read"), str(data.get("source") or "user")
+        if perm == "deny" or (perm == "ask" and source != "user"):
+            why = ("Screen access is turned off in NOVA's permissions." if perm == "deny" else
+                   "Screen access is set to Ask me, so NOVA only looks when you switch it on.")
+            return jsonify({"ok": False, "watching": mgr.screen_status()["watching"],
+                            "error": "screen_" + perm, "message": why}), (403 if perm == "deny" else 200)
+    return jsonify(mgr.set_screen_share(want))
+
+
 @app.get("/api/live/status")
 @require_token
 def api_live_status():
     mgr = desk_live.get_live_manager()
     return jsonify(mgr.status())
+
+
+@app.get("/api/audio/devices")
+@require_token
+def api_audio_devices():
+    """The microphones this machine has, for the `mic_device` setting.
+
+    PortAudio lists each device once per Windows audio API, so names are
+    de-duplicated, keeping the entry on the host API the voice session itself
+    prefers. The setting stores the name, which is what live_session matches.
+    """
+    try:
+        import sounddevice as sd
+    except Exception as e:
+        return jsonify({"ok": False, "inputs": [], "error": f"audio unavailable: {e}"})
+    try:
+        preferred = desk_live._preferred_host_api()
+    except Exception:
+        preferred = None
+    try:
+        default_in = sd.default.device[0] if sd.default.device else None
+        seen: dict[str, dict] = {}
+        for i, d in enumerate(sd.query_devices()):
+            if int(d.get("max_input_channels", 0) or 0) <= 0:
+                continue
+            name = str(d.get("name", "")).strip()
+            if not name:
+                continue
+            entry = {"index": i, "name": name, "default": i == default_in}
+            prior = seen.get(name)
+            if prior is None or (preferred is not None and d.get("hostapi") == preferred):
+                if prior is not None:
+                    entry["default"] = entry["default"] or prior["default"]
+                seen[name] = entry
+        return jsonify({"ok": True, "inputs": list(seen.values())})
+    except Exception as e:
+        return jsonify({"ok": False, "inputs": [], "error": str(e)})
+
+
+def _block_on_accept(server) -> None:
+    """Accepted connections block on reads, whatever the process default.
+
+    Python gives an accepted socket the process-wide default timeout. The
+    browser sends nothing on the voice and event WebSockets, so a default
+    (nova.is_online() used to set 4 s) made their reader thread treat four
+    quiet seconds as a close; the handler ended mid-stream and the window
+    silently stopped receiving the voice session. This has to happen at
+    accept: by the time a route runs, the reader is already waiting with
+    the old timeout.
+    """
+    accept = server.get_request
+
+    def get_request():
+        conn, addr = accept()
+        conn.settimeout(None)
+        return conn, addr
+
+    server.get_request = get_request
 
 
 @sock.route("/api/live/ws")
@@ -896,30 +1352,85 @@ def api_live_ws(ws):
         return
     mgr = desk_live.get_live_manager()
     q = mgr.subscribe()
+    idle = 0
     try:
         while True:
             try:
-                ev = q.get(timeout=0.5)
+                idle = 0
+                try:
+                    ev = q.get(timeout=0.5)
+                except queue.Empty:
+                    # A quiet half-second is the normal state of a voice
+                    # session, not a reason to hang up.
+                    #
+                    # This used to fall through to the bare `except
+                    # Exception: break` below, so the socket closed after the
+                    # first 500 ms in which NOVA happened to say nothing —
+                    # which is immediately. The conversation panel therefore
+                    # never received a transcript, and the greeting sat
+                    # waiting eight seconds for an interface that had already
+                    # been and gone.
+                    #
+                    # The ping is not decoration: without traffic there is no
+                    # way to notice a peer that has gone away, and a
+                    # subscriber queue nobody drains fills up and starts
+                    # dropping the events other surfaces still want.
+                    idle += 1
+                    if idle >= 20:              # ~10 s
+                        idle = 0
+                        try:
+                            ws.send('{"type":"ping"}')
+                        except Exception:
+                            break
+                    continue
                 ev_dict = ev.to_dict()
                 ws.send(json.dumps(ev_dict))
                 # Forward voice state events to unified event bus
                 if ev_dict.get("type") == "state":
                     state_val = ev_dict.get("state", "")
+                    # Every state the session can publish, named here.
+                    #
+                    # Anything missing fell through to "idle", and three of
+                    # the states NOVA spends nearly all her time in were
+                    # missing: a conversation showed an idle orb while she
+                    # was listening, thinking about it, and talking back.
+                    # The surfaces that open the voice socket directly were
+                    # fine; the ambient bar and the telemetry panel, which
+                    # deliberately read this bus instead, were not.
                     orb_map = {
                         "connecting": "thinking",
-                        "connected": "idle",
+                        "connected": "listening",
+                        "ready": "listening",
+                        "listening": "listening",
                         "streaming": "listening",
+                        "speaking": "speaking",
+                        "muted": "idle",
+                        "offline": "offline",
                         "disconnecting": "thinking",
                         "error": "error",
                         "closed": "offline",
                     }
                     orb_state = orb_map.get(state_val, "idle")
-                    publish_event({"type": "voice_state", "state": state_val, "ts": time.time()})
+                    # publish_voice_state, not a bare voice_state event: it
+                    # also records the state /api/system reports, and the
+                    # HUD's VOICE pill showed "idle" for whole conversations.
+                    publish_voice_state(state_val)
                     publish_event({"type": "orb_state", "state": orb_state, "ts": time.time()})
                 elif ev_dict.get("type") == "user_transcript":
                     publish_event({"type": "transcript", "text": ev_dict.get("text", ""), "role": "user", "ts": time.time()})
                 elif ev_dict.get("type") == "nova_transcript":
                     publish_event({"type": "transcript", "text": ev_dict.get("text", ""), "role": "nova", "ts": time.time()})
+                elif ev_dict.get("type") in ("turn_complete", "interrupted",
+                                             "tool_call", "tool_result",
+                                             "screen_share", "screen_frame",
+                                             "playback_complete",
+                                             "vision_capture", "vision_captured",
+                                             "vision_sent", "vision_failed",
+                                             "vision_refused"):
+                    # Forwarded so the ambient bar and the telemetry panel can
+                    # follow the conversation without opening their own voice
+                    # socket. One runtime, one event stream.
+                    publish_event({**ev_dict, "ts": time.time()})
             except Exception:
                 break
     finally:
@@ -1279,13 +1790,17 @@ def _mcp_status() -> dict:
     if has_mcp and bridge is not None:
         try:
             servers = list(getattr(bridge, "servers", lambda: [])() or []) or []
-            servers = [getattr(s, "name", None) or s if isinstance(s, str) else
-                       {"name": getattr(s, "name", None) or str(s)} for s in servers]
+            # One shape for every server: a bare name and an object with
+            # .name used to come back as a string and a dict respectively.
+            servers = [{"name": s if isinstance(s, str) else (getattr(s, "name", None) or str(s))}
+                       for s in servers]
         except Exception:
             servers = []
         try:
             decls = list(getattr(bridge, "gemini_declarations", lambda: [])() or []) or []
-            tools = [{"name": d.get("name") if isinstance(d, dict) else d for d in decls}]
+            # One entry per declaration. (This was a dict comprehension inside
+            # a list, which collapsed every tool into a single {"name": last}.)
+            tools = [{"name": d.get("name") if isinstance(d, dict) else str(d)} for d in decls]
         except Exception:
             tools = []
     return {
@@ -1309,6 +1824,271 @@ def api_mcp():
 
 # ── tasks ──────────────────────────────────────────────────────────────────────
 
+# ── ambient mode ──────────────────────────────────────────────────────────────
+#
+# NOVA collapses to a small always-on-top presence while she is doing work on
+# the desktop, so the user can watch the actual application being driven. The
+# desktop shell owns the windows, so it registers hooks here and the web layer
+# only ever asks for a mode.
+
+_ambient_hooks: dict = {"enter": None, "exit": None}
+_ambient_mode: str = "full"
+
+# Tools whose value to the user is *seeing the desktop*. Purely conversational
+# turns must not yank the window away, so this list is deliberately narrow.
+_DESKTOP_TOOLS = {
+    "open_app", "close_app", "browser_control", "computer_control",
+    "computer_settings", "file_controller", "vision",
+}
+
+
+def register_ambient_hooks(enter=None, exit=None) -> None:
+    """Called by the desktop shell to expose real window control."""
+    _ambient_hooks["enter"] = enter
+    _ambient_hooks["exit"] = exit
+    log.info("[AMBIENT] hooks registered (enter=%s exit=%s)", bool(enter), bool(exit))
+
+
+def set_ambient_mode(mode: str) -> dict:
+    """Switch NOVA between the full command centre and the ambient presence."""
+    global _ambient_mode
+    mode = "ambient" if mode == "ambient" else "full"
+    if mode == _ambient_mode:
+        return {"ok": True, "mode": mode, "changed": False}
+    hook = _ambient_hooks["enter"] if mode == "ambient" else _ambient_hooks["exit"]
+    if hook is None:
+        # Headless/browser runs have no window to move; say so rather than
+        # reporting a transition that did not happen.
+        return {"ok": False, "mode": _ambient_mode, "reason": "no desktop window"}
+    try:
+        hook()
+    except Exception as e:
+        log.warning("[AMBIENT] %s hook failed: %s", mode, e)
+        return {"ok": False, "mode": _ambient_mode, "reason": str(e)}
+    _ambient_mode = mode
+    publish_event({"type": "ambient", "mode": mode, "ts": time.time()})
+    log.info("[AMBIENT] mode -> %s", mode)
+    return {"ok": True, "mode": mode, "changed": True}
+
+
+@app.post("/api/ambient")
+@require_token
+def api_ambient():
+    data = request.get_json(silent=True) or {}
+    return jsonify(set_ambient_mode((data.get("mode") or "full").strip()))
+
+
+@app.get("/api/ambient")
+@require_token
+def api_ambient_get():
+    return jsonify({
+        "ok": True,
+        "mode": _ambient_mode,
+        "available": bool(_ambient_hooks["enter"]),
+    })
+
+
+def _agent_key(agent_id: str, tool: str = "", name: str = "") -> str:
+    """The roster agent that owns a runtime agent/tool id.
+
+    The chat path names agents after the tool they run ("agent-web_search-3f9c")
+    and its own thinking "thinking-<turn>", which is NOVA herself.
+    """
+    if tool:
+        return agent_activity.agent_for_tool(tool)
+    m = re.match(r"agent-(.+)-[^-]+$", agent_id or "")
+    return agent_activity.agent_for_tool(m.group(1) if m else (name or ""))
+
+
+# ── command-centre telemetry ──────────────────────────────────────────────────
+#
+# Everything the HUD renders comes from here, and every field is measured. The
+# reference design is dense with readouts; a dense UI full of invented numbers
+# would be worse than no UI, so nothing below is synthesised — if a value is
+# unavailable the field is omitted and the panel renders it as "--".
+
+_AGENT_ROSTER = [tuple(a) for a in agent_activity.AGENTS]
+
+_net_last = {"t": 0.0, "sent": 0, "recv": 0}
+
+try:  # prime the CPU sampler — the first call always returns 0.0
+    import psutil as _psutil_prime
+    _psutil_prime.cpu_percent(interval=None)
+except Exception:
+    pass
+
+
+def _vitals() -> dict:
+    """Real host metrics. Fields are omitted when the platform cannot supply them."""
+    out: dict = {}
+    try:
+        import psutil
+    except Exception:
+        return out
+    try:
+        out["cpu_pct"] = psutil.cpu_percent(interval=None)
+        vm = psutil.virtual_memory()
+        out["mem_pct"] = vm.percent
+        out["mem_used_gb"] = round(vm.used / 1e9, 2)
+        out["mem_total_gb"] = round(vm.total / 1e9, 2)
+    except Exception:
+        pass
+    try:
+        now = time.time()
+        n = psutil.net_io_counters()
+        if _net_last["t"] and now > _net_last["t"]:
+            dt = now - _net_last["t"]
+            out["up_bps"] = int((n.bytes_sent - _net_last["sent"]) / dt)
+            out["down_bps"] = int((n.bytes_recv - _net_last["recv"]) / dt)
+        _net_last.update(t=now, sent=n.bytes_sent, recv=n.bytes_recv)
+    except Exception:
+        pass
+    try:
+        temps = psutil.sensors_temperatures() or {}
+        for readings in temps.values():
+            if readings and readings[0].current:
+                out["thermal_c"] = round(readings[0].current, 1)
+                break
+    except Exception:
+        pass
+    return out
+
+
+@app.get("/api/system")
+@require_token
+def api_system():
+    """Live telemetry for the command-centre HUD."""
+    import nova
+
+    # ── agents: every executor reports to one registry ──────────────────────
+    agents = [{k: a[k] for k in ("id", "label", "role", "state", "action", "task_id")}
+              | {"since": a.get("since"), "busy": len(a.get("work") or [])}
+              for a in agent_activity.snapshot()]
+
+    # ── tasks: real task manager state, active first ────────────────────────
+    tasks = []
+    try:
+        tm = _ns("_task_manager")
+        if tm is not None:
+            listing = tm.recent(12) if hasattr(tm, "recent") else tm.list()[-12:][::-1]
+            for t in listing:
+                d = t.to_dict() if hasattr(t, "to_dict") else {}
+                tasks.append(_task_brief(d))
+    except Exception as e:
+        log.debug("task listing failed: %s", e)
+
+    # ── intelligence ────────────────────────────────────────────────────────
+    provider = ""
+    model = ""
+    try:
+        r = getattr(nova, "_nova_router", None)
+        if r is not None:
+            provider = getattr(r, "_last_provider_used", "") or ""
+            prov = r.get_provider(provider) if provider else None
+            if prov is not None:
+                model = str(getattr(prov, "model", "") or getattr(prov, "_model", "") or "")
+    except Exception:
+        pass
+
+    # A voice conversation does not go through the router, so while one is
+    # running the engine and latency are the live session's own -- otherwise
+    # the HUD showed ENGINE ---- and LATENCY -- throughout a conversation.
+    turn_ms = _last_turn_ms
+    try:
+        live = desk_live.get_live_manager().status()
+        if live.get("state") not in (None, "idle", "closed", "error", "offline"):
+            model = str(live.get("model") or model).replace("models/", "")
+            provider = live.get("engine") or provider
+            turn_ms = live.get("last_turn_ms") or turn_ms
+    except Exception:
+        pass
+
+    conn = "unknown"
+    try:
+        r = getattr(nova, "_nova_router", None)
+        if r is not None:
+            conn = r.connectivity.state.value
+    except Exception:
+        pass
+
+    return jsonify({
+        "ts": time.time(),
+        "uptime_s": round(time.time() - _started_at, 1),
+        "vitals": _vitals(),
+        "agents": agents,
+        "tasks": tasks,
+        "intelligence": {
+            "provider": provider,
+            "model": model,
+            "connectivity": conn,
+            "brain_ready": _brain_ready,
+            "last_turn_ms": turn_ms,
+        },
+        "voice": {
+            "state": _last_voice_state,
+        },
+        "tls": _tls_status(),
+    })
+
+
+def _task_brief(d: dict) -> dict:
+    """What the task list shows for one task. Every figure is counted."""
+    msgs = d.get("agent_messages") or []
+    review = (d.get("reviews") or [None])[-1]
+    return {
+        "id": d.get("id", ""),
+        "title": d.get("title", ""),
+        "status": d.get("status", ""),
+        "phase": d.get("phase", ""),
+        "steps": len(d.get("steps", []) or []),
+        "steps_done": d.get("steps_done", 0),
+        "progress": d.get("progress", 0),
+        "seconds_remaining": d.get("seconds_remaining"),
+        "estimated_duration_s": d.get("estimated_duration_s", 0),
+        "elapsed_s": d.get("elapsed_s", 0),
+        "current": d.get("current", ""),
+        "next": d.get("next", ""),
+        "agents": d.get("agents", []),
+        "reason": d.get("reason_for_stop", ""),
+        "artifacts": [a.get("path", "") for a in d.get("artifacts") or []][:5],
+        "messages": msgs[-4:],
+        "review": ({"round": review.get("round"), "passed": review.get("passed"),
+                    "issues": [i.get("problem", "") for i in review.get("issues") or []]}
+                   if review else None),
+        "updated": d.get("updated", 0),
+    }
+
+
+@app.get("/api/tasks/<task_id>")
+@require_token
+def api_task(task_id: str):
+    """One task in full: steps, agent messages, reviews, history."""
+    tm = _ns("_task_manager")
+    t = tm.get(task_id) if tm is not None else None
+    if t is None:
+        return jsonify({"ok": False, "error": "no such task"}), 404
+    return jsonify({"ok": True, "task": t.to_dict()})
+
+
+@app.post("/api/tasks/<task_id>/cancel")
+@require_token
+def api_task_cancel(task_id: str):
+    tm = _ns("_task_manager")
+    ok = bool(tm is not None and tm.cancel(task_id, force=True))
+    return jsonify({"ok": ok, **({} if ok else {"error": "that task is not running"})})
+
+
+@app.post("/api/tasks/<task_id>/retry")
+@require_token
+def api_task_retry(task_id: str):
+    """Run a finished task again, as a new task that remembers its parent."""
+    tm = _ns("_task_manager")
+    t = tm.retry(task_id) if tm is not None and hasattr(tm, "retry") else None
+    if t is None:
+        return jsonify({"ok": False, "error": "only a task that has stopped can be retried"}), 400
+    return jsonify({"ok": True, "task_id": t.id})
+
+
 @app.get("/api/tasks")
 @require_token
 def api_tasks():
@@ -1319,7 +2099,10 @@ def api_tasks():
     try:
         raw = getattr(tm, "list", None)
         if callable(raw):
-            tasks = raw()
+            # to_dict(), not the Task objects themselves: jsonify would
+            # serialise the raw dataclass fields and skip the computed
+            # progress and countdown.
+            tasks = [t.to_dict() if hasattr(t, "to_dict") else t for t in raw()]
     except Exception:
         tasks = []
     if not tasks and callable(getattr(tm, "exec_command", None)):
@@ -1339,7 +2122,7 @@ def api_permissions():
     return jsonify({
         "categories": list(desk_settings._PERMISSION_CATEGORIES),  # noqa: SLF001
         "permissions": desk_settings.get("permissions", {}),
-        "tool_map": desk_confirm.TOOL_CATEGORY,
+        "tool_map": desk_confirm.tool_scopes(),
         "policy": desk_settings.get("confirm_policy", "prompt"),
     })
 
@@ -1413,6 +2196,39 @@ def api_settings_get():
     return jsonify({"settings": desk_settings.all(), "toggles": desk_settings.toggles()})
 
 
+def _enforce_revocations() -> list:
+    """Make a withdrawn permission take effect now, not at the next session.
+
+    The switch in the window and what NOVA can actually do must never differ:
+    turning the microphone to Never stops a running voice session, and
+    turning screen access off (or to Ask me) stops a screen share that the
+    person did not start themselves. Returns what was stopped.
+    """
+    stopped = []
+    try:
+        mgr = desk_live.get_live_manager()
+        # Any session that is not idle -- including one still connecting, which
+        # does not own the microphone *yet* and was missed by the first version
+        # of this check (caught against the real app: it went on to stream).
+        if _permission("microphone") == "deny":
+            r = mgr.stop()
+            if isinstance(r, dict) and r.get("message") != "not running":
+                stopped.append("voice")
+        if _permission("screen_read") == "deny" and mgr.screen_status().get("watching"):
+            mgr.set_screen_share(False)
+            stopped.append("screen")
+        if _permission("microphone") == "deny":
+            try:
+                desk_voice.abort_capture()
+            except Exception:
+                pass
+    except Exception as e:
+        log.warning("[DESK] could not apply a permission change immediately: %s", e)
+    if stopped:
+        log.info("[DESK] permission withdrawn; stopped %s", ", ".join(stopped))
+    return stopped
+
+
 @app.post("/api/settings")
 @require_token
 def api_settings_post():
@@ -1421,8 +2237,39 @@ def api_settings_post():
     if isinstance(data.get("permissions"), dict):
         desk_settings.set_many({"permissions": data["permissions"]})
         data.pop("permissions", None)
+        _enforce_revocations()
     desk_settings.set_many(data)
+    if getattr(desk_settings, "last_write_error", ""):
+        return jsonify({"ok": False, "error": "Your change could not be saved: "
+                                             + desk_settings.last_write_error}), 500
+    # The setting has already been applied locally. Syncing it to the account
+    # happens afterwards, on a background thread, so changing a preference is
+    # never gated on the network.
+    desk_account.push_preferences_async(data)
     return jsonify({"ok": True, "settings": desk_settings.all()})
+
+
+@app.get("/api/startup")
+@require_token
+def api_startup_get():
+    from desk import startup
+    return jsonify({"ok": True, "mode": desk_settings.get("startup_mode", "manual") or "manual",
+                    "registered": startup.registered_command(), "modes": list(startup.MODES)})
+
+
+@app.post("/api/startup")
+@require_token
+def api_startup_set():
+    """Start NOVA with Windows: manual | open | background (per user, no admin)."""
+    from desk import startup
+    mode = str((request.get_json(silent=True) or {}).get("mode") or "")
+    try:
+        r = startup.set_mode(mode)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except OSError as e:
+        return jsonify({"ok": False, "error": f"Windows refused the change: {e}"}), 500
+    return jsonify({"ok": True, **r})
 
 
 @app.post("/api/settings/profile")
@@ -1433,6 +2280,13 @@ def api_settings_profile():
     if name:
         desk_settings.set_many({"user_name": name})
         _META["user_name"] = name
+    # How the name is *said*, which the spelling often does not tell you.
+    # Stored whenever it is offered so the voice layer can be told once
+    # rather than mispronouncing it every session.
+    if "user_name_pronunciation" in data:
+        say = (data.get("user_name_pronunciation") or "").strip()
+        desk_settings.set_many({"user_name_pronunciation": say})
+        _META["user_name_pronunciation"] = say
     return jsonify({"ok": True, "user_name": desk_settings.get("user_name") or "User"})
 
 
@@ -1450,6 +2304,77 @@ def _creds():
 @require_token
 def api_onboarding_status():
     return jsonify({"ok": True, "auth": _auth_status()})
+
+
+@app.get("/api/accounts")
+@require_token
+def api_accounts():
+    """Which external services NOVA is connected to, and what she may do.
+
+    Never contains a token: the account layer keeps credentials in the
+    credential store and returns only metadata, because everything here
+    reaches the interface and can reach the model.
+    """
+    try:
+        from integrations.accounts import PROVIDERS, get_account_store
+        store = get_account_store()
+        connected = {c["provider"]: c for c in store.connected()}
+        out = []
+        for name, spec in sorted(PROVIDERS.items()):
+            if name.endswith("_placeholder"):
+                continue
+            entry = connected.get(name) or {"provider": name,
+                                            "status": "disconnected",
+                                            "grants": []}
+            entry["description"] = spec.description
+            entry["supports"] = sorted(g.value for g in spec.supports)
+            out.append(entry)
+        return jsonify({"ok": True, "accounts": out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:200]}), 500
+
+
+@app.post("/api/accounts/gmail/connect")
+@require_token
+def api_accounts_gmail_connect():
+    """Start Google's consent flow. Opens a browser on this machine.
+
+    Read-only: the scope requested cannot send, delete or archive anything.
+    Run on a worker thread because the flow blocks until the person either
+    consents or closes the window, and the request must not hold the server.
+    """
+    import threading
+
+    def _run():
+        try:
+            from integrations.gmail import authorise
+            result = authorise()
+            log.info("[GMAIL] connected as %s", result.get("account", "?"))
+            publish_event({"type": "account_changed", "provider": "gmail",
+                           "ok": True, "ts": time.time()})
+        except Exception as e:
+            log.warning("[GMAIL] consent failed: %s", e)
+            publish_event({"type": "account_changed", "provider": "gmail",
+                           "ok": False, "error": str(e)[:200],
+                           "ts": time.time()})
+
+    threading.Thread(target=_run, daemon=True,
+                     name="GmailConsent").start()
+    return jsonify({"ok": True, "started": True})
+
+
+@app.post("/api/accounts/<provider>/disconnect")
+@require_token
+def api_accounts_disconnect(provider):
+    """Forget the account and destroy the credential."""
+    try:
+        from integrations.accounts import get_account_store
+        get_account_store().disconnect(provider)
+        publish_event({"type": "account_changed", "provider": provider,
+                       "ok": True, "ts": time.time()})
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:200]}), 500
 
 
 @app.post("/api/onboarding/byok")
@@ -1501,6 +2426,21 @@ def api_onboarding_cloud():
 def api_onboarding_complete():
     _creds().mark_onboarded()
     return jsonify({"ok": True, "auth": _auth_status()})
+
+
+@app.get("/api/update")
+@require_token
+def api_update_status():
+    """Automatic updates: what is installed, what is staged, what happened."""
+    from desk import updater
+    s = updater.status()
+    s["staged"] = updater.staged()
+    try:
+        import json as _json
+        s["history"] = _json.loads((updater.update_dir() / "history.json").read_text("utf-8"))[-5:]
+    except Exception:
+        s["history"] = []
+    return jsonify({"ok": True, **s})
 
 
 @app.get("/api/live/token")
@@ -1603,37 +2543,42 @@ def _collect_mind_map_nodes():
     })
     nid += 1
 
-    # Memory nodes
-    try:
-        mem_path = Path(__file__).parent.parent / "nova_memory_store" / "records.json"
-        if mem_path.exists():
-            records = json.loads(mem_path.read_text(encoding="utf-8"))
-            for rec in records[:30]:
+    # Memory nodes -- from the running memory system, the same source as
+    # /api/memory. (These used to be read from files beside the source code,
+    # which in the packaged app is inside the bundle: the map showed no
+    # memories, or stale ones, while the Memory page showed the real ones.)
+    # `updated` travels with each node so the page can forget exactly that
+    # record through DELETE /api/memory/records.
+    lm = _ns("_living_memory")
+    if lm is not None:
+        try:
+            live = [r for r in lm.all_records() if not r.get("superseded_by")]
+            live.sort(key=lambda r: r.get("importance", 0.0), reverse=True)
+            for rec in live[:40]:
+                text = str(rec.get("text", ""))
                 nodes.append({
                     "id": f"n{nid}", "region": "memory", "type": "memory",
-                    "label": rec.get("text", rec.get("fact", ""))[:60],
-                    "detail": rec.get("text", rec.get("fact", "")),
-                    "size": 0.5, "accent": REGION_COLORS["memory"],
+                    "label": text[:60], "detail": text,
+                    "size": 0.4 + 0.3 * min(1.0, float(rec.get("importance", 0.0) or 0.0)),
+                    "accent": REGION_COLORS["memory"],
                     "source_type": rec.get("type", "unknown"),
                     "source_id": rec.get("id", ""),
+                    "updated": rec.get("updated", 0.0),
+                    "confirmed": bool(rec.get("confirmed", True)),
                 })
                 nid += 1
-    except Exception:
-        pass
+        except Exception as e:
+            log.warning("mind map: living memory listing failed: %s", e)
 
-    # Facts from memory_texts.json
     try:
-        facts_path = Path(__file__).parent.parent / "memory_texts.json"
-        if facts_path.exists():
-            facts = json.loads(facts_path.read_text(encoding="utf-8"))
-            for fact in (facts if isinstance(facts, list) else []):
-                text = fact if isinstance(fact, str) else fact.get("text", str(fact))
-                nodes.append({
-                    "id": f"n{nid}", "region": "memory", "type": "fact",
-                    "label": text[:60], "detail": text,
-                    "size": 0.4, "accent": REGION_COLORS["memory"],
-                })
-                nid += 1
+        for text in list(_ns("_memory_texts", []) or [])[-30:]:
+            text = text if isinstance(text, str) else str(text)
+            nodes.append({
+                "id": f"n{nid}", "region": "memory", "type": "fact",
+                "label": text[:60], "detail": text,
+                "size": 0.4, "accent": REGION_COLORS["memory"],
+            })
+            nid += 1
     except Exception:
         pass
 
@@ -1671,9 +2616,12 @@ def _collect_mind_map_nodes():
 
     # Working memory nodes (current session)
     try:
-        cid = desk_store.current_conversation_id() if hasattr(desk_store, "current_conversation_id") else None
-        if cid:
-            msgs = desk_store.get_messages(cid, limit=20)
+        # The most recent conversation. This used to call two store functions
+        # that do not exist, behind a hasattr guard, so the region was always empty.
+        recent = desk_store.list_conversations(limit=1)
+        convo = desk_store.get_conversation(recent[0]["id"]) if recent else None
+        if convo:
+            msgs = (convo.get("messages") or [])[-20:]
             for m in msgs:
                 if m.get("role") == "user":
                     nodes.append({
@@ -1689,41 +2637,65 @@ def _collect_mind_map_nodes():
     return nodes
 
 
+_mind_map_edge_cache: dict = {"key": None, "edges": None}
+_mind_map_edge_lock = threading.Lock()
+
+
 def _collect_mind_map_edges(nodes):
-    """Compute semantic edges between nodes using FAISS embeddings if available."""
-    edges = []
+    """Edges between nodes: semantic when NOVA's embedder is loaded, else regional.
+
+    Uses the embedder NOVA already holds (nova_state._embedder). This used to
+    load a fresh SentenceTransformer from a folder beside the source on every
+    request -- seconds and hundreds of MB per map view, and again for every
+    node clicked -- and that folder does not exist in the packaged app. The
+    result is cached against the node texts, so a click reuses it.
+    """
     if len(nodes) < 2:
-        return edges
+        return []
+    key = tuple((n["id"], n.get("detail", n.get("label", ""))) for n in nodes)
+    with _mind_map_edge_lock:
+        if _mind_map_edge_cache["key"] == key:
+            return list(_mind_map_edge_cache["edges"])
+    edges = _compute_mind_map_edges(nodes)
+    with _mind_map_edge_lock:
+        _mind_map_edge_cache["key"] = key
+        _mind_map_edge_cache["edges"] = list(edges)
+    return edges
 
-    # Try FAISS-based cosine similarity
-    try:
-        import faiss
-        import numpy as np
-        embedder_path = Path(__file__).parent.parent / "nova_embedder"
-        if embedder_path.exists():
-            from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer(str(embedder_path))
-            texts = [n.get("detail", n.get("label", "")) for n in nodes]
-            embeddings = model.encode(texts, show_progress_bar=False)
-            embeddings = np.array(embeddings, dtype="float32")
-            faiss.normalize_L2(embeddings)
-            index = faiss.IndexFlatIP(embeddings.shape[1])
-            index.add(embeddings)
-            D, I = index.search(embeddings, min(4, len(nodes)))
-            for i, (dists, neighbors) in enumerate(zip(D, I)):
-                for j, (dist, neighbor) in enumerate(zip(dists, neighbors)):
-                    if i != neighbor and dist > 0.35 and j < 3:
-                        edge_id = tuple(sorted([nodes[i]["id"], nodes[neighbor]["id"]]))
-                        if not any(e["source"] == edge_id[0] and e["target"] == edge_id[1] for e in edges):
-                            edges.append({
-                                "source": edge_id[0], "target": edge_id[1],
-                                "weight": float(dist), "type": "semantic",
-                            })
-            return edges
-    except Exception:
-        pass
 
-    # Fallback: region-based edges
+def _compute_mind_map_edges(nodes):
+    model = _ns("_embedder")
+    if model is not None:
+        try:
+            return _semantic_edges(model, nodes)
+        except Exception as e:
+            log.warning("mind map: semantic edges failed, using regional: %s", e)
+    return _regional_edges(nodes)
+
+
+def _semantic_edges(model, nodes):
+    import faiss
+    import numpy as np
+    edges, seen = [], set()
+    texts = [n.get("detail", n.get("label", "")) for n in nodes]
+    embeddings = np.array(model.encode(texts, show_progress_bar=False), dtype="float32")
+    faiss.normalize_L2(embeddings)
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings)
+    D, I = index.search(embeddings, min(4, len(nodes)))
+    for i, (dists, neighbors) in enumerate(zip(D, I)):
+        for j, (dist, neighbor) in enumerate(zip(dists, neighbors)):
+            if i != neighbor and dist > 0.35 and j < 3:
+                pair = tuple(sorted([nodes[i]["id"], nodes[neighbor]["id"]]))
+                if pair not in seen:
+                    seen.add(pair)
+                    edges.append({"source": pair[0], "target": pair[1],
+                                  "weight": float(dist), "type": "semantic"})
+    return edges
+
+
+def _regional_edges(nodes):
+    edges = []
     region_groups = {}
     for n in nodes:
         region_groups.setdefault(n["region"], []).append(n["id"])
@@ -1837,6 +2809,37 @@ def ws_observe(ws):
                 _observer_clients.remove(ws)
 
 
+def _start_account_session() -> None:
+    """Restore the signed-in account, adopt its name, and start telemetry.
+
+    Everything here is either local (reading the cached session from the OS
+    keystore) or dispatched to a background thread. Startup never waits on the
+    network: a machine with no connection reaches the same voice-ready state,
+    just without a fresh preference pull.
+    """
+    import nova_account
+    acct = nova_account.account()
+    if not acct.configured:
+        log.info("[DESK] no NOVA Cloud configured; running local-only")
+        return
+    if not acct.signed_in:
+        log.info("[DESK] NOVA Cloud configured; no account signed in")
+        return
+
+    name = acct.display_name
+    if name:
+        # NOVA already knows who this is; the user should not be asked again.
+        desk_settings.set_many({"user_name": name})
+        _META["user_name"] = name
+
+    acct.start_background()
+    acct.emit("NOVA_STARTED", surface="desktop",
+              app_version=nova_account.APP_VERSION)
+    desk_account.pull_preferences_async()
+    log.info("[DESK] signed in as %s (%s)", name or "?",
+             "online" if acct.online else "cached")
+
+
 def run_desk_server(meta, port: int | None = None) -> None:
     """Entrypoint called by nova.py --desk. Blocks (serves until stopped)."""
     global _META, run_token, _started_at, _server
@@ -1851,6 +2854,50 @@ def run_desk_server(meta, port: int | None = None) -> None:
     ok, msg = desk_confirm.install(ui_mode=True)
     log.info("[DESK] %s", msg)
 
+    # Account surface. Registered before the server starts so the SPA can ask
+    # who is signed in on its very first request. If no NOVA Cloud backend is
+    # configured this still answers -- with configured:false -- and NOVA runs
+    # entirely locally.
+    try:
+        desk_account.register(app, require_token, _META)
+        _start_account_session()
+    except Exception as e:                       # never block startup on this
+        log.warning("[DESK] account surface unavailable: %s", e)
+
+    # Offline model preparation (first-run and Settings), with real progress.
+    try:
+        from desk import offline_model
+        offline_model.register(app, require_token)
+        # Keep "start with Windows" pointing at this copy of NOVA after an
+        # update moved it (desk.startup's docstring promised this; nothing called it).
+        from desk import startup as _startup
+        _startup.reapply_saved()
+    except Exception as e:
+        log.warning("[DESK] offline model surface unavailable: %s", e)
+
+    # NOVA's learned skills: list, connect an account, test, roll back, remove.
+    try:
+        from desk import skills_api
+        skills_api.register(app, require_token)
+    except Exception as e:
+        log.error("[DESK] skills surface unavailable: %s", e)
+
+    # Knowledge the person teaches NOVA: learn a folder, progress, provenance.
+    try:
+        from desk import knowledge_api
+        knowledge_api.register(app, require_token)
+    except Exception as e:
+        log.error("[DESK] knowledge surface unavailable: %s", e)
+
+    # Document library. Registered here so the SPA can list and add documents;
+    # the tool path reaches the same library through nova_core.rag.api.
+    try:
+        from nova_core.rag import api as rag_api
+        rag_api.register(app, require_token)
+        log.info("[DESK] document library ready")
+    except Exception as e:
+        log.warning("[DESK] document library unavailable: %s", e)
+
     if port is None:
         port = int(os.getenv("NOVA_DESK_PORT", "") or 8765)
     try:
@@ -1859,8 +2906,18 @@ def run_desk_server(meta, port: int | None = None) -> None:
         pass
 
     from werkzeug.serving import make_server
+
+    # Stop logging a line per HTTP request. Two surfaces poll this server
+    # several times a second, and every one of those was formatted and
+    # written to nova.log through the root handler -- 8 MB of
+    # "GET /api/confirm/pending 200" in a single session, constant disk I/O
+    # on the audio path, and any real error buried a thousand lines deep.
+    # Warnings and errors from the server still come through.
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
     host = os.getenv("NOVA_DESK_HOST", "127.0.0.1")
     _server = make_server(host, port, app, threaded=True)
+    _block_on_accept(_server)
     print(f"[NOVA] 🖥  NOVA Desktop backend ready at http://{host}:{port}")
 
     # ── Unified event bus (voice state + agent lifecycle + transcripts) ────────
@@ -1868,6 +2925,7 @@ def run_desk_server(meta, port: int | None = None) -> None:
     _event_lock = threading.Lock()
 
     def publish_event(event: dict):
+        _notify_listeners(event)
         msg = json.dumps(event, ensure_ascii=False)
         with _event_lock:
             dead = []
@@ -1880,6 +2938,8 @@ def run_desk_server(meta, port: int | None = None) -> None:
                 _event_clients.remove(cws)
 
     def publish_voice_state(state: str, **extra):
+        global _last_voice_state
+        _last_voice_state = state
         publish_event({"type": "voice_state", "state": state, "ts": time.time(), **extra})
 
     def publish_transcript(text: str, role: str = "nova"):
@@ -1892,12 +2952,20 @@ def run_desk_server(meta, port: int | None = None) -> None:
         publish_event({"type": "task_done", "task_id": task_id, "ok": ok, "summary": summary, "ts": time.time()})
 
     def publish_agent_start(agent_id: str, task_id: str, name: str, action: str = "", tool: str = ""):
+        agent_activity.begin(_agent_key(agent_id, tool, name), action or name,
+                             source="chat", task_id=task_id, key=f"chat:{agent_id}")
         publish_event({"type": "agent_start", "agent_id": agent_id, "task_id": task_id, "name": name, "action": action, "tool": tool, "ts": time.time()})
 
     def publish_agent_progress(agent_id: str, action: str = "", tool: str = ""):
+        # The registry's row says what the agent started on; progress is
+        # the event below, not a rewrite of that row.
         publish_event({"type": "agent_progress", "agent_id": agent_id, "action": action, "tool": tool, "ts": time.time()})
 
     def publish_agent_done(agent_id: str, ok: bool = True, summary: str = ""):
+        # By the exact id it started under. Matching by substring left
+        # "research" lit forever: it is not a substring of
+        # "agent-web_search-3f9c".
+        agent_activity.end(f"chat:{agent_id}")
         publish_event({"type": "agent_done", "agent_id": agent_id, "ok": ok, "summary": summary, "ts": time.time()})
 
     def publish_orb_state(state: str):
@@ -1912,6 +2980,16 @@ def run_desk_server(meta, port: int | None = None) -> None:
     _chat_mod._publish_agent_progress = publish_agent_progress
     _chat_mod._publish_agent_done = publish_agent_done
     _chat_mod._publish_orb_state = publish_orb_state
+    try:
+        from desk import skills_api as _skills_api
+        _skills_api.attach_events(publish_event)
+    except Exception as e:
+        log.warning("[DESK] skill events unavailable: %s", e)
+    try:
+        from desk import knowledge_api as _knowledge_api
+        _knowledge_api.attach_events(publish_event)
+    except Exception as e:
+        log.warning("[DESK] learning events unavailable: %s", e)
 
     @sock.route("/ws/events")
     def ws_events(cws):
@@ -1924,9 +3002,17 @@ def run_desk_server(meta, port: int | None = None) -> None:
             _event_clients.append(cws)
         try:
             while True:
-                data = cws.receive(timeout=30)
+                # receive() returning None is an *idle* timeout, not a close.
+                # Breaking on it tore down every event client every few seconds
+                # and reconnected in a loop, so agent/task/voice events were
+                # regularly lost. Keep the socket open and ping to hold it.
+                data = cws.receive(timeout=20)
                 if data is None:
-                    break
+                    try:
+                        cws.send('{"type":"ping"}')
+                    except Exception:
+                        break          # peer really is gone
+                    continue
         except Exception:
             pass
         finally:
@@ -1934,24 +3020,16 @@ def run_desk_server(meta, port: int | None = None) -> None:
                 if cws in _event_clients:
                     _event_clients.remove(cws)
 
-    # Auto-start Gemini Live session (voice-first behavior)
-    try:
-        def _auto_start_live():
-            """Auto-start Live session after a short delay to let the server stabilize."""
-            import time as _time
-            _time.sleep(2.0)  # give the server a moment to be ready
-            try:
-                mgr = desk_live.get_live_manager()
-                result = mgr.start()
-                if result.get("ok"):
-                    print(f"[NOVA] 🔊 Voice auto-started: {result.get('message', 'ok')}")
-                else:
-                    print(f"[NOVA] ⚠️  Voice auto-start skipped: {result.get('reason', 'unknown')}")
-            except Exception as e:
-                print(f"[NOVA] ⚠️  Voice auto-start failed: {e}")
-        threading.Thread(target=_auto_start_live, daemon=True).start()
-    except Exception as e:
-        print(f"[NOVA] ⚠️  Voice auto-start thread failed: {e}")
-
+    # Voice is started by the interface, not by a timer here.
+    #
+    # This used to spawn a thread that slept two seconds and then opened the
+    # Live session regardless of what else was happening. Two seconds after
+    # the HTTP server binds is not "the application is ready" — it is usually
+    # before the window has painted. The user's report was NOVA speaking over
+    # her own startup, a fragment of a greeting delivered to an interface that
+    # did not exist yet, and this timer is where that came from.
+    #
+    # The SPA calls POST /api/live/start once it has loaded and attached to
+    # the event stream, which is the only moment that actually means ready.
     print(f"[NOVA] Press Ctrl+C to stop.")
     _serve(_server)

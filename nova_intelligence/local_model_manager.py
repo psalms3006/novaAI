@@ -134,16 +134,91 @@ class LocalModelManager:
             self._provider = OllamaProvider(base_url=self._base_url, model=model)
         return self._provider
 
-    def _load_current_model(self) -> str:
+    def _configured_model(self) -> str:
         try:
             from desk.settings import get as _get_setting
-            return _get_setting("local_model", DEFAULT_MODEL_ID)
+            return _get_setting("local_model", DEFAULT_MODEL_ID) or DEFAULT_MODEL_ID
         except Exception:
             return DEFAULT_MODEL_ID
+
+    def _load_current_model(self) -> str:
+        """Resolve the local model to use, preferring one that is installed.
+
+        The configured name used to be returned unchecked. If it was not
+        installed — the default qwen2.5:3b on a machine that has something else,
+        or a model the user removed — OllamaProvider.is_available() returned
+        False and the router quietly dropped the local provider entirely. NOVA
+        then reported "no intelligence provider available" while perfectly good
+        models sat installed on disk.
+
+        The user's explicit choice always wins when it is actually present.
+        """
+        configured = self._configured_model()
+        try:
+            installed = [
+                m.get("name", "")
+                for m in OllamaProvider(base_url=self._base_url).list_models()
+            ]
+        except Exception:
+            return configured
+        if not installed:
+            return configured
+        if any(configured in name for name in installed):
+            return configured
+
+        best = self._best_installed(installed)
+        if best:
+            log.warning(
+                "[LOCAL] configured model %r is not installed; using %r instead "
+                "(installed: %s)", configured, best, ", ".join(installed),
+            )
+            return best
+        return configured
+
+    @staticmethod
+    def _best_installed(installed: List[str]) -> Optional[str]:
+        """Pick the most capable installed model.
+
+        NOVA's core loop is tool calling, so a model that cannot call tools
+        (tinyllama) is a last resort no matter how fast it is.
+        """
+        _REASONING_RANK = {"very good": 3, "good": 2, "basic": 1}
+        meta_by_id = {m["id"]: m for m in KNOWN_MODELS}
+
+        def score(name: str) -> tuple:
+            meta = None
+            for mid, m in meta_by_id.items():
+                if mid.split(":")[0] in name:
+                    meta = m
+                    break
+            if meta is None:
+                # Unknown model: assume it calls tools, rank mid.
+                return (1, 2, 0.0)
+            return (
+                1 if meta.get("tool_calling") else 0,
+                _REASONING_RANK.get(meta.get("reasoning", "basic"), 1),
+                float(meta.get("size_gb", 0.0)),
+            )
+
+        ranked = sorted(installed, key=score, reverse=True)
+        return ranked[0] if ranked else None
 
     @property
     def current_model(self) -> str:
         return self._get_provider().model
+
+    @property
+    def configured_model(self) -> str:
+        """The model NOVA is set to use, without checking it is installed.
+
+        `current_model` asks Ollama what it actually has, which is the right
+        answer and costs a round trip to a service that may not be running —
+        measured at 4.1 s on this machine, spent during startup, before the
+        microphone was open. When the cloud is available Ollama is only ever
+        a fallback and is deliberately left stopped, so that check belongs at
+        the moment the fallback is first wanted, not at launch.
+        """
+        return self._configured_model()
 
     def get_status(self) -> dict:
         """Full status of local model infrastructure."""

@@ -34,17 +34,17 @@ which ships with Windows 10/11 by default.
 cd C:\Users\Lenovo\project-nova
 python -m pip install pyinstaller
 python -m PyInstaller packaging\nova_desktop.spec --noconfirm --clean
-copy dist\NOVADesktop\_internal\.env.template dist\NOVADesktop\.env.template
+copy dist\NOVADesktop2\_internal\.env.template dist\NOVADesktop2\.env.template
 ```
 
-Output: **`dist\NOVADesktop\`** — a folder containing `NOVA.exe` plus the
+Output: **`dist\NOVADesktop2\`** — a folder containing `NOVA.exe` plus the
 bundled Python runtime, the SPA, the local embedder model, `.env.template`,
 and `nova_config.toml`.
 
 Quick sanity check before packaging:
 
 ```bat
-dist\NOVADesktop\NOVA.exe
+dist\NOVADesktop2\NOVA.exe
 ```
 
 The NOVA window should open. First run creates `%APPDATA%\NOVA\`.
@@ -52,16 +52,27 @@ The NOVA window should open. First run creates `%APPDATA%\NOVA\`.
 ## Step 2 — build the installer
 
 ```bat
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\NOVA.iss
+"%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" packaging\NOVA-Setup.iss
 ```
 
-Output: **`packaging\out\NOVASetup.exe`** — the distributable installer.
+Output: **`packaging\out\NOVA-Setup.exe`** — the distributable installer.
+
+> `packaging\NOVA.iss` is an older script pointing at a
+> `dist\NOVADesktop\` folder the spec no longer produces. Build
+> `NOVA-Setup.iss`; the other fails on a missing source directory.
 
 ## Portable alternative (no installer)
 
 ```bat
-powershell -Command "Compress-Archive -Path dist\NOVADesktop\* -DestinationPath packaging\out\NOVA-portable.zip -Force"
+powershell -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path 'dist\NOVADesktop2').Path, (Join-Path (Get-Location) 'packaging\out\NOVA-portable.zip'), [IO.Compression.CompressionLevel]::Optimal, $false)"
 ```
+
+> `Compress-Archive` builds the whole archive in memory before writing
+> anything, and on this bundle it passed 700 MB of RAM with no output
+> after nine minutes. The .NET call above streams to disk instead:
+> 57 s for a 198 MB archive of 3,622 entries. Both paths are resolved
+> first because .NET resolves a relative path against its own working
+> directory rather than PowerShell's.
 
 Output: `packaging\out\NOVA-portable.zip` — unzip anywhere, run `NOVA.exe`.
 

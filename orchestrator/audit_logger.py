@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import os
 import threading
 import time
 from datetime import datetime
@@ -61,8 +62,25 @@ def redact_payload(data: Dict[str, Any]) -> Dict[str, Any]:
 class AuditLogger:
     """Append-only structured audit store."""
 
+    @staticmethod
+    def default_path() -> Path:
+        """Where the audit log lives.
+
+        A relative "data/" path resolves against the working directory, which
+        for the packaged app is the install directory. Under Program Files that
+        is not writable by a standard user, so auditing silently disabled
+        itself; it also contradicts the installer's guarantee that user data
+        never lives inside the install directory.
+
+        This used to carry its own copy of the frozen/dev rule, which is how
+        it came to ignore NOVA_DATA_DIR and write outside the sandbox the test
+        suite sets up. nova_paths is the one place that decides.
+        """
+        import nova_paths
+        return nova_paths.data_file("nova_audit.ndjson")
+
     def __init__(self, path: Optional[str] = None, max_lines: int = 2000) -> None:
-        self.path = Path(path) if path else Path("data") / "nova_audit.ndjson"
+        self.path = Path(path) if path else self.default_path()
         self.max_lines = max_lines
         self._lock = threading.Lock()
         if not self.path.exists():

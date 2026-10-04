@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import threading
 import time
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -23,12 +25,29 @@ OLLAMA_DEFAULT_URL = "http://localhost:11434"
 class OllamaProvider:
     """Ollama local inference provider."""
 
+    #: How long an availability probe stays valid (seconds).
+    AVAIL_TTL_S = 60.0
+
+    #: Inference runs on this machine — the router uses this for network-aware
+    #: routing rather than matching on the provider's name.
+    is_local = True
+
     def __init__(
         self,
         base_url: str = OLLAMA_DEFAULT_URL,
         model: str = "llama3.2",
-        timeout: int = 30,
+        timeout: int = 0,
     ):
+        # 8s was far too short to be a real fallback: a cold local model spends
+        # most of that just loading weights into memory, so every offline
+        # request failed with a read timeout right after the router had
+        # correctly chosen Ollama. Availability probes stay short (3s, below);
+        # this timeout covers actual generation. 180s is not arbitrary: with
+        # NOVA's full ~4,600-token system prompt and 16 tool schemas, a 1.5B
+        # model on a memory-saturated machine took ~130s and failed at 120s,
+        # then completed in ~60s once given room. Override with
+        # NOVA_OLLAMA_TIMEOUT.
+        timeout = timeout or int(os.getenv("NOVA_OLLAMA_TIMEOUT", "") or 180)
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._timeout = timeout
@@ -40,6 +59,10 @@ class OllamaProvider:
         )
         self._last_check_time = 0.0
         self._last_check_result = False
+        self._avail_check_time = 0.0
+        self._avail_check_result = False
+        self._avail_lock = threading.Lock()
+        self._avail_refreshing = False
 
     @property
     def name(self) -> str:
@@ -60,6 +83,7 @@ class OllamaProvider:
     @model.setter
     def model(self, value: str) -> None:
         self._model = value
+        self._invalidate_availability()
 
     def is_running(self) -> bool:
         """Is the Ollama process reachable? Uses 5s cache to avoid repeated timeouts."""
@@ -75,17 +99,110 @@ class OllamaProvider:
         return self._last_check_result
 
     def is_available(self) -> bool:
-        """Quick check: is Ollama running and does it have the model?"""
-        if not self.is_running():
+        """Is Ollama running and does it have the model? Cached.
+
+        The router calls this on every provider for every request. Uncached,
+        the extra /api/tags round trip cost 2-4 s of pure pre-flight latency
+        per chat turn on a machine with models installed — more than the model
+        call itself for a short prompt. The installed-model set changes rarely,
+        so a short TTL is safe; downloads/removals invalidate it explicitly.
+        """
+        now = time.time()
+        fresh = (now - self._avail_check_time) < self.AVAIL_TTL_S
+
+        if self._avail_check_time == 0.0:
+            # Never probed: this one has to block, but only once per process.
+            self._probe_availability()
+            return self._avail_check_result
+
+        if not fresh:
+            # Serve the last known answer immediately and refresh behind the
+            # request. A stale answer only affects ranking order for one turn —
+            # a provider that has actually gone away still fails over — whereas
+            # blocking here put a 2-4 s probe on the critical path of a chat
+            # turn every time the TTL happened to lapse between messages.
+            self._refresh_availability_async()
+        return self._avail_check_result
+
+    #: Set by nova.main() so a stopped-but-installed Ollama can be woken when
+    #: it is actually wanted. Left None, this provider behaves exactly as it
+    #: always did: not running means not available.
+    runtime = None
+
+    def _probe_availability(self) -> bool:
+        result = False
+        if self.is_running():
+            try:
+                r = requests.get(f"{self._base_url}/api/tags", timeout=3)
+                if r.status_code == 200:
+                    models = [m.get("name", "") for m in r.json().get("models", [])]
+                    result = any(self._model in m for m in models)
+            except Exception:
+                result = False
+        elif self._can_be_started():
+            # Installed but not running. NOVA no longer starts Ollama at boot
+            # when a cloud key is present -- it held about a gigabyte on an
+            # 8 GB machine for a fallback that mostly never happens. But
+            # "stopped" must not mean "unavailable", or the router would
+            # filter the local model out at the moment the cloud fails and
+            # report having no provider at all.
+            #
+            # So it is started here, in the background, and reported as
+            # available: usable, not necessarily warm. If the start fails the
+            # call errors and the router moves on to the next provider, which
+            # is the behaviour a genuinely dead provider should get anyway.
+            self._start_runtime_async()
+            result = True
+        self._avail_check_result = result
+        self._avail_check_time = time.time()
+        return result
+
+    def _can_be_started(self) -> bool:
+        rt = self.runtime
+        if rt is None:
             return False
         try:
-            r = requests.get(f"{self._base_url}/api/tags", timeout=3)
-            if r.status_code != 200:
-                return False
-            models = [m.get("name", "") for m in r.json().get("models", [])]
-            return any(self._model in m for m in models)
+            return getattr(rt.state, "name", "") != "NOT_INSTALLED"
         except Exception:
             return False
+
+    def _start_runtime_async(self) -> None:
+        """Bring Ollama up without blocking the turn that asked for it."""
+        with self._avail_lock:
+            if getattr(self, "_starting", False):
+                return
+            self._starting = True
+
+        def _run():
+            try:
+                log.info("[OLLAMA] starting local runtime on first use")
+                self.runtime.ensure_running()
+            except Exception as e:
+                log.warning("[OLLAMA] could not start local runtime: %s", e)
+            finally:
+                with self._avail_lock:
+                    self._starting = False
+                self._avail_check_time = 0.0   # re-probe for real next time
+
+        threading.Thread(target=_run, name="ollama-start", daemon=True).start()
+
+    def _refresh_availability_async(self) -> None:
+        with self._avail_lock:
+            if self._avail_refreshing:
+                return
+            self._avail_refreshing = True
+
+        def _run():
+            try:
+                self._probe_availability()
+            finally:
+                with self._avail_lock:
+                    self._avail_refreshing = False
+
+        threading.Thread(target=_run, name="ollama-avail", daemon=True).start()
+
+    def _invalidate_availability(self) -> None:
+        self._avail_check_time = 0.0
 
     def list_models(self) -> List[Dict[str, Any]]:
         """List all locally installed Ollama models."""
@@ -202,9 +319,83 @@ class OllamaProvider:
                         continue
             self._health.record_success()
         except Exception as e:
+            # Raise rather than yielding an error string: the router can only
+            # fail over to another provider if the failure is visible as an
+            # exception. A yielded "[Error: ...]" looks like a valid answer.
             self._health.record_failure(str(e))
             log.warning("[OLLAMA] stream error: %s", e)
-            yield f"[Error: {e}]"
+            raise
+
+    def stream_complete(
+        self,
+        messages: List[Dict[str, Any]],
+        system: str = "",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+    ) -> Iterator[tuple]:
+        """Stream text as it arrives, then a final ("done", GenerateResult).
+
+        Without this, IntelligenceRouter.stream_complete() falls back to
+        this provider's plain complete() -- the whole reply generated
+        before anything is handed back -- because it only checks for
+        stream_complete specifically, not the plain-text stream() this
+        class already had. That made offline voice wait for a complete
+        Ollama response before speaking a single sentence of it, every
+        turn, regardless of how long the reply was.
+
+        Tool calls: Ollama-compatible models that call tools while
+        streaming emit them in the final chunk's message, same shape as
+        complete()'s non-streamed response -- parsed identically here.
+        """
+        t0 = time.time()
+        full_text_parts: List[str] = []
+        tool_calls: List[Dict[str, Any]] = []
+        try:
+            payload = self._build_payload(messages, system, tools, temperature, max_tokens)
+            payload["stream"] = True
+            with requests.post(
+                f"{self._base_url}/api/chat",
+                json=payload,
+                timeout=self._timeout,
+                stream=True,
+            ) as r:
+                r.raise_for_status()
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = chunk.get("message", {})
+                    content = msg.get("content", "")
+                    if content:
+                        full_text_parts.append(content)
+                        yield ("text", content)
+                    for tc in msg.get("tool_calls", []) or []:
+                        func = tc.get("function", {})
+                        name = func.get("name", "")
+                        args = func.get("arguments", {})
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except Exception:
+                                args = {}
+                        if name:
+                            tool_calls.append({"name": name, "args": args})
+                    if chunk.get("done"):
+                        break
+            latency = (time.time() - t0) * 1000
+            self._health.record_success(latency)
+            yield ("done", GenerateResult(
+                text="".join(full_text_parts), tool_calls=tool_calls,
+                provider="ollama", model=self._model, latency_ms=latency,
+            ))
+        except Exception as e:
+            self._health.record_failure(str(e))
+            log.warning("[OLLAMA] stream_complete error: %s", e)
+            raise
 
     def get_model_info(self) -> dict:
         return {
@@ -237,6 +428,7 @@ class OllamaProvider:
                     except json.JSONDecodeError:
                         pass
             log.info("[OLLAMA] model %s downloaded", model_name)
+            self._invalidate_availability()
             return True
         except Exception as e:
             log.error("[OLLAMA] download failed: %s", e)
@@ -249,6 +441,7 @@ class OllamaProvider:
                 json={"name": model_name},
                 timeout=10,
             )
+            self._invalidate_availability()
             return r.status_code == 200
         except Exception:
             return False
@@ -285,6 +478,12 @@ class OllamaProvider:
             "model": self._model,
             "messages": msgs,
             "stream": False,
+            # Keep the model resident between turns. Ollama unloads after 5
+            # minutes by default, and reloading a multi-GB model costs more
+            # than the whole request budget — a cold mistral:latest exceeded a
+            # 120s timeout on this machine, so the local fallback appeared
+            # broken when it was only cold.
+            "keep_alive": os.getenv("NOVA_OLLAMA_KEEP_ALIVE", "") or "30m",
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,

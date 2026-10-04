@@ -13,7 +13,11 @@
 ;   * Contains NO secrets: no .env, no API keys, no DPAPI blobs
 
 #define MyAppName "NOVA"
+; Overridable at build time: ISCC /DMyAppVersion=1.0.1 packaging/NOVA-Setup.iss
+; (keep equal to APP_VERSION in nova_version.py)
+#ifndef MyAppVersion
 #define MyAppVersion "1.0.0"
+#endif
 #define MyAppPublisher "Omniel"
 #define MyAppExeName "NOVA.exe"
 
@@ -44,7 +48,7 @@ Name: "autostart"; Description: "Start {#MyAppName} when Windows starts"; \
     GroupDescription: "Startup:"; Flags: unchecked
 
 [Files]
-Source: "..\dist\NOVADesktop\*"; DestDir: "{app}"; \
+Source: "..\dist\NOVADesktop2\*"; DestDir: "{app}"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
 ; NOTE: deliberately NOT packaged: any ".env" file, "byok.bin", "device.json",
 ; "settings.json" or "*.log". Those are user-machine artifacts and never ship.
@@ -60,19 +64,24 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}
     Flags: nowait postinstall skipifsilent
 
 [Code]
+// The "remove my data?" question used to be a wizard page built in
+// InitializeWizard -- which runs for the INSTALLER only. It showed during
+// install, where it means nothing, and the uninstaller then read a page that
+// was never created: "Runtime error ... Could not call proc" on every
+// uninstall. The question now belongs to the uninstaller alone.
 var
-  DataPage: TInputOptionWizardPage;
+  DeleteUserData: Boolean;
 
-procedure InitializeWizard();
+function InitializeUninstall(): Boolean;
 begin
-  DataPage := CreateInputOptionPage(wpReady,
-    'Remove User Data?', 'Would you like to remove your NOVA data as well?',
-    'Your NOVA data (memories, settings, files) is kept in your profile folder ' +
-    'and is preserved when uninstalling. Only check this if you want a complete wipe.',
-    False, False);
-  DataPage.Add('Keep my NOVA data (recommended)');
-  DataPage.Add('Also delete memories, settings and workspace files');
-  DataPage.Values[0] := True;
+  DeleteUserData := False;
+  // Silent uninstalls (and future automatic updates) always keep user data.
+  if not UninstallSilent() then
+    DeleteUserData := MsgBox(
+      'Also delete your NOVA data (memories, settings and workspace files)?' + #13#10#13#10 +
+      'Choose No to keep it -- reinstalling NOVA will pick it up again.',
+      mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES;
+  Result := True;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -90,6 +99,6 @@ end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
-  if (CurUninstallStep = usPostUninstall) and (not DataPage.Values[0]) then
+  if (CurUninstallStep = usPostUninstall) and DeleteUserData then
     DelTree(ExpandConstant('{userappdata}\NOVA'), True, True, True);
 end;

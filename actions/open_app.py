@@ -39,6 +39,18 @@ def execute(parameters):
     if lookup in app_map:
         cmd = app_map[lookup]
     else:
+        # The name is interpolated into a shell string, and it comes from the
+        # model — which a web page fetched by web_search can steer. A quote
+        # ends the quoted argument and everything after it is another command
+        # to cmd.exe; a percent sign expands an environment variable even
+        # inside quotes.
+        #
+        # Parentheses are deliberately NOT rejected: "C:\Program Files (x86)\"
+        # is an ordinary path, and inside double quotes they are not special.
+        bad = set('"%&|<>^`$;\r\n\t') & set(app_name)
+        if bad:
+            return (f"I won't open {app_name!r} — an application name cannot "
+                    f"contain {''.join(sorted(bad))}.")
         cmd = f'start "" "{app_name}"'
 
     try:

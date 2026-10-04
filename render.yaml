@@ -1,0 +1,47 @@
+# Render blueprint for NOVA Cloud.
+#
+# Secrets are NOT here. Every value below is either public or marked sync:false,
+# which makes Render prompt for it in the dashboard instead of reading it from
+# the repository. Nothing secret should ever reach Git.
+services:
+  - type: web
+    name: nova-cloud
+    runtime: python
+    plan: starter          # free tier sleeps; a sleeping API means a cold start
+    region: frankfurt      # closest Render region to eu-west-2 Supabase
+    buildCommand: pip install -r nova_cloud/requirements.txt
+    startCommand: >-
+      gunicorn --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 60
+      --access-logfile - --error-logfile - "nova_cloud.app:create_app()"
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: NOVA_ENV
+        value: production
+      - key: NOVA_ADMIN_REQUIRE_MFA
+        value: "1"
+      - key: NOVA_REQUIRE_EMAIL_VERIFICATION
+        value: "1"
+      - key: NOVA_BRAND
+        value: NOVA
+      - key: EMAIL_PROVIDER
+        value: resend
+      - key: EMAIL_FROM
+        value: NOVA <hello@omniel.com.ng>
+      - key: SUPPORT_EMAIL
+        value: support@omniel.com.ng
+      - key: ADMIN_EMAIL
+        value: admin@omniel.com.ng
+      - key: APP_BASE_URL
+        value: https://api.nova.omniel.com.ng
+
+      # Prompted in the dashboard, never stored in the repository.
+      - key: DATABASE_URL
+        sync: false
+      - key: NOVA_SECRET_KEY
+        sync: false
+      - key: NOVA_ADMIN_SECRET_KEY
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false

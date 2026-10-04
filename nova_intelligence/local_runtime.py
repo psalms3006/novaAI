@@ -64,7 +64,11 @@ class LocalRuntimeManager:
         ollama_url: str = OLLAMA_DEFAULT_URL,
         auto_start: bool = True,
         auto_stop: bool = False,
-        start_timeout: float = 15.0,
+        # Ollama's first `serve` on Windows routinely needs well over 15s
+        # (service registration + GPU probe). Timing out early marked a
+        # perfectly healthy runtime FAILED, so the UI reported "local AI
+        # unavailable" while the router was successfully using it.
+        start_timeout: float = 45.0,
     ):
         self._ollama_url = ollama_url.rstrip("/")
         self._auto_start = auto_start
@@ -86,7 +90,20 @@ class LocalRuntimeManager:
 
     @property
     def is_running(self) -> bool:
-        return self._state == RuntimeState.RUNNING
+        """Whether Ollama is answering right now.
+
+        This re-probes instead of trusting the cached state: the state is only
+        written at start-up, so a runtime that came up slowly stayed reported as
+        FAILED/STARTING for the rest of the session even while serving requests.
+        """
+        if self._state == RuntimeState.RUNNING:
+            return True
+        if self._state in (RuntimeState.NOT_INSTALLED, RuntimeState.STOPPING):
+            return False
+        if self._check_http_alive():
+            self._state = RuntimeState.RUNNING
+            return True
+        return False
 
     def detect(self) -> RuntimeState:
         """Detect Ollama installation without starting it.
@@ -176,7 +193,12 @@ class LocalRuntimeManager:
                 return True
             else:
                 log.warning("[RUNTIME] Ollama started but not responding within %.1fs", self._start_timeout)
-                self._state = RuntimeState.FAILED
+                # It may still be coming up. Leave the state as STARTING rather
+                # than FAILED so a later health_check()/is_running() can promote
+                # it — a slow start is not a permanent failure, and marking it
+                # FAILED made NOVA report local AI as unavailable for the whole
+                # session even once Ollama answered normally.
+                self._state = RuntimeState.STARTING
                 return False
 
         except FileNotFoundError:

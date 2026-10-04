@@ -1,7 +1,0 @@
-{
-    "GEMINI_API_KEY": "AQ.Ab8RN6Ir_hcOgSf71jEN-jvwt0lySUVmdmlnkrEudw2wfhm-ig",
-    "GEMINI_LIVE_MODEL": "models/gemini-2.5-flash-native-audio-preview-12-2025",
-    "GEMINI_VISION_MODEL": "gemini-2.0-flash",
-    "os_system": "windows",
-    "camera_index": 0
-}

@@ -33,13 +33,17 @@ import ctypes.wintypes as wt
 import json
 import os
 import secrets
+import logging
 import sys
 import time
 from pathlib import Path
 
 from desk.settings import app_data_dir, get as _get_setting, set_many
 
+log = logging.getLogger("nova.desk.creds")
+
 _CRED_FILE = "byok.bin"
+_PLAINTEXT_FILE = "api_keys.json"     # plaintext fallback (mirrors MARK XXXIX)
 _DEVICE_FILE = "device.json"
 _SENTINEL = "nova-cloud-session"      # truthy placeholder, NOT a secret
 _LOG_REDACT = "nova-gateway-auth"     # what appears in logs instead of tokens
@@ -96,27 +100,86 @@ def _cred_path() -> Path:
     return app_data_dir() / _CRED_FILE
 
 
-def store_byok(api_key: str) -> None:
-    _cred_path().write_bytes(dpapi_protect(api_key.strip()))
+def _plaintext_path() -> Path:
+    return app_data_dir() / _PLAINTEXT_FILE
 
 
-def clear_byok() -> None:
+def _load_plaintext_key() -> str:
+    """Read a Gemini key from the plaintext JSON file (reliability fallback).
+
+    DPAPI sealing is preferred but has proven unreliable inside the PyInstaller
+    bundle, so a plaintext copy (same shape as MARK XXXIX's config/api_keys.json)
+    guarantees the key is always recoverable on the same machine.
+    """
+    p = _plaintext_path()
+    if not p.exists():
+        return ""
     try:
-        _cred_path().unlink(missing_ok=True)
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return (data.get("gemini_api_key") or "").strip()
+    except Exception:
+        return ""
+
+
+def _store_plaintext_key(api_key: str) -> None:
+    p = _plaintext_path()
+    data: dict = {}
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["gemini_api_key"] = api_key.strip()
+    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def store_byok(api_key: str) -> None:
+    """Seal the key with DPAPI (readable only by this Windows user).
+
+    This used to write a plaintext copy first, unconditionally, so every key
+    sat readable in api_keys.json even when DPAPI worked. Plaintext is now
+    only the fallback for a machine where sealing genuinely fails, and a
+    successful seal removes any old plaintext copy.
+    """
+    key = api_key.strip()
+    try:
+        _cred_path().write_bytes(dpapi_protect(key))
+    except Exception as e:
+        log.warning("DPAPI unavailable (%s); storing the key unencrypted", type(e).__name__)
+        _store_plaintext_key(key)
+        return
+    try:
+        _plaintext_path().unlink(missing_ok=True)
     except Exception:
         pass
 
 
+def clear_byok() -> None:
+    for p in (_cred_path(), _plaintext_path()):
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def load_byok() -> str:
     p = _cred_path()
-    if not p.exists():
-        return ""
-    try:
-        return dpapi_unprotect(p.read_bytes())
-    except Exception:
-        # unreadable under this user account — treat as absent, remove it
-        clear_byok()
-        return ""
+    if not p.exists() and _plaintext_path().exists():
+        # Migrate a key left in plaintext by an older build.
+        legacy = _load_plaintext_key()
+        if legacy:
+            store_byok(legacy)
+    if p.exists():
+        try:
+            return dpapi_unprotect(p.read_bytes())
+        except Exception:
+            # DPAPI unavailable (e.g. frozen build) — remove the stale blob and
+            # fall through to the plaintext copy.
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+    return _load_plaintext_key()
 
 
 def mask(key: str) -> str:
@@ -126,14 +189,69 @@ def mask(key: str) -> str:
 
 
 def valid_key_format(key: str) -> bool:
+    """Accept any plausible credential, not just `AIza…` API keys.
+
+    The google-genai SDK also accepts OAuth access tokens and other credential
+    formats (e.g. `AQ.Ab8…`), so we must not reject keys just because they don't
+    match the classic Gemini API-key shape. The real validation happens on the
+    first API call, whose error is surfaced to the user.
+    """
     k = (key or "").strip()
-    return bool(k) and k.startswith("AIza") and 30 <= len(k) <= 60
+    return len(k) >= 20
+
+
+def classify_credential(key: str) -> dict:
+    """Describe what kind of credential this is, and whether it is intact.
+
+    Google AI Studio issues keys in two formats, and both are durable:
+
+        AIza…    the classic 39-character Gemini API key
+        AQ.Ab8…  the current 53-character AI Studio key
+
+    Verified on 2026-09-10: an `AQ.` key from aistudio.google.com/apikey
+    connected to Gemini Live in 3.6 s. An earlier revision of this function
+    called `AQ.` a short-lived OAuth token that expires within the hour. That
+    was wrong -- the observed failure was truncation, not expiry, and nothing
+    in the evidence supported an expiry claim.
+
+    What actually breaks is a partial paste. `AQ.Ab8…` that loses its leading
+    `AQ.` becomes a 50-character string beginning `Ab8`, which Gemini rejects
+    with
+
+        1007  API key not valid. Please pass a valid API key.
+
+    -- an error that names the key rather than the paste, so it reads as a
+    wrong key rather than a truncated one. That cost a day of diagnosis, so it
+    is detected explicitly.
+    """
+    k = (key or "").strip()
+    if not k:
+        return {"kind": "none", "durable": False, "warning": ""}
+    if k.startswith("AIza"):
+        return {"kind": "api_key", "durable": True, "warning": ""}
+    if k.startswith("AQ."):
+        return {"kind": "api_key_aistudio", "durable": True, "warning": ""}
+    if k.startswith("Ab8") or k.startswith("Ab"):
+        # An `AQ.Ab8…` key whose prefix was lost in the paste. It cannot
+        # authenticate, and the resulting error does not say so.
+        return {"kind": "truncated_key", "durable": False, "warning":
+                "This key looks like an AI Studio key that lost its leading "
+                "“AQ.” when it was pasted, so Gemini will reject it. "
+                "Copy the whole value from aistudio.google.com/apikey, "
+                "including the “AQ.” at the start."}
+    return {"kind": "unknown", "durable": False, "warning":
+            "NOVA does not recognise this credential’s format. Keys from "
+            "aistudio.google.com/apikey begin with either “AQ.” or "
+            "“AIza”. If voice fails to start, check the whole value was "
+            "pasted."}
 
 
 # ── device identity ──────────────────────────────────────────────────────────
 
 def _device_path() -> Path:
-    return app_data_dir() / _DEVICE_FILE
+    # The installation's identity, shared by every account on this PC.
+    from .settings import machine_data_dir
+    return machine_data_dir() / _DEVICE_FILE
 
 
 def device_identity() -> dict:
@@ -163,69 +281,54 @@ def device_identity() -> dict:
 # ── NOVA cloud client (REST contract) ────────────────────────────────────────
 
 class NovaCloudClient:
-    """Client for the NOVA auth backend / AI gateway.
+    """Model access through the signed-in NOVA account (nova_cloud).
 
-    Expected backend contract (implement server-side when deploying NOVA Cloud):
+    The session is the account's own access token (nova_account refreshes it),
+    so there is one identity for sign-in, sync and models:
 
-      POST {url}/v1/devices/register
-           headers: X-NOVA-Device: <device_id>
-           body:    {"secret": <device secret>, "platform": "windows"}
-           200 ->   {"ok": true}
+      POST {url}/v1/model/live-token     short-lived Gemini Live token (voice)
+      POST {url}/gateway/<Google path>   text/streaming/embeddings, forwarded
+                                         with the server's key, header
+                                         X-NOVA-Session: <access token>
 
-      POST {url}/v1/sessions
-           headers: X-NOVA-Device: <device_id>, Authorization: Bearer <secret>
-           200 ->   {"session_token": "...", "expires_in": 3600}
-
-      POST {url}/v1/live/token          (optional; ephemeral Live credentials)
-           headers: X-NOVA-Session: <session token>
-           200 ->   {"token": "...", "expires_in": <seconds>}
-
-      The gateway also accepts normal Generative-Language paths under
-      {url}/gateway/... with header X-NOVA-Session instead of a Gemini key.
-
-    Until such a backend exists, every method raises honestly and cloud mode
-    stays inactive — nothing here pretends to succeed.
+    The Gemini key itself never reaches this machine.
     """
 
     def __init__(self, base_url: str):
         self.base = (base_url or "").rstrip("/")
-        self._session_token = ""
-        self._expires = 0.0
+        self._live: dict = {}
 
     @property
     def active(self) -> bool:
-        return bool(self.base)
-
-    def _post(self, path: str, body: dict | None = None, headers: dict | None = None,
-              timeout: float = 8.0) -> dict:
-        import requests
-        h = {"X-NOVA-Device": device_identity()["device_id"]}
-        h.update(headers or {})
-        r = requests.post(self.base + path, json=body or {}, headers=h, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
-
-    def register_device(self) -> dict:
-        ident = device_identity()
-        return self._post("/v1/devices/register",
-                          {"secret": ident["secret"], "platform": ident["platform"]})
+        if not self.base:
+            return False
+        try:
+            import nova_account
+            return nova_account.account().signed_in
+        except Exception:
+            return False
 
     def get_session(self, force_refresh: bool = False) -> str:
-        if self._session_token and not force_refresh and time.time() < self._expires - 60:
-            return self._session_token
-        ident = device_identity()
-        j = self._post("/v1/sessions", {},
-                       {"Authorization": f"Bearer {ident['secret']}"})
-        tok = (j.get("session_token") or "").strip()
+        import nova_account
+        tok = nova_account.account().ensure_access_token()
         if not tok:
-            raise RuntimeError("cloud backend returned no session token")
-        self._session_token = tok
-        self._expires = time.time() + float(j.get("expires_in", 3600))
+            raise RuntimeError("not signed in to NOVA, or NOVA Cloud is unreachable")
         return tok
 
     def mint_live_token(self) -> dict:
-        return self._post("/v1/live/token", {},
-                          {"X-NOVA-Session": self.get_session()})
+        """A Live token, reused while it has more than two minutes left (the
+        backend issues them for 30 minutes and several sessions)."""
+        if self._live and time.time() < float(self._live.get("_expires", 0)) - 120:
+            return {k: v for k, v in self._live.items() if not k.startswith("_")}
+        import requests
+        r = requests.post(self.base + "/v1/model/live-token",
+                          headers={"Authorization": f"Bearer {self.get_session()}"},
+                          timeout=10)
+        j = r.json() if r.content else {}
+        if r.status_code >= 400 or not j.get("token"):
+            raise RuntimeError(j.get("message") or f"live token refused ({r.status_code})")
+        self._live = {**j, "_expires": time.time() + float(j.get("expires_in") or 600)}
+        return {k: v for k, v in self._live.items() if not k.startswith("_")}
 
     def gateway_base_url(self) -> str:
         return self.base + "/gateway"
@@ -256,6 +359,16 @@ def apply_gateway_shim(client) -> None:
 
     def _patched_init(self, *a, **kw):
         orig_init(self, *a, **kw)
+        # A client built with a Live token talks to Google directly: that is
+        # the point of the token. Re-pointing it at the gateway would send the
+        # voice WebSocket to the NOVA server, which does not carry audio.
+        if str(kw.get("api_key") or "").startswith("auth_tokens/"):
+            return
+        # Installed once per process, but only meaningful while the managed
+        # model is the chosen mode: after a switch to the person's own key,
+        # their requests go to Google, not through NOVA's gateway.
+        if os.environ.get("GEMINI_API_KEY") != _SENTINEL:
+            return
         try:
             session = cloud.get_session()          # cached; refreshes near expiry
             from google.genai import types as _t
@@ -275,9 +388,16 @@ def apply_gateway_shim(client) -> None:
 _last_status: dict = {}
 
 
+def _accounts_enabled() -> bool:
+    from nova_version import cloud_base_url
+    return bool(cloud_base_url())
+
+
 def current_cloud_client() -> NovaCloudClient:
-    url = (os.getenv("NOVA_CLOUD_URL") or _get_setting("cloud_url") or "").strip()
-    return NovaCloudClient(url)
+    # The same server the account signs in to -- one resolver, so the model
+    # gateway can never point somewhere the account does not.
+    from nova_version import cloud_base_url
+    return NovaCloudClient(cloud_base_url())
 
 
 def resolve() -> dict:
@@ -288,6 +408,25 @@ def resolve() -> dict:
     global _last_status
     env_key = os.getenv("GEMINI_API_KEY", "").strip()
 
+    # An explicit choice of offline outranks an ambient key.
+    #
+    # A GEMINI_API_KEY in the environment — from .env, or exported by a
+    # developer shell — used to win unconditionally, so a user who chose
+    # "work offline" still had every request going to Gemini while the
+    # interface said offline. That is the reported "offline mode still runs on
+    # Gemini? it's all confusing", and it is worse than confusing: the one
+    # setting whose entire purpose is to stop network calls did not stop them.
+    if _get_setting("auth_mode") == "offline":
+        if env_key and env_key != _SENTINEL:
+            os.environ.pop("GEMINI_API_KEY", None)
+        _last_status = {
+            "mode": "offline", "onboarded": bool(_get_setting("onboarded")),
+            "cloud_configured": False, "cloud_error": "",
+            "byok_present": bool(load_byok()), "byok_masked": "",
+            "has_credential": False, "chosen_offline": True,
+        }
+        return dict(_last_status)
+
     if env_key and env_key != _SENTINEL:
         mode = "env"
         cloud_error = ""
@@ -295,7 +434,11 @@ def resolve() -> dict:
         cloud = current_cloud_client()
         byok = load_byok()
         cloud_error = ""
-        if cloud.active:
+        if byok and _get_setting("auth_mode") == "byok":
+            # The person chose their own key over NOVA's managed model.
+            os.environ["GEMINI_API_KEY"] = byok
+            mode = "byok"
+        elif cloud.active:
             try:
                 cloud.get_session()
                 apply_gateway_shim(_import_genai())
@@ -320,17 +463,39 @@ def resolve() -> dict:
         "byok_present": bool(load_byok()),
         "byok_masked": mask(load_byok()) if mode == "byok" else "",
         "has_credential": mode in ("env", "cloud", "byok"),
+        # A build with an account server sets up through /api/lifecycle, not
+        # the key/offline first-run screen.
+        "accounts_enabled": _accounts_enabled(),
     }
+    # Tell the interface what sort of credential is actually in play, so a
+    # key that will expire is flagged before it strands the user mid-sentence.
+    effective = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if mode == "cloud" or effective == _SENTINEL:
+        status["credential_kind"] = "cloud_session"
+        status["credential_warning"] = ""
+    else:
+        info = classify_credential(effective)
+        status["credential_kind"] = info["kind"]
+        status["credential_durable"] = info["durable"]
+        status["credential_warning"] = info["warning"]
     _last_status = status
     return status
 
 
 def set_byok(api_key: str) -> dict:
-    """Store a user-provided key securely and re-resolve. Never returns the key."""
+    """Store a user-provided key securely and re-resolve. Never returns the key.
+
+    Marking the user onboarded is part of this, not an afterthought. Pasting a
+    key *is* choosing how NOVA connects, and leaving the flag unset meant the
+    first-run screen reappeared seconds after the key was accepted, over and
+    over, until the user gave up and picked offline — which did set it. The
+    key was being stored correctly the whole time; only the "you have chosen"
+    flag was missing, so the choice could never stick.
+    """
     if not valid_key_format(api_key):
-        raise ValueError("That doesn't look like a Gemini API key (expected AIza…).")
+        raise ValueError("That key looks too short to be valid. Paste the full key.")
     store_byok(api_key.strip())
-    set_many({"auth_mode": "byok"})
+    set_many({"auth_mode": "byok", "onboarded": True})
     return apply_runtime()
 
 
@@ -374,7 +539,34 @@ def apply_runtime() -> dict:
         _chat.GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
     except Exception:
         pass
+    _register_router_gemini()
     return st
+
+
+def _register_router_gemini() -> None:
+    """(Re)register the Gemini provider on the running router when a key is set.
+
+    The router is built once at startup; if no API key was present then it has
+    no Gemini provider and would keep routing to a local model forever. After
+    BYOK/env resolution, make sure a Gemini provider backed by the current key
+    exists so text chat actually uses the cloud model.
+    """
+    key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not key:
+        return
+    try:
+        import nova as _nova
+    except Exception:
+        return
+    router = getattr(_nova, "_nova_router", None)
+    if router is None:
+        return
+    try:
+        if router.get_provider("gemini") is None:
+            from nova_intelligence.gemini_provider import GeminiProvider
+            router.register_provider("gemini", GeminiProvider(api_key=key))
+    except Exception:
+        pass
 
 
 def bootstrap() -> dict:

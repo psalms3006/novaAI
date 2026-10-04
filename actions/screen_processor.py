@@ -40,7 +40,10 @@ API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 _DEFAULT_LIVE_MODEL   = "models/gemini-2.5-flash-native-audio-preview-12-2025"
-_DEFAULT_VISION_MODEL = "gemini-2.0-flash"
+# An alias, not a pinned version: gemini-2.0-flash was retired and every
+# screen analysis through this path returned HTTP 404. A dated id is a
+# time bomb with a long fuse.
+_DEFAULT_VISION_MODEL = "gemini-flash-latest"
 
 CHANNELS            = 1
 RECEIVE_SAMPLE_RATE = 24000
@@ -344,10 +347,13 @@ class _LiveSession:
         assert self._audio_in is not None
 
         async for response in self._session.receive():
-            if response.data:
-                await self._audio_in.put(response.data)
-
             sc = response.server_content
+            if sc and sc.model_turn and sc.model_turn.parts:
+                for part in sc.model_turn.parts:
+                    inline = getattr(part, "inline_data", None)
+                    if inline is not None and getattr(inline, "data", None):
+                        await self._audio_in.put(inline.data)
+
             if not sc:
                 continue
 

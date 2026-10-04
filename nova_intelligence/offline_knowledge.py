@@ -51,11 +51,27 @@ class OfflineKnowledgeManager:
     and handles installation with progress callbacks.
     """
 
+    @staticmethod
+    def default_data_path() -> Path:
+        """Where downloaded ZIM archives live.
+
+        When frozen this must NOT be the install directory. __file__ points
+        inside the PyInstaller bundle, so archives downloaded through the UI
+        landed inside the install directory — not writable under Program
+        Files, and destroyed by the next uninstall or upgrade. Multi-gigabyte
+        user downloads belong with the rest of the user's data.
+        """
+        import os
+        import sys
+        if getattr(sys, "frozen", False):
+            base = os.getenv("APPDATA")
+            root = Path(base) / "NOVA" if base else Path.home() / ".nova"
+            return root / "data" / "zim"
+        return Path(__file__).parent.parent / "data" / "zim"
+
     def __init__(self, data_path: str = ""):
         if not data_path:
-            # Default: data/zim/ under the nova root
-            nova_root = Path(__file__).parent.parent
-            data_path = str(nova_root / "data" / "zim")
+            data_path = str(self.default_data_path())
         self._data_path = Path(data_path)
         self._data_path.mkdir(parents=True, exist_ok=True)
         self._wiki = None  # Lazy-loaded OfflineWiki

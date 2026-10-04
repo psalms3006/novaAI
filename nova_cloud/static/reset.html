@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reset your NOVA password</title>
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+<div class="login-wrap">
+  <form id="reset-form" class="login-card" autocomplete="on">
+    <div class="brand">NOVA</div>
+    <p class="hint" style="text-align:left;margin:14px 0 0">
+      Choose a new password. The link that brought you here works once.
+    </p>
+    <label for="pw">New password</label>
+    <input id="pw" type="password" autocomplete="new-password" required
+           minlength="10">
+    <label for="pw2">Repeat it</label>
+    <input id="pw2" type="password" autocomplete="new-password" required>
+    <button type="submit" id="go">Set password</button>
+    <p id="msg" class="error" hidden></p>
+  </form>
+</div>
+<script src="/static/reset.js"></script>
+</body>
+</html>

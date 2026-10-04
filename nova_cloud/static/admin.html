@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NOVA Admin</title>
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+
+<div id="login-view" class="login-wrap">
+  <form id="login-form" class="login-card" autocomplete="on">
+    <div class="brand">NOVA <span>Control Plane</span></div>
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" autocomplete="username" required>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <label for="totp">Authenticator code</label>
+    <input id="totp" name="totp" type="text" inputmode="numeric" autocomplete="one-time-code"
+           placeholder="6 digits">
+    <button type="submit" id="login-btn">Sign in</button>
+    <p id="login-error" class="error" hidden></p>
+    <p class="hint">Administrator access is logged.</p>
+  </form>
+</div>
+
+<div id="app-view" hidden>
+  <header class="topbar">
+    <div class="brand">NOVA <span>Control Plane</span></div>
+    <div class="topbar-right">
+      <span id="who" class="who"></span>
+      <button id="refresh-btn" class="ghost" title="Refresh">Refresh</button>
+      <button id="logout-btn" class="ghost">Sign out</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav id="nav" class="nav"></nav>
+    <main id="main" class="main">
+      <div id="loading" class="loading" hidden>Loading…</div>
+      <div id="content"></div>
+    </main>
+  </div>
+</div>
+
+<script src="/static/admin.js"></script>
+</body>
+</html>

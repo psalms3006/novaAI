@@ -17,9 +17,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+import nova_paths
+
 log = logging.getLogger("nova.goal")
 
-_GOALS_PATH = "goals.json"
+_GOALS_FILENAME = "goals.json"
 
 
 class GoalStatus:
@@ -113,7 +115,10 @@ class GoalStore:
     """Persistent store for goals with atomic writes."""
 
     def __init__(self, path: Optional[str] = None) -> None:
-        self.path = path or _GOALS_PATH
+        # Resolved per instance, not at import: a bare relative path resolves
+        # against whatever directory the app was launched from, which for a
+        # frozen install is the install directory.
+        self.path = path or str(nova_paths.data_file(_GOALS_FILENAME))
         self._data: Dict[str, Any] = {"goals": {}}
         self._load()
 

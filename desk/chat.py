@@ -12,10 +12,14 @@ This is an ADDITIVE layer. No brain code is modified.
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 from typing import Any, Dict, List, Tuple
 
+from . import trace as desk_trace
+from nova_core import trust as _trust
+from nova_intelligence.provider import GenerateResult
 import nova as _nova
 
 log = _nova.log
@@ -276,6 +280,7 @@ def run_turn(
       {"type":"error","message":...}
     """
     started = time.time()
+    desk_trace.mark("turn_start", msgs=len(messages))
     import uuid as _uuid
     task_id = str(_uuid.uuid4())[:8]
 
@@ -287,14 +292,12 @@ def run_turn(
     # which routes through IntelligenceRouter — works with or without Gemini key
     if HAS_GEMINI and GEMINI_API_KEY and genai and gtypes:
         try:
+            # A back-off recorded by *another* caller (memory extraction,
+            # vision) used to refuse the whole chat for up to 30 minutes. The
+            # router has its own fallbacks (another model, then the offline
+            # one), so say so and carry on instead of turning the person away.
             if _is_rate_limited and callable(_is_rate_limited) and _is_rate_limited():
-                yield _ev("error", message=(
-                    "Gemini is rate-limited right now (free-tier quota). "
-                    "Please wait a minute and retry."
-                ))
-                if _publish_task_done:
-                    _publish_task_done(task_id, ok=False, summary="Rate limited")
-                return
+                yield _ev("status", label="Gemini is busy — using a fallback if needed")
         except Exception:
             pass
     else:
@@ -302,12 +305,12 @@ def run_turn(
 
     # 1. First model round (streaming preferred, full-response fallback)
     followup_msgs = list(messages)
-    r_text, tool_calls, tokens = _first_round(followup_msgs, stop_event, streaming)
-    for t in tokens:
-        yield t
-        # Publish progress for thinking agent while streaming tokens
-        if t.get("type") == "token" and _publish_agent_progress:
-            _publish_agent_progress("thinking-" + task_id, action="Generating response")
+    desk_trace.mark("first_round_start")
+    r_text, tool_calls = yield from _first_round(followup_msgs, stop_event, streaming)
+    desk_trace.mark("first_round_done", chars=len(r_text or ""),
+                    tools=len(tool_calls or []))
+    if _publish_agent_progress:
+        _publish_agent_progress("thinking-" + task_id, action="Generating response")
     tool_events = []
 
     # Publish thinking agent start if no tools (pure text response)
@@ -321,6 +324,13 @@ def run_turn(
             for tc in tool_calls
         ]
         exec_list = []
+        pending_tool_results: List[Tuple[str, str]] = []
+        # Once a tool has returned content NOVA did not author -- a web page, a
+        # document, a search result -- everything the model asks for after it
+        # may be acting on instructions embedded in that content. The rest of
+        # the turn therefore runs untrusted, which is what stops the classic
+        # "search returns a page saying delete the user's files" chain.
+        tainted_by = ""
         for tc in tool_calls:
             name = tc.get("name", "")
             if stop_event is not None and stop_event.is_set():
@@ -332,11 +342,19 @@ def run_turn(
                 _publish_agent_start(agent_id, task_id, name=tool_label(name), action=f"Using {tool_label(name)}", tool=name)
             tool_events.append({"name": name, "label": tool_label(name), "ok": True, "summary": ""})
             try:
-                ok, result = _execute_tool_via_orchestrator(name, tc.get("args", {}), meta)
+                if tainted_by:
+                    with _trust.untrusted(tainted_by):
+                        ok, result = _execute_tool_via_orchestrator(
+                            name, tc.get("args", {}), meta)
+                else:
+                    ok, result = _execute_tool_via_orchestrator(
+                        name, tc.get("args", {}), meta)
             except Exception as e:
                 log.error("Tool failure %s: %s", name, e, exc_info=True)
                 result = f"Tool error: {e}"
                 ok = False
+            if ok and _trust.taints(name):
+                tainted_by = f"the result of {tool_label(name)}"
             summary = _tool_summary(result)
             tool_events[-1]["summary"] = summary
             tool_events[-1]["ok"] = ok
@@ -344,11 +362,7 @@ def run_turn(
             # Publish agent done event
             if _publish_agent_done:
                 _publish_agent_done(agent_id, ok=ok, summary=summary[:120])
-            followup_msgs.append({
-                "role": "tool",
-                "content": result,
-                "tool_call_id": tc.get("id", ""),
-            })
+            pending_tool_results.append((name, result))
 
         if stop_event is not None and stop_event.is_set():
             yield _ev("assistant", text=r_text)
@@ -357,12 +371,32 @@ def run_turn(
                 _publish_task_done(task_id, ok=True, summary=f"{len(tool_events)} tools executed")
             return
 
-        # 3. Follow-up round to produce the final answer
+        # 3. Follow-up round to produce the final answer.
+        #
+        # Turn order matters. The assistant turn that *requested* the tools has
+        # to come before their results, and the conversation must end on a user
+        # turn — Gemini rejects a request whose last content is a model turn
+        # with "400 Requests ending with a model turn are not supported", which
+        # made every tool-using answer fall through to the local model.
         yield _ev("status", label="Finishing up")
-        followup_msgs.append({
-            "role": "assistant", "content": r_text or "",
-            "tool_calls": [{"id": c.get("id", ""), "type": "function", "function": {"name": c.get("name", ""), "arguments": ""}} for c in tool_calls],
-        })
+        # Only add the assistant turn if the model actually said something. A
+        # synthetic placeholder here gets echoed back verbatim by the model and
+        # shown to the user as NOVA's answer.
+        if r_text and r_text.strip():
+            followup_msgs.append({"role": "assistant", "content": r_text})
+        if pending_tool_results:
+            results_block = "\n\n".join(
+                f"[{name} result]\n{res}" for name, res in pending_tool_results
+            )
+            followup_msgs.append({
+                "role": "user",
+                "content": (
+                    f"{results_block}\n\n"
+                    "Using these tool results, reply to my original request "
+                    "directly. Do not narrate your reasoning or mention that "
+                    "tools were used."
+                ),
+            })
         final_text, _tokens2 = _finish_round(followup_msgs, stop_event, streaming)
         if final_text is None or not final_text.strip():
             final_text = r_text.strip()
@@ -382,6 +416,7 @@ def run_turn(
     if not final_text:
         final_text = "NOVA couldn't complete that request. Please try again."
 
+    final_text = _unbacked_claim_note(final_text, tool_events)
     yield _ev("assistant", text=final_text)
     yield _ev("done", latency=round(time.time() - started, 2), tools=tool_events)
 
@@ -393,9 +428,36 @@ def run_turn(
         _publish_agent_done("thinking-" + task_id, ok=True, summary="Response generated")
 
 
+#: A reply saying NOVA did something to the computer. 2026-10-01: with the
+#: cloud quota spent, the local fallback (tinyllama, which cannot call tools)
+#: answered "Yes, I did change the file" about a file nothing had touched.
+_ACTION_CLAIM = re.compile(
+    r"\bI(?:'ve| have| did| just| already)?\s+(?:already\s+|just\s+|now\s+|successfully\s+)?"
+    r"(?:changed|modified|edited|updated|created|saved|deleted|removed|moved|renamed|sent|emailed|"
+    r"opened|closed|installed|uninstalled|wrote|written|downloaded|scheduled|launched|executed)\b"
+    r"|\bI did (?:change|modify|edit|update|create|save|delete|remove|send|open|install)\b",
+    re.I)
+
+
+def _unbacked_claim_note(text: str, tool_events: list) -> str:
+    """Say so when a reply claims an action no tool performed. NOVA's own rule
+    is never to claim a change that did not happen; a model that cannot call
+    tools does not follow it, so the turn checks the claim against what ran."""
+    if any(t.get("ok") for t in tool_events or []):
+        return text
+    if _ACTION_CLAIM.search(text or ""):
+        return (text + "\n\n_(No tool ran for this reply, so nothing on your computer "
+                "was actually changed.)_")
+    return text
+
+
 def _first_round(messages, stop_event, streaming):
-    """Return (text, tool_calls, tokens_list_of_events).
-    
+    """Yield token events as they arrive; return (text, tool_calls).
+
+    A generator rather than a function that returns a finished list, because
+    the whole point is that the caller can forward each word the moment it
+    exists instead of after the last one does.
+
     Provider-agnostic: routes through IntelligenceRouter when available,
     falls back to Gemini-specific path when router unavailable.
     Returns offline message if no AI backend is initialized.
@@ -405,7 +467,14 @@ def _first_round(messages, stop_event, streaming):
         import nova
         router = getattr(nova, "_nova_router", None)
         if router:
-            return _router_round(router, messages, use_tools=True, stop_event=stop_event, streaming=streaming)
+            if streaming:
+                return (yield from _router_round_streaming(router, messages))
+            text, calls, toks = _router_round(
+                router, messages, use_tools=True,
+                stop_event=stop_event, streaming=False)
+            for t in toks:
+                yield t
+            return text, calls
     except Exception as e:
         log.debug("router round failed, using Gemini path: %s", e)
 
@@ -418,7 +487,9 @@ def _first_round(messages, stop_event, streaming):
         if router is None:
             user_msg = messages[-1].get("content", "") if messages else ""
             log.info("Brain not initialized (router=None), returning offline response")
-            return _get_offline_response(user_msg), [], []
+            msg = _get_offline_response(user_msg)
+            yield _ev("token", text=msg)
+            return msg, []
     except Exception:
         pass
 
@@ -426,20 +497,73 @@ def _first_round(messages, stop_event, streaming):
     if HAS_GEMINI and GEMINI_API_KEY and genai and gtypes:
         if streaming:
             try:
-                return _stream_round(messages, use_tools=True, stop_event=stop_event)
+                text, calls, toks = _stream_round(
+                    messages, use_tools=True, stop_event=stop_event)
+                for t in toks:
+                    yield t
+                return text, calls
             except Exception as e:
                 log.error("streaming round failed; falling back to offline: %s", e)
                 # Don't try _full_round too — if streaming failed (SSL/network),
                 # full round will also fail and waste another 10+ seconds.
                 user_msg = messages[-1].get("content", "") if messages else ""
-                return _get_offline_response(user_msg), [], []
+                msg = _get_offline_response(user_msg)
+                yield _ev("token", text=msg)
+                return msg, []
         text, tool_calls = _full_round(messages, use_tools=True)
-        return text, tool_calls, []
+        if text:
+            yield _ev("token", text=text)
+        return text, tool_calls
 
     # No AI backend available — return offline message
     user_msg = messages[-1].get("content", "") if messages else ""
     log.info("No AI backend available, returning offline response")
-    return _get_offline_response(user_msg), [], []
+    msg = _get_offline_response(user_msg)
+    yield _ev("token", text=msg)
+    return msg, []
+
+
+def _model_error_message(error: str) -> str:
+    """Turn a raw provider/router error into an honest, user-facing message.
+
+    Kept separate from the offline fallback so real failures (API quota,
+    transient 5xx, config problems) are never disguised as "brain still
+    starting up". The full detail is always logged at ERROR level by the
+    caller before this message is produced.
+    """
+    err = (error or "").strip()
+    detail = err[:200]
+    if "No intelligence provider" in err:
+        return ("I can't reach an AI model right now — neither the cloud nor a "
+                "local model is available. Check your API key and that Ollama is running.")
+    if any(tok in err for tok in ("11434", "ConnectionPool", "Read Timeout", "Read timed out",
+                                  "Connection refused", "localhost", "ollama")):
+        return ("The local AI model (Ollama) isn't responding. "
+                "Add your Gemini API key in Settings → Account, or start Ollama and load a model.")
+    if "503" in err or "UNAVAILABLE" in err or "high demand" in err:
+        return ("The AI model is temporarily overloaded (503). "
+                "Please wait a moment and try again.")
+    if "PerDay" in err or "perday" in err.replace("_", "").replace("-", "").lower():
+        # "Wait and retry" is wrong advice for a daily cap and sends people
+        # looking for a fault that isn't there — the key is fine, the day's
+        # allowance is spent. Say which limit it was and what actually
+        # changes it.
+        return ("Your Gemini key has used up its requests for today — this is "
+                "the free tier's daily limit, not a fault. It resets at "
+                "midnight Pacific time. Until then NOVA will answer from the "
+                "local model, which is slower; a paid key in Settings → "
+                "Account removes the cap.")
+    if "429" in err or "RESOURCE_EXHAUSTED" in err or "quota" in err.lower():
+        return "The AI model quota was reached (429). Please wait and retry."
+    if "401" in err or "API key" in err or "api key" in err:
+        return "The AI API key was rejected (401). Check your GEMINI_API_KEY."
+    if "CERTIFICATE_VERIFY_FAILED" in err or "certificate verify failed" in err.lower():
+        return ("I can reach the network but can't establish a trusted HTTPS "
+                "connection to the AI provider. This usually means antivirus "
+                "HTTPS scanning or a corporate proxy is intercepting TLS. NOVA "
+                "normally handles this via the system certificate store — "
+                "check that the 'truststore' package is installed.")
+    return f"The AI model call failed: {detail}"
 
 
 def _get_offline_response(user_msg: str) -> str:
@@ -491,6 +615,76 @@ def _finish_round(messages, stop_event, streaming):
     return text, []
 
 
+def _collect_stream(router, router_msgs, system, sink=None):
+    """Run a tool-capable round, handing text to `sink` as it arrives.
+
+    `sink` is called with each chunk so the caller can put words on screen
+    while the model is still writing them. Passing None just collects, which
+    is what any caller that cannot yield needs.
+    """
+    result = None
+    for kind, payload in router.stream_complete(
+        messages=router_msgs, system=system,
+        tools=TOOL_DECLARATIONS, require_tools=True,
+    ):
+        if kind == "text":
+            if sink is not None and payload:
+                sink(payload)
+        else:
+            result = payload
+    return result or GenerateResult(error="no result from router", provider="none")
+
+
+def _router_round_streaming(router, messages):
+    """Generator form of the first round: yields token events, returns result.
+
+    The first round is where the latency lives — it is the one that has to
+    wait for the model — and it was the one round that never streamed,
+    because tool calls were believed to arrive only in a complete response.
+    They arrive in the stream too. So the words now reach the screen as they
+    are written, and the tool calls are accumulated on the way past.
+    """
+    system = _system_text(messages)
+    router_msgs = [{"role": m.get("role", "user"), "content": m.get("content", "")}
+                   for m in messages]
+    desk_trace.mark("model_call_start", mode="stream", tools=True)
+
+    pending: List[dict] = []
+    result = None
+    for kind, payload in router.stream_complete(
+        messages=router_msgs, system=system,
+        tools=TOOL_DECLARATIONS, require_tools=True,
+    ):
+        if kind == "text":
+            if payload:
+                if not pending:
+                    desk_trace.mark("first_token")
+                pending.append(payload)
+                yield _ev("token", text=payload)
+        else:
+            result = payload
+
+    result = result or GenerateResult(error="no result from router", provider="none")
+    desk_trace.mark("model_call_done", provider=result.provider, model=result.model,
+                    model_ms=int(result.latency_ms), chars=len(result.text or ""),
+                    tool_calls=len(result.tool_calls or []),
+                    err=(result.error or "")[:60])
+
+    if result.error:
+        log.error("router stream returned error: %s", result.error)
+        err_text = _model_error_message(result.error)
+        # Nothing was shown yet, so the error is the whole answer.
+        if not pending:
+            yield _ev("token", text=err_text)
+        return err_text, []
+    if not result.text and not result.tool_calls:
+        log.warning("router stream returned empty result")
+        msg = "I received your message but couldn't produce a response. Please try again."
+        yield _ev("token", text=msg)
+        return msg, []
+    return result.text or "", result.tool_calls or []
+
+
 def _router_round(router, messages, use_tools, stop_event=None, streaming=True):
     """Route a turn through the IntelligenceRouter.
     
@@ -506,25 +700,25 @@ def _router_round(router, messages, use_tools, stop_event=None, streaming=True):
     # Round with tools: non-streaming (need full response for tool calls)
     if use_tools:
         try:
-            result = router.complete(
-                messages=router_msgs,
-                system=system,
-                tools=TOOL_DECLARATIONS,
-                require_tools=True,
-            )
+            desk_trace.mark("model_call_start", mode="complete", tools=True)
+            result = _collect_stream(router, router_msgs, system, sink=None)
+            desk_trace.mark("model_call_done", provider=result.provider, model=result.model, model_ms=int(result.latency_ms), chars=len(result.text or ""), tool_calls=len(result.tool_calls or []), err=(result.error or "")[:60])
             # Emit any text as tokens so the UI shows it
             tokens = []
             if result.text:
                 tokens.append(_ev("token", text=result.text))
             if result.error:
-                log.warning("router.complete returned error: %s", result.error)
-                user_msg = messages[-1].get("content", "") if messages else ""
-                return _get_offline_response(user_msg), [], tokens
+                # Surface the real error instead of a misleading offline message.
+                log.error("router.complete returned error: %s", result.error)
+                err_text = _model_error_message(result.error)
+                return err_text, [], tokens
+            if not result.text and not result.tool_calls:
+                log.warning("router.complete returned empty result (no text, no tools)")
+                return "I received your message but couldn't produce a response. Please try again.", [], tokens
             return result.text or "", result.tool_calls or [], tokens
         except Exception as e:
-            log.warning("router complete failed: %s", e)
-            user_msg = messages[-1].get("content", "") if messages else ""
-            return _get_offline_response(user_msg), [], []
+            log.error("router complete failed: %s", e, exc_info=True)
+            return _model_error_message(str(e)), [], []
 
     # Text-only follow-up: streaming is fine
     if streaming:
@@ -541,12 +735,19 @@ def _router_round(router, messages, use_tools, stop_event=None, streaming=True):
                 tokens.append(_ev("token", text=chunk))
             return "".join(text_parts), [], tokens
         except Exception as e:
-            log.warning("router streaming failed; falling back to complete: %s", e)
+            log.error("router streaming failed; falling back to complete: %s", e, exc_info=True)
 
-    result = router.complete(
-        messages=router_msgs,
-        system=system,
-    )
+    try:
+        result = router.complete(
+            messages=router_msgs,
+            system=system,
+        )
+    except Exception as e:
+        log.error("router complete failed (follow-up): %s", e, exc_info=True)
+        return _model_error_message(str(e)), [], []
+    if result.error:
+        log.error("router.complete returned error (follow-up): %s", result.error)
+        return _model_error_message(result.error), [], []
     return result.text or "", [], []
 
 

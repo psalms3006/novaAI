@@ -16,12 +16,11 @@ from pathlib import Path
 from .settings import app_data_dir
 
 _LOCK = threading.Lock()
-_DIR = app_data_dir() / "projects"
-
-
 def _path() -> Path:
-    _DIR.mkdir(parents=True, exist_ok=True)
-    return _DIR / "projects.json"
+    # Per call: the folder is the signed-in account's (see desk.settings).
+    d = app_data_dir() / "projects"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "projects.json"
 
 
 def _load() -> list:

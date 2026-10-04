@@ -40,10 +40,33 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+# ── Runtime data location ────────────────────────────────────────────────────
+# Relative paths resolve against the working directory, which for the packaged
+# app is the install directory — not writable under Program Files for a standard
+# user, and contrary to the installer's guarantee that user data never lives
+# inside the install directory.
+
+def _runtime_data_dir() -> Path:
+    """The one data directory, not a third copy of the rule.
+
+    This carried its own frozen/dev logic and ignored NOVA_DATA_DIR, so the
+    suite's sandbox did not contain it: running the tests wrote confirmation
+    records into the developer's real audit log. That was found by reading a
+    user's audit trail after an incident and seeing test fixtures in it --
+    computer_control({"action": "click", "x": 10, "y": 10}) -- interleaved
+    with the real events being investigated.
+    """
+    try:
+        import nova_paths
+        return nova_paths.data_dir()
+    except Exception:
+        return Path(".")
+
+
 # ── Config (can be overridden by nova_config.toml) ───────────────────────────
-AUDIT_FILE       = Path("nova_audit.log")
+AUDIT_FILE       = _runtime_data_dir() / "nova_audit.log"
 AUDIT_MAX_LINES  = 500   # rotate after this many entries
-COST_FILE        = Path("nova_cost.json")
+COST_FILE        = _runtime_data_dir() / "nova_cost.json"
 COST_PER_1K_IN  = 0.0   # Gemini Flash free tier
 COST_PER_1K_OUT = 0.0   # update if on paid tier
 
@@ -67,6 +90,9 @@ CONSEQUENTIAL_TOOLS: Dict[str, str] = {
 }
 
 # Actions within tools that are safe without confirmation
+#: Fallback allowlist, used only when the permission engine cannot be
+#: imported. nova_core.permissions is the source of truth; anything added
+#: here must be added there too, or the two will disagree again.
 SAFE_ACTIONS: Dict[str, set] = {
     "file_controller":  {"list", "read", "find", "info"},
     "computer_settings":{"screenshot"},
@@ -109,6 +135,7 @@ def safety_gate(
     args: dict,
     get_confirmation: Callable[[], str],
     speak_fn: Optional[Callable[[str], None]] = None,
+    trust: Optional[object] = None,
 ) -> Optional[str]:
     """
     Returns:
@@ -118,23 +145,97 @@ def safety_gate(
     get_confirmation must return the user's text response (blocking call).
     Each consequential action asks independently — no blanket pre-approval.
     """
+    action = args.get("action", "")
+
+    # Whose instruction is this, really?
+    #
+    # The caller usually does not say, so look it up. A turn that read a web
+    # page or a document is marked untrusted for its remainder, and that is
+    # the case this gate exists for.
+    if trust is None:
+        try:
+            from nova_core import trust as _trust_ctx
+            trust = _trust_ctx.current_trust()
+        except Exception:
+            trust = None
+
+    tainted = trust is not None and str(getattr(trust, "value", trust)) != "user"
+
+    if tainted:
+        # Under taint the permission engine decides, for every tool — not
+        # just the seven named below.
+        #
+        # It already returns CONFIRM for computer_control, open_app,
+        # app_control and computer_settings at UNTRUSTED trust, and that
+        # verdict used to be thrown away twice: this function returned None
+        # immediately for anything absent from CONSEQUENTIAL_TOOLS, and when
+        # it did ask the engine it asked without `trust=`, so the answer came
+        # back for Trust.USER — an ALLOW that overrode the CONFIRM the caller
+        # had obtained under taint. Synthetic keystrokes are indistinguishable
+        # from the user typing, so that was the widest way in.
+        try:
+            from nova_core import permissions as _perm
+            decision = _perm.check_tool("nova", tool_name, trust=trust, args=args)
+            if decision.effect is _perm.Effect.ALLOW:
+                return None
+            if decision.effect is _perm.Effect.DENY:
+                return f"Refused: {decision.reason}."
+            return _ask_permission(tool_name, args, get_confirmation, speak_fn)
+        except ImportError:
+            pass   # engine unreachable — fall through to the static list
+
     if tool_name not in CONSEQUENTIAL_TOOLS:
         return None  # unrestricted — go ahead
 
-    # Check if this specific action is safe
-    action = args.get("action", "")
+    # Ask the permission engine, which is the one place that decides this.
+    #
+    # SAFE_ACTIONS below is a second allowlist answering the same question,
+    # and two lists drift: this one named only "screenshot" as safe for
+    # computer_settings, so NOVA stopped to ask "should I proceed?" before
+    # reading a battery percentage — out loud, mid-conversation — while the
+    # permission engine had already decided that was fine. Defer to the
+    # engine; keep the list below only for when it cannot be reached.
+    try:
+        from nova_core import permissions as _perm
+        decision = _perm.check_tool("nova", tool_name, args=args)
+        if decision.effect is _perm.Effect.ALLOW:
+            return None
+        if decision.effect is _perm.Effect.DENY:
+            return f"Refused: {decision.reason}."
+    except Exception:
+        pass                      # fall back to the static list below
+
     safe_for_this_tool = SAFE_ACTIONS.get(tool_name, set())
     if action in safe_for_this_tool:
         return None  # read-only variant — go ahead
 
-    description = CONSEQUENTIAL_TOOLS[tool_name]
-    what = _describe_action(tool_name, args)
+    return _ask_permission(tool_name, args, get_confirmation, speak_fn)
 
-    prompt = (
-        f"I'm about to {description}. "
-        f"Specifically: {what}. "
-        f"Should I proceed? (yes/no)"
-    )
+
+def _ask_permission(
+    tool_name: str,
+    args: dict,
+    get_confirmation: Callable[[], str],
+    speak_fn: Optional[Callable[[str], None]] = None,
+) -> Optional[str]:
+    """Put the question to the user. None to proceed, a string to refuse."""
+    # Tools reached under taint are not in the consequential map, so the
+    # description has to degrade to something still readable aloud.
+    what = _describe_action(tool_name, args)
+    description = CONSEQUENTIAL_TOOLS.get(tool_name)
+
+    if description:
+        prompt = (
+            f"I'm about to {description}. "
+            f"Specifically: {what}. "
+            f"Should I proceed? (yes/no)"
+        )
+    else:
+        # Reached under taint, where the tool has no standing description.
+        # "I'm about to use computer_control. Specifically: type ..." says the
+        # same thing twice and names an internal tool; just say what happens.
+        description = what
+        prompt = f"I'm about to {what}. Should I proceed? (yes/no)"
 
     if speak_fn:
         try:
@@ -161,12 +262,45 @@ def safety_gate(
         return None  # proceed
     else:
         _log(f"DECLINED: {tool_name} — user said: {response[:40]!r}")
-        return f"Action cancelled. You said: '{response}'. I won't {description} without your explicit yes."
+        # Explicit about not retrying, for the same reason
+        # desk/live_session.py's own tool-timeout message is: from a real
+        # session, a computer_settings confirmation that got no real answer
+        # (see nova_confirm.VoiceConfirmer.speak for why) was retried by the
+        # model every ~20.5s for three-plus minutes, dropping the user's mic
+        # audio the whole time because the session never got back to
+        # processing anything else. "I won't do X without your yes" reads as
+        # a status, not an instruction not to try again.
+        if response:
+            return (f"Action cancelled. You said: '{response}'. I won't "
+                    f"{description} without your explicit yes. Do not call "
+                    f"this tool again for this request.")
+        return (f"Action cancelled — no response was heard. I won't "
+                f"{description} without your explicit yes. Do NOT call "
+                f"this tool again for this request; if it's still wanted, "
+                f"wait for the user to bring it up again themselves.")
 
 
 def _describe_action(tool_name: str, args: dict) -> str:
     """Human-readable summary of what the tool will do."""
     action = args.get("action", "")
+    # The tools reachable under taint. This question is read aloud, so it has
+    # to name what will happen rather than dumping a tool name and a JSON
+    # blob at someone who is being asked to approve it.
+    if tool_name in ("computer_control", "computer_settings", "app_control"):
+        if action in ("type", "type_text", "write"):
+            text = (args.get("text") or args.get("value") or "")[:60]
+            return f"type {text!r} into whatever window is in front"
+        if action in ("hotkey", "press"):
+            keys = args.get("keys") or args.get("key") or "?"
+            return f"press {keys}"
+        if action in ("click", "doubleClick", "rightClick"):
+            return "click where the mouse is pointing"
+        if action:
+            return f"{action.replace('_', ' ')} on this computer"
+    if tool_name == "open_app":
+        return f"open {args.get('app_name') or args.get('app') or 'an application'}"
+    if tool_name == "close_app":
+        return f"close {args.get('app_name') or args.get('app') or 'an application'}"
     if tool_name == "self_editor":
         if action == "patch":
             old = (args.get("old_code") or "")[:60]

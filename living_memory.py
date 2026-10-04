@@ -75,6 +75,46 @@ _TYPE_KEYWORDS: Dict[str, List[str]] = {
 }
 _FALLBACK_TYPE = "fact"
 
+#: Who a record with no subject is about.
+#:
+#: Every record written before memory knew about people is one of these. They
+#: were all written on a single-user machine about its owner, so attributing
+#: them to the owner is not a guess -- it is what they already meant. The
+#: alternative, leaving them unattributed, would hide them from the one person
+#: they describe the moment retrieval started filtering by subject.
+DEFAULT_SUBJECT = "owner"
+
+# ── transient observations ────────────────────────────────────────────────────
+#
+# What is on the screen right now is not a fact about the user. NOVA stored
+# this, explicitly, confirmed, at confidence 1.0:
+#
+#     "User opened setup screen, NOVA Cloud, own API key, or work offline
+#      prompt is visible"
+#
+# It was true for about four seconds. It is now a permanent, confident belief
+# about someone, sitting alongside their name and date of birth and competing
+# with them in retrieval. Screen awareness makes this failure easy to reach:
+# the model sees a window, decides it has learned something, and writes it
+# down for ever.
+_TRANSIENT_PATTERNS = [
+    re.compile(r"\bis (?:currently )?(?:visible|displayed|shown|showing|open)\b", re.I),
+    re.compile(r"\b(?:on|in) (?:the )?(?:screen|display)\b", re.I),
+    re.compile(r"\bscreen (?:shows|displays|currently)\b", re.I),
+    re.compile(r"\b(?:dialog|prompt|window|popup|modal|tab) is\b", re.I),
+    re.compile(r"\b(?:right now|at the moment|just now|at present)\b", re.I),
+    re.compile(r"\buser (?:opened|clicked|is viewing|is looking at)\b", re.I),
+    # What someone is in the middle of doing, or how they felt about one
+    # moment. Both were stored on 2026-09-30 by the conversation extractor
+    # ("The user is trying to change their location to download an app",
+    # "The user is unhappy with a situation where someone sat at the table")
+    # and then offered back as facts about them.
+    re.compile(r"\buser is (?:currently |now )?(?:trying|attempting|about|going|working|planning) to\b", re.I),
+    re.compile(r"\buser (?:is|was|feels|felt|seems|seemed) (?:a bit |very |quite )?"
+               r"(?:unhappy|upset|annoyed|angry|frustrated|irritated|tired|sad|bored|stressed|happy|excited)\b",
+               re.I),
+]
+
 # keywords that raise importance
 _HIGH_IMPORTANCE = ["remember", "important", "confirmed", "decided", "preferred",
                     "never", "always", "my name", "must", "critical", "final"]
@@ -89,6 +129,63 @@ _CLUSTER_WORDS = {
     "supabase", "sqlite", "postgres", "mysql", "mongodb", "postgresql",
     "fast", "slow", "large", "small", "new", "old",
 }
+
+
+# ── claims: "<subject> is <value>" ────────────────────────────────────────────
+#
+# Contradiction detection used to require a correction word — "actually", "no
+# longer", "now". That is how a person phrases a correction when they know
+# they are correcting something, and it is not how they usually speak. Stating
+# the same thing differently is far more common, and it was never caught:
+#
+#     "Project NOVA team's company name is OMNIEL"
+#     "Project NOVA team's company name is Omnia."
+#
+# Both were stored, both confirmed, both at confidence 1.0, and retrieval then
+# returned whichever was closest to the question. Two confident answers to one
+# question is worse than none, because nothing downstream can tell that the
+# memory is in disagreement with itself.
+#
+# So a copula sentence is read as a claim: this subject has this value. Two
+# claims about the same subject with different values contradict, whatever
+# words they are dressed in.
+_COPULA_RE = re.compile(
+    r"^(?P<subject>.{3,120}?)\s+(?:is|are|was|were)\s+(?P<value>.+)$", re.I)
+
+#: Dropped from the subject before comparing, so "my full name" and "the full
+#: name" are recognised as the same subject.
+_SUBJECT_STOP = {"the", "a", "an", "of", "my", "our", "your", "their", "its",
+                 "his", "her",
+                 # the orphan left by stripping the apostrophe out of a
+                 # possessive, so "user's full name" and "users full name"
+                 # are one subject rather than two.
+                 "s"}
+
+
+def _claim(text: str) -> Optional[tuple]:
+    """Read "<subject> is <value>" as (subject_key, value), or None.
+
+    None for most sentences, which is the point: this is deliberately narrow.
+    A copula asserts that a subject *has* a value, so a second value for the
+    same subject is a correction. Verbs like "likes" or "uses" do not work
+    that way — "I like coffee" and "I like tea" are both true — so only the
+    copula is read this way.
+
+    Subjects of fewer than two content words are rejected. "It is broken" and
+    "NOVA is slow" carry nothing specific enough to match on, and matching
+    them would supersede unrelated facts about the same single noun.
+    """
+    m = _COPULA_RE.match((text or "").strip().rstrip("."))
+    if not m:
+        return None
+    subject = re.sub(r"[^a-z0-9 ]+", " ", m.group("subject").lower())
+    words = tuple(w for w in subject.split() if w not in _SUBJECT_STOP)
+    if len(words) < 2:
+        return None
+    value = " ".join(re.sub(r"[^a-z0-9 ]+", " ", m.group("value").lower()).split())
+    if not value:
+        return None
+    return (words, value)
 
 
 class LivingMemory:
@@ -166,6 +263,16 @@ class LivingMemory:
     def is_sensitive(text: str) -> bool:
         return any(p.search(text) for p in _SECRET_PATTERNS)
 
+    @staticmethod
+    def is_transient(text: str) -> bool:
+        """Is this a passing observation rather than something durable?
+
+        Refused rather than stored quietly at low confidence, because the
+        caller is usually the model deciding it has learned something, and a
+        refusal with a reason is what stops it deciding that again.
+        """
+        return any(p.search(text) for p in _TRANSIENT_PATTERNS)
+
     # ── record ops ───────────────────────────────────────────────────────────
     def _project_of(self, text: str) -> str:
         for p in ("ORIN", "KIWI", "VYREN", "ARVO", "NOVA", "OMNIEL", "KIWI2"):
@@ -175,22 +282,117 @@ class LivingMemory:
 
     def remember(self, text: str, source: str = "explicit",
                  project: str = "", confirmed: bool = True,
-                 importance: Optional[float] = None) -> Dict[str, Any]:
-        """Explicit command — highest priority, confirmed, strongly stored."""
+                 importance: Optional[float] = None,
+                 subject_id: str = DEFAULT_SUBJECT,
+                 author_id: str = "") -> Dict[str, Any]:
+        """Explicit command — highest priority, confirmed, strongly stored.
+
+        `subject_id` is who the fact is *about*; `author_id` is who said it.
+        They are usually the same person and occasionally are not, and the
+        difference is the whole reason both exist: "Chizi prefers tea" said by
+        Samuel is a fact about Chizi on Samuel's authority, and filing it
+        under either name alone loses half of what is known.
+        """
         text = (text or "").strip()
         if not text:
             raise ValueError("nothing to remember")
         if self.is_sensitive(text):
             raise ValueError("refusing to store what looks like a secret (key/password)")
+        if self.is_transient(text):
+            raise ValueError(
+                "that describes what is happening right now, not something "
+                "durable about the user — not storing it as a permanent fact")
         return self._upsert(text, type="fact", source=source, confirmed=confirmed,
                             project=project or self._project_of(text),
                             importance=(importance if importance is not None else 0.9),
-                            explicit=True)
+                            explicit=True, subject_id=subject_id,
+                            author_id=author_id)
+
+    #: Subject NOVA's own world-knowledge research is filed under -- it is
+    #: not a fact about a person, so it does not belong under any real
+    #: subject_id, and giving it a fixed one keeps every researched topic
+    #: queryable together regardless of who asked for it.
+    RESEARCH_SUBJECT = "nova:research"
+
+    def remember_research(self, topic: str, findings: str,
+                          sources: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Store the outcome of researching *topic* as durable, retrievable
+        knowledge -- what NOVA learned about the world, not a fact about
+        the user, so this bypasses remember()'s transient/sensitive
+        checks. Those exist for personal facts ("the user is at the
+        airport right now" should not be stored as durable) and would
+        incorrectly reject research text that happens to describe a
+        current event, a person, or a topic that just sounds personal.
+
+        Calling this twice for the same topic updates the existing
+        record (via _upsert's own exact/near-duplicate matching) rather
+        than piling up near-identical entries -- researching the same
+        topic again should refresh what NOVA knows, not fork it.
+        """
+        topic = (topic or "").strip()
+        findings = (findings or "").strip()
+        if not findings:
+            raise ValueError("no findings to remember")
+        rec = self._upsert(findings, type="research", source="research",
+                           confirmed=True, project="", importance=0.7,
+                           explicit=True, subject_id=self.RESEARCH_SUBJECT,
+                           author_id="nova")
+        with self._lock:
+            rec.setdefault("meta", {})
+            rec["meta"]["topic"] = topic
+            rec["meta"]["sources"] = list(sources or [])
+            self._save()
+        return rec
+
+    #: Jaccard word-overlap between the asked-about topic and a stored
+    #: research record's own topic, below which they are not considered
+    #: the same research even though search() surfaced the record.
+    RESEARCH_MATCH_THRESHOLD = 0.4
+
+    def recall_research(self, topic: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        """Research NOVA has already done on *topic*, best first -- checked
+        before starting a new research task so the same ground is not
+        covered twice. Empty if nothing matches; the caller (the research
+        workflow) then actually researches it and calls
+        remember_research() when it's done.
+
+        search() itself is not enough here: every record gets a nonzero
+        score just from importance/recency (score += importance * 0.3,
+        and the only filter is score > 0), which is the right behaviour
+        for "give me loose context even with no real match" but the
+        wrong one for "have I already researched THIS topic" -- searching
+        an empty-of-relevance query against a single stored research
+        record for a completely unrelated topic still returned it.
+        Filtered here by comparing the asked topic's words against each
+        candidate's own stored topic (recorded verbatim in meta['topic']
+        by remember_research), not the free-text search score.
+        """
+        topic = (topic or "").strip()
+        if not topic:
+            return []
+        topic_words = set(re.findall(r"\w+", topic.lower()))
+        if not topic_words:
+            return []
+        candidates = self.search(topic, top_k=max(top_k * 3, 10), types=["research"])
+        matches = []
+        for rec in candidates:
+            stored_topic = (rec.get("meta") or {}).get("topic", "")
+            stored_words = set(re.findall(r"\w+", stored_topic.lower()))
+            if not stored_words:
+                continue
+            overlap = len(topic_words & stored_words) / len(topic_words | stored_words)
+            if overlap >= self.RESEARCH_MATCH_THRESHOLD:
+                matches.append(rec)
+        return matches[:top_k]
 
     def _upsert(self, text: str, type: str, source: str, confirmed: bool,
-                project: str, importance: float, explicit: bool) -> Dict[str, Any]:
+                project: str, importance: float, explicit: bool,
+                subject_id: str = DEFAULT_SUBJECT,
+                author_id: str = "") -> Dict[str, Any]:
+        subject_id = (subject_id or DEFAULT_SUBJECT).strip() or DEFAULT_SUBJECT
         with self._lock:
-            existing = self._find_exact(text)
+            existing = (self._find_exact(text, subject_id)
+                        or self._find_same_claim(text, subject_id))
             if existing:
                 existing["updated"] = time.time()
                 existing["access_count"] = existing.get("access_count", 0)
@@ -199,10 +401,22 @@ class LivingMemory:
                     existing["importance"] = round(importance, 3)
                 existing["type"] = existing.get("type") or type
                 self._metrics["updated"] += 1
+                # Saying something NOVA already believes is still a correction
+                # of anything that disagrees with it. Returning here without
+                # checking is how a store that already held two answers to one
+                # question kept holding them: the correct answer was present,
+                # so restating it matched and changed nothing, and the wrong
+                # answer beside it was never looked at. Found on the real
+                # store, where "the company is OMNIEL" left "the company is
+                # Omnia" standing next to it.
+                clash = self._detect_conflict(text, project, subject_id)
+                if clash is not None and clash is not existing:
+                    self._supersede(clash, text)
+                    self._metrics["superseded"] += 1
                 self._save()
                 return existing
 
-            conflict = self._detect_conflict(text, project)
+            conflict = self._detect_conflict(text, project, subject_id)
             if conflict is not None and (explicit or importance >= conflict.get("importance", 0)):
                 # supersede the old conflicting fact (version it) — self-edit
                 self._supersede(conflict, text)
@@ -212,6 +426,9 @@ class LivingMemory:
                 "id": f"mem_{uuid.uuid4().hex[:12]}",
                 "text": text[:2000],
                 "type": type,
+                #: Who this is about, and who said it.
+                "subject_id": subject_id,
+                "author_id": author_id or subject_id,
                 "importance": round(max(0.0, min(1.0, importance)), 3),
                 "confidence": 1.0 if confirmed else 0.6,
                 "source": source,
@@ -228,8 +445,12 @@ class LivingMemory:
             }
             self._records.append(rec)
             self._metrics["stored"] += 1
-            # mirror plain text into legacy FAISS semantic store (best-effort)
-            self._mirror(rec["text"])
+            # mirror plain text into legacy FAISS semantic store (best-effort).
+            # Only what is about a person: a two-thousand-character research
+            # report and "Task ... ended as COMPLETED" were mirrored there and
+            # came back in every chat as things known about the user.
+            if self.is_personal(rec):
+                self._mirror(rec["text"])
             self._save()
             return rec
 
@@ -244,13 +465,66 @@ class LivingMemory:
         except Exception:
             pass
 
-    def _find_exact(self, text: str) -> Optional[Dict[str, Any]]:
+    #: Record types that are NOVA's own work, not knowledge about a person.
+    #: Kept and searchable on purpose (recall_research, task history), but
+    #: never offered to the model as "what you know about the user".
+    NOT_PERSONAL_TYPES = ("research", "task")
+
+    @classmethod
+    def is_personal(cls, record: Dict[str, Any]) -> bool:
+        if (record or {}).get("type") in cls.NOT_PERSONAL_TYPES:
+            return False
+        return not str((record or {}).get("subject_id") or "").startswith("nova:")
+
+    TASK_SUBJECT = "nova:tasks"
+
+    def remember_task_outcome(self, text: str) -> Dict[str, Any]:
+        """How one of NOVA's tasks ended, kept so "what happened with X" has
+        an answer -- filed as NOVA's own history, not as a fact about the
+        user, which is where task_manager used to put it."""
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("nothing to record")
+        return self._upsert(text, type="task", source="system", confirmed=False,
+                            project="", importance=0.55, explicit=False,
+                            subject_id=self.TASK_SUBJECT, author_id="nova")
+
+    @staticmethod
+    def subject_of(record: Dict[str, Any]) -> str:
+        """Who a record is about, including records written before subjects
+        existed."""
+        return (record.get("subject_id") or DEFAULT_SUBJECT)
+
+    def _find_exact(self, text: str,
+                    subject_id: str = DEFAULT_SUBJECT) -> Optional[Dict[str, Any]]:
         for r in self._records:
-            if r.get("text") == text and not r.get("superseded_by"):
+            if (r.get("text") == text and not r.get("superseded_by")
+                    and self.subject_of(r) == subject_id):
                 return r
         return None
 
-    def _detect_conflict(self, text: str, project: str) -> Optional[Dict[str, Any]]:
+    def _find_same_claim(self, text: str,
+                         subject_id: str = DEFAULT_SUBJECT) -> Optional[Dict[str, Any]]:
+        """A live record asserting the very same thing, worded differently.
+
+        "…is OMNIEL" and "…is OMNIEL." are one fact, and storing them twice
+        is how a store of five memories ends up with two of them saying the
+        same thing. Exact-text matching cannot see it; the claim can.
+        """
+        claim = _claim(text)
+        if claim is None:
+            return None
+        for r in self._records:
+            if r.get("superseded_by"):
+                continue
+            if self.subject_of(r) != subject_id:
+                continue
+            if _claim(r.get("text", "")) == claim:
+                return r
+        return None
+
+    def _detect_conflict(self, text: str, project: str,
+                         subject_id: str = DEFAULT_SUBJECT) -> Optional[Dict[str, Any]]:
         """Find a live record that the new fact contradicts.
 
         Heuristic: when the new statement is a correction, contradictions are
@@ -260,6 +534,27 @@ class LivingMemory:
         from the polarity/attribute cluster). Candidates that already agree on a
         value dimension are treated as consistent and never superseded.
         """
+        # Same subject, different value: a contradiction whatever words it
+        # comes in. Checked before the correction-word path below because it
+        # needs no announcement from the speaker, and people do not announce.
+        claim = _claim(text)
+        if claim is not None:
+            subject, value = claim
+            for r in self._records:
+                if r.get("superseded_by"):
+                    continue
+                # Two people are allowed to disagree. "Samuel's favourite
+                # colour is blue" does not contradict "Chizi's favourite
+                # colour is green", and superseding across subjects would
+                # mean the last person to speak overwrote everyone else.
+                if self.subject_of(r) != subject_id:
+                    continue
+                if project and r.get("project") and project != r.get("project"):
+                    continue
+                other = _claim(r.get("text", ""))
+                if other is not None and other[0] == subject and other[1] != value:
+                    return r
+
         low = text.lower()
         is_correction = any(k in low for k in
                             ("no longer", "isn't", "is not", "not anymore",
@@ -279,6 +574,8 @@ class LivingMemory:
         best_overlap: Optional[int] = None
         for r in self._records:
             if r.get("superseded_by"):
+                continue
+            if self.subject_of(r) != subject_id:
                 continue
             if project and r.get("project") and project != r.get("project"):
                 continue
@@ -301,6 +598,19 @@ class LivingMemory:
         old["superseded_by"] = new_text[:120]
         old["updated"] = time.time()
         self._metrics["deleted"] = 0  # versioned, not deleted
+        self._unmirror([old.get("text", "")])
+
+    def _unmirror(self, texts: List[str]) -> None:
+        """Take facts that are no longer believed out of the legacy store too.
+        Superseding "Asogwara" with "Asagwara" left the old spelling there,
+        where it was still searched and offered to the model."""
+        if not self.mirror:
+            return
+        try:
+            from memory_extra import remove_memory_facts
+            remove_memory_facts([t for t in texts if t])
+        except Exception:
+            pass
 
     def forget(self, predicate: str) -> int:
         """Delete all live records matching a text/subject (explicit command)."""
@@ -315,6 +625,7 @@ class LivingMemory:
                 if low in r["text"].lower():
                     r["decay"] = {"active": True, "expires": time.time()}
                     r["confirmed"] = False
+                    self._unmirror([r["text"]])
                     n += 1
                     keep.append(r)
                 else:
@@ -346,7 +657,23 @@ class LivingMemory:
     # ── hybrid retrieval ─────────────────────────────────────────────────────
     def search(self, query: str, top_k: Optional[int] = None,
                project: Optional[str] = None,
-               types: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+               types: Optional[List[str]] = None,
+               reader_id: Optional[str] = None,
+               can_read_others: bool = True) -> List[Dict[str, Any]]:
+        """Find relevant records.
+
+        `reader_id` is who is asking. With `can_read_others=False` the search
+        is confined to what is known about that one person, which is what a
+        guest gets: "what do you know about Samuel" should not be a way to
+        read the owner's memory out of a machine by standing next to it.
+
+        The default is unrestricted, because every existing caller is NOVA
+        working on the owner's behalf and silently narrowing those would be a
+        quiet loss of memory rather than a security improvement.
+        """
+        visible = None
+        if reader_id is not None and not can_read_others:
+            visible = {reader_id}
         with self._lock:
             self._metrics["retrieval_count"] += 1
             k = top_k or self.top_k
@@ -362,6 +689,8 @@ class LivingMemory:
             now = time.time()
             for r in self._records:
                 if r.get("superseded_by") or r.get("decay", {}).get("active"):
+                    continue
+                if visible is not None and self.subject_of(r) not in visible:
                     continue
                 if project and r.get("project") and project.lower() not in r["project"].lower():
                     continue
@@ -411,6 +740,7 @@ class LivingMemory:
                       top_k: Optional[int] = None) -> str:
         results = self.search(query, top_k=top_k, project=project) if query else \
             [r for r in self._records if not r.get("superseded_by")][:self.top_k]
+        results = [r for r in results if self.is_personal(r)]
         if not results:
             return ""
         lines = []

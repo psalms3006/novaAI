@@ -23,6 +23,14 @@ BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 
+try:
+    # The planner is one of NOVA's agents: it inherits her standards and has
+    # its own temperament (nova_personality.AGENT_TEMPERAMENTS).
+    import nova_personality as _persona
+    _TEMPERAMENT = chr(10) * 2 + _persona.render("agent:planner")
+except Exception:
+    _TEMPERAMENT = ""
+
 PLANNER_PROMPT = """You are the planning module of NOVA, a personal JARVIS-class AI assistant.
 Your job: break any user goal into a sequence of steps using ONLY the tools listed below.
 
@@ -184,21 +192,84 @@ _FALLBACK_HEURISTICS: list[tuple[list[str], str, dict]] = [
 
 
 def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+    """The Gemini key NOVA runs with.
+
+    NOVA's key lives in the environment -- loaded from .env in development,
+    and put there by desk.creds from the sealed credential store in the
+    installed app. This read only config/api_keys.json, which the desktop
+    app does not use, so every plan failed with KeyError('gemini_api_key')
+    and fell back to a single keyword search.
+    """
+    import os
+    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if key:
+        return key
+    try:
+        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+            key = json.load(f).get("gemini_api_key", "")
+    except (OSError, ValueError):
+        key = ""
+    if not key:
+        raise RuntimeError("no Gemini API key is configured")
+    return key
 
 
 def _clean_json(text: str) -> str:
     return re.sub(r"```(?:json)?", "", text).strip().rstrip("`").strip()
 
 
-def create_plan(goal: str, context: str = "") -> dict:
+def prompt_for_tools(declarations: list) -> str:
+    """PLANNER_PROMPT with its tool list replaced by *declarations*.
+
+    The list written into PLANNER_PROMPT is an older NOVA's: cmd_control,
+    code_helper, send_message and more no longer exist, and a plan naming
+    them is refused step by step. Given the declarations the model is
+    actually offered (nova.TOOL_DECLARATIONS), plan with exactly those.
+    """
+    lines = []
+    for d in declarations:
+        name = d.get("name")
+        if not name or name in ("nova_task", "planner", "self_editor", "autostart"):
+            continue      # a plan must not spawn plans, edit NOVA, or change startup
+        lines.append(f"\n{name} — {str(d.get('description', '')).strip()[:220]}")
+        props = ((d.get("parameters") or {}).get("properties") or {})
+        required = set((d.get("parameters") or {}).get("required") or [])
+        for pname, spec in props.items():
+            desc = str((spec or {}).get("description", "")).strip()[:140]
+            lines.append(f"  {pname}{' (required)' if pname in required else ''}: {desc}")
+    head = PLANNER_PROMPT[:PLANNER_PROMPT.index("ABSOLUTE RULES:")]
+    tail = PLANNER_PROMPT[PLANNER_PROMPT.index("OUTPUT —"):]
+    return (head + """ABSOLUTE RULES:
+- Use ONLY the tools in the list below, with the parameter names shown. No other tool names.
+- Use web_search for ANY information retrieval, research, or current data.
+- To produce a document from research: web_search steps first, then ONE
+  generate_document step with a title and format and NO content -- it is
+  written from what the searches found.
+- NEVER invent file paths; leave path out to use the user's Documents folder.
+- Max 6 steps. Use the minimum steps needed.
+
+AVAILABLE TOOLS AND THEIR PARAMETERS:
+""" + "\n".join(lines) + """
+
+EXAMPLE:
+
+Goal: "research mechanical engineering and write me a report"
+Steps:
+  web_search        | query: "mechanical engineering overview definition history"
+  web_search        | query: "mechanical engineering applications and future trends"
+  generate_document | title: "Mechanical engineering", format: "docx"
+
+""" + tail)
+
+
+def create_plan(goal: str, context: str = "", tool_declarations: list | None = None) -> dict:
     import google.generativeai as genai
 
     genai.configure(api_key=_get_api_key())
     model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash-lite",
-        system_instruction=PLANNER_PROMPT,
+        model_name="gemini-flash-lite-latest",  # dated ids are retired; see nova-model-ids-expire
+        system_instruction=(prompt_for_tools(tool_declarations) if tool_declarations
+                            else PLANNER_PROMPT) + _TEMPERAMENT,
     )
 
     user_input = f"Goal: {goal}"
@@ -291,7 +362,7 @@ def replan(goal: str, completed_steps: list, failed_step: dict, error: str) -> d
     model_name = "gemini-2.5-flash" if num_completed > 1 else "gemini-2.5-flash-lite"
     model      = genai.GenerativeModel(
         model_name=model_name,
-        system_instruction=PLANNER_PROMPT,
+        system_instruction=PLANNER_PROMPT + _TEMPERAMENT,
     )
 
     prompt = f"""Goal: {goal}

@@ -19,3 +19,18 @@ _rest_backoff_secs: float = 0.0
 _mcp_bridge: Optional[Any] = None  # nova_mcp.bridge.MCPBridge instance, set in main()
 _living_memory: Optional[Any] = None  # living_memory.LivingMemory, set in main()
 _task_manager: Optional[Any] = None   # task_manager.TaskManager, set in main()
+
+# Heartbeat instance, so any surface can ask for missed notices.
+_heartbeat = None
+
+# Scheduled workflows and the registry that runs them. Set by
+# nova._start_ambient_intelligence so any surface can list, pause or cancel
+# what NOVA has committed to.
+_scheduler: Optional[Any] = None
+_workflow_runner: Optional[Any] = None
+
+# Record of autonomous activity, for "what have you been doing?".
+_activity: Optional[Any] = None
+
+# Restarts the voice session when the network returns after a give-up.
+_voice_supervisor: Optional[Any] = None

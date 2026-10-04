@@ -15,6 +15,18 @@ env/
 # Environment Variables
 .env
 .env.*
+# ...but the templates are documentation, not configuration. Both were
+# swept up by the line above, so a clean checkout had neither the
+# example env nor the test that checks it can pass.
+!.env.template
+!**/.env.example
+
+# API keys / credentials (NEVER commit)
+config/api_keys.json
+api_keys.json
+byok.bin
+*.key
+*.pem
 
 # IDE
 .vscode/
@@ -71,6 +83,11 @@ models/
 # Audio
 # =========================
 *.wav
+# ...except the speaker fixtures. Four two-second clips, 250 KB, and
+# without them the only end-to-end check on the numpy Kaldi front end
+# cannot run -- it would skip, and a skip reads as a pass.
+!tests/fixtures/voices/*.wav
+!tests/fixtures/voice/*.wav
 *.mp3
 *.flac
 
@@ -90,6 +107,20 @@ memory_meta.json
 memory_texts.json
 data/nova_audit.ndjson
 data/trust_preferences.json
+# The audit log is written to the repo root, not data/, despite the
+# ignore rule above naming data/nova_audit.ndjson -- a real path
+# mismatch, out of scope to chase down here, but both locations need to
+# be ignored or every PyInstaller build reports a dirty tree over a
+# runtime log, not a source change.
+/nova_audit.ndjson
+/workflows.json
+
+# =========================
+# Claude Code session state (this tool's own working directories, not
+# NOVA source)
+# =========================
+.claude/
+.claude-flow/
 
 # =========================
 # Temporary / Backup
@@ -131,3 +162,50 @@ env/
 
 # PyInstaller
 *.spec
+# NOVA Cloud local development data (database, dev keys, traffic scripts)
+.devcloud/
+
+# PyInstaller alternate build paths used when dist/ is locked by a running app
+dist_build/
+build_tmp/
+dist_v2/
+build_tmp2/
+
+# Archived dead/duplicate modules (kept out of builds; see archive/README.md)
+archive/
+
+# Build output from versioned build attempts. Generated, never source.
+build_v*/
+dist_v*/
+build_voice/
+
+# PyInstaller's --distpath staging directory. Not covered by dist/ or dist_v*/,
+# so `git add -A` would have staged 3,518 files and 525 MB of build output,
+# 207 MB of it DLLs that no other rule here excludes.
+dist_stage/
+
+# =========================
+# Runtime state written by a dev run
+# =========================
+# A dev run keeps NOVA's data in the working directory, which for this
+# repository is the repository. These are one user's memories, goals and
+# tasks -- not source, and not something a fresh clone should start life
+# already believing.
+living_memory.json
+goals.json
+nova_tasks.json
+nova_tasks_aios.json
+nova_cost.json
+# Ad-hoc captures from vision testing.
+screenshot_*.png
+
+# NOVA UI (React, desk/ui): dependencies are installed, never committed.
+# Its build output (desk/static/ui) IS committed, so a source checkout and the
+# PyInstaller bundle run without Node.
+desk/ui/node_modules/
+
+# Browser-automation screenshots and snapshots from local UI testing.
+.playwright-mcp/
+desk/ui/tsconfig.tsbuildinfo
+memory_texts.before-cleanup.*.json
+/knowledge/

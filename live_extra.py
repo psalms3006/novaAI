@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import threading
 import time
 import traceback
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 import numpy as np
+
+import nova_voice
 import sounddevice as sd
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -100,6 +104,7 @@ class NOVALive:
         self._has_greeted    = False
         self._last_speak_end = 0.0
         self._play_q         = None
+        self._gate           = None
         self._barge_in_pending = False
         # Diagnostic counters — stage 0: did __init__ even reach here?
         self._diag_mic_chunks_sent   = 0
@@ -282,17 +287,19 @@ class NOVALive:
             _diag("MIC", "🔴 ABORT: out_queue is None — cannot start mic capture")
             raise RuntimeError("out_queue not initialized")
 
-        _silence_chunk: bytes = bytes(CHUNK_SIZE * 2)  # 16-bit = 2 bytes/sample
         _cb_count = {"n": 0, "dropped": 0}
         _rms_window = {"sum": 0.0, "n": 0, "max": 0.0}
-        # Barge-in detection: sustained speech while NOVA is talking.
-        _BARGE_IN_RMS    = 350.0     # int16 RMS above this counts as "speech"
-        _BARGE_IN_CHUNKS = 2         # consecutive loud chunks before interrupting
-        _speech_runs = {"n": 0}
 
         def _request_barge_in() -> None:
             if self._loop is not None:
                 self._loop.call_soon_threadsafe(self._barge_in)
+
+        # Listening policy lives in nova_voice so the terminal and the desktop
+        # cannot drift apart. The thresholds below are the ones this file used
+        # to define inline; they now have one home.
+        self._gate = nova_voice.VoiceGate(
+            chunk_samples=CHUNK_SIZE, on_barge_in=_request_barge_in,
+        )
 
         def _callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
             _cb_count["n"] += 1
@@ -302,40 +309,21 @@ class NOVALive:
                 _diag("MIC", f"⚠️ PortAudio status flag on callback #{_cb_count['n']}: {status} "
                               f"(input_overflow means chunks were dropped by the OS before we ever saw them)")
 
-            with self._speaking_lock:
-                speaking = self._is_speaking
-                too_soon = (time.time() - self._last_speak_end) < 0.25
+            # nova_voice.VoiceGate decides what actually goes on the wire.
+            payload = self._gate.process(np.asarray(indata).reshape(-1))
+            data = {"data": payload, "mime_type": "audio/pcm;rate=16000"}
+            speaking = self._gate.speaking
 
-            if speaking or too_soon:
-                # NOVA is talking. Mute by default, BUT keep an ear out: if the user
-                # starts speaking over NOVA, barge in (stop playback + send real audio
-                # so Gemini cuts off its own output too).
-                rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
-                if rms > _BARGE_IN_RMS:
-                    _speech_runs["n"] += 1
-                    if _speech_runs["n"] >= _BARGE_IN_CHUNKS:
-                        _speech_runs["n"] = 0
-                        _request_barge_in()
-                        speaking = False
-                        self._diag_mic_chunks_sent += 1
-                        data = {"data": indata.tobytes(), "mime_type": "audio/pcm;rate=16000"}
-                    else:
-                        self._diag_mic_chunks_muted += 1
-                        data = {"data": _silence_chunk, "mime_type": "audio/pcm;rate=16000"}
-                else:
-                    _speech_runs["n"] = 0
-                    self._diag_mic_chunks_muted += 1
-                    # Send silence to keep Gemini WS alive (prevents 1011 keepalive timeout)
-                    data = {"data": _silence_chunk, "mime_type": "audio/pcm;rate=16000"}
-            else:
+            # Keep the signal diagnostics that made mic problems debuggable:
+            # they report on the audio actually being transmitted.
+            if not speaking:
                 self._diag_mic_chunks_sent += 1
-                data = {"data": indata.tobytes(), "mime_type": "audio/pcm;rate=16000"}
-                # RMS of the REAL (non-muted) samples actually being sent — tests
-                # whether the mic is capturing usable signal at all.
                 rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
                 _rms_window["sum"] += rms
                 _rms_window["n"] += 1
                 _rms_window["max"] = max(_rms_window["max"], rms)
+            else:
+                self._diag_mic_chunks_muted += 1
 
             if _cb_count["n"] == 1:
                 _diag("MIC", f"first callback fired — frames={frames}, dtype={indata.dtype}, "
@@ -402,10 +390,16 @@ class NOVALive:
                     if response is None:
                         _diag("RECV", "got None response object — skipping")
                         continue
-                    if response.data and self.audio_in_queue is not None:
-                        self._diag_ws_bytes_in += len(response.data)
-                        self._set_speaking(True)
-                        self.audio_in_queue.put_nowait(response.data)
+                    if response.server_content is not None and self.audio_in_queue is not None:
+                        _sc = response.server_content
+                        _mt = getattr(_sc, "model_turn", None)
+                        _parts = getattr(_mt, "parts", None) or []
+                        for _part in _parts:
+                            _inline = getattr(_part, "inline_data", None)
+                            if _inline is not None and getattr(_inline, "data", None):
+                                self._diag_ws_bytes_in += len(_inline.data)
+                                self._set_speaking(True)
+                                self.audio_in_queue.put_nowait(_inline.data)
                     if response.server_content:
                         sc = response.server_content
                         if sc and sc.output_transcription and sc.output_transcription.text:
@@ -510,6 +504,16 @@ class NOVALive:
                     if chunk is None:
                         break
                     try:
+                        # Tell the shared voice policy what the room is about
+                        # to hear. Without this the echo canceller in
+                        # nova_voice has no reference to cancel against, and
+                        # the terminal falls back to a plain loudness test —
+                        # the exact behaviour that made the desktop interrupt
+                        # itself. Both surfaces run one policy; both have to
+                        # feed it.
+                        gate = self._gate
+                        if gate is not None:
+                            gate.reference(chunk, RECEIVE_SAMPLE_RATE)
                         stream.write(chunk)
                         self._diag_play_chunks += 1
                         if self._diag_play_chunks == 1:
@@ -776,8 +780,11 @@ def _load_whisper_async() -> None:
         return
     try:
         from faster_whisper import WhisperModel
-    except ImportError:
-        log.error("faster-whisper failed to import at load time — STT unavailable.")
+    except ImportError as e:
+        # Name the cause: this read only "failed to import", which hid that the
+        # packaged app had excluded one of its dependencies (av).
+        log.error("faster-whisper failed to import at load time — STT unavailable (%s: %s).",
+                  type(e).__name__, e)
         _stt_loaded.set()
         return
     try:
@@ -815,7 +822,19 @@ OFFLINE_MODELS = ["tinyllama", "llama3.2", "phi3", "mistral"]
 OFFLINE_TIMEOUTS = {"tinyllama": 15, "llama3.2": 30, "phi3": 30, "mistral": 45}
 
 # ZIM/Wikipedia paths
-OFFLINE_MAPS_PATH = os.path.expanduser("~/project-nova/data/maps")
+def _maps_data_path() -> str:
+    """Offline map data location — see _zim_data_path for why this is derived."""
+    if getattr(sys, "frozen", False):
+        base = os.getenv("APPDATA")
+        root = Path(base) / "NOVA" if base else Path.home() / ".nova"
+        return str(root / "data" / "maps")
+    override = os.getenv("NOVA_MAPS_DIR", "").strip()
+    if override:
+        return override
+    return str(Path(__file__).resolve().parent / "data" / "maps")
+
+
+OFFLINE_MAPS_PATH = _maps_data_path()
 
 # Tool declarations for Ollama (must match Ollama's expected format)
 OLLAMA_TOOL_FORMAT = {

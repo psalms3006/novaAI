@@ -1,0 +1,368 @@
+# -*- mode: python ; coding: utf-8 -*-
+"""PyInstaller spec for the NOVA Desktop application (Windows).
+
+Produces dist/NOVADesktop/ — a self-contained folder whose NOVA.exe boots the
+full NOVA intelligence stack (nova.py) plus the WebView2 SPA shell.
+
+Build:  python -m PyInstaller packaging/nova_desktop.spec --noconfirm --clean
+"""
+import os
+import sys
+from PyInstaller.utils.hooks import collect_submodules  # kept for future use if needed
+
+block_cipher = None
+ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
+
+
+def _build_stamp():
+    """Record which commit this bundle was cut from.
+
+    The previous build matched no commit at all: its copy of
+    desk/static/app.js hashed to something that appears in no revision,
+    because it was built from a dirty working tree. "What is in the EXE" then
+    has no answer, and a packaged smoke test can pass against code that was
+    never committed.
+
+    Written into the bundle so the question is always answerable from the
+    artifact itself, and so a test can compare it against HEAD.
+    """
+    import json
+    import subprocess
+    import time
+
+    def _git(*args, default="unknown"):
+        try:
+            out = subprocess.run(
+                ["git", *args], cwd=ROOT, capture_output=True, text=True, timeout=15,
+            )
+            return out.stdout.strip() or default
+        except Exception:
+            return default
+
+    # Not _git(): a clean tree prints nothing, and an empty result is the
+    # answer here rather than a failure to be defaulted away.
+    try:
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=ROOT,
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+    except Exception:
+        dirty = "?"
+    stamp = {
+        "commit": _git("rev-parse", "HEAD"),
+        "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
+        "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "clean_tree": dirty == "",
+        "dirty_files": [ln[3:] for ln in dirty.splitlines()[:20]] if dirty else [],
+    }
+    path = os.path.join(ROOT, "build", "BUILDINFO.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(stamp, handle, indent=2)
+    if not stamp["clean_tree"]:
+        print("WARNING: building from a dirty tree; this bundle will not "
+              "correspond to any commit.")
+    return path
+
+
+def _gmail_discovery():
+    """The single discovery document the Gmail connector needs, if present."""
+    try:
+        import googleapiclient
+        from pathlib import Path as _P
+        doc = (_P(googleapiclient.__file__).parent / "discovery_cache"
+               / "documents" / "gmail.v1.json")
+        if doc.exists():
+            return [(str(doc), "googleapiclient/discovery_cache/documents")]
+    except Exception:
+        pass
+    return []
+
+
+def _silero_vad():
+    """The speech detector's model. Required: without it the packaged voice
+    gate reacts to loudness instead of speech, so a missing file fails the
+    build rather than shipping that."""
+    import importlib.util
+    spec = importlib.util.find_spec("faster_whisper")
+    for loc in (spec.submodule_search_locations or []) if spec else []:
+        f = os.path.join(loc, "assets", "silero_vad_v6.onnx")
+        if os.path.isfile(f):
+            return [(f, "faster_whisper/assets")]
+    raise SystemExit("silero_vad_v6.onnx not found: install faster-whisper "
+                     "before building, or NOVA ships reacting to noise")
+
+
+_buildinfo = _build_stamp()
+
+# Auto-detect Python shared library
+_python_dll = os.path.join(os.path.dirname(sys.executable), "python311.dll")
+if not os.path.exists(_python_dll):
+    # Try uv-managed Python
+    _python_dll = r'C:\Users\Lenovo\AppData\Roaming\uv\python\cpython-3.11-windows-x86_64-none\python311.dll'
+_binaries = []
+if os.path.exists(_python_dll):
+    _binaries = [(_python_dll, '.')]
+
+hidden = [
+    # web stack
+    "flask", "flask.json", "jinja2", "werkzeug", "itsdangerous", "click",
+    "requests", "urllib3",
+    # TLS trust via the OS certificate store — without this, HTTPS fails on any
+    # machine with antivirus HTTPS scanning or a corporate TLS proxy.
+    "nova_tls", "truststore", "truststore._api", "truststore._windows",
+    # one shared voice model + Core-owned proactive speech
+    "nova_voice", "nova_core_voice", "nova_heartbeat",
+    # The console surface over that same voice session. Imported inside a
+    # function in nova.py (so the desktop never pays for it), which means
+    # static analysis cannot see it and the packaged app would fail the
+    # moment anything reached the terminal path.
+    "terminal_voice",
+    # account identity, cross-platform secret storage and telemetry. keyring
+    # resolves its backend at runtime, so the platform backends have to be
+    # named explicitly or the packaged app silently falls back to the file
+    # store even where a real keystore exists.
+    "nova_account", "nova_secure_store",
+    # Runtime spine + document library. onnxruntime is ~15 MB and lets the
+    # packaged app run the same embedding model that previously needed torch
+    # (~2 GB) and was therefore excluded, degrading semantic search to
+    # keywords in the EXE only. The model itself is downloaded to the user's
+    # data directory, not bundled.
+    "nova_core", "nova_core.permissions", "nova_core.trust",
+    "nova_core.rag", "nova_core.rag.parsers", "nova_core.rag.chunking",
+    "nova_core.rag.embeddings", "nova_core.rag.store",
+    "nova_core.rag.library", "nova_core.rag.api",
+    "onnxruntime", "tokenizers",
+    # Gmail, read-only. googleapiclient resolves services dynamically, so
+    # none of this is visible to a static scan.
+    "googleapiclient", "googleapiclient.discovery",
+    "googleapiclient.discovery_cache",
+    "googleapiclient.discovery_cache.base",
+    "google_auth_oauthlib", "google_auth_oauthlib.flow",
+    "google.oauth2", "google.oauth2.credentials", "google.auth",
+    "google.auth.transport.requests",
+    # Single-file modules reached by function-local imports in nova.py.
+    "nova_paths", "nova_proactive", "nova_scheduler", "nova_activity",
+    "integrations", "integrations.accounts", "integrations.gmail",
+    "integrations.email_importance",
+    "pypdf", "docx", "openpyxl", "pptx",
+    "keyring", "keyring.backends", "keyring.backends.Windows",
+    "keyring.backends.macOS", "keyring.backends.SecretService",
+    "keyring.backends.chainer", "keyring.backends.fail",
+    "keyring.backends.null",
+    "_ssl", "ssl",
+    # websocket support (Live voice)
+    "flask_sock", "simple_websocket",
+    # GUI shell (pywebview -> WebView2 via .NET)
+    "webview", "webview.platforms.winforms", "webview.platforms.edgechromium",
+    "clr", "pythonnet",
+    # audio / stt
+    "sounddevice",
+    "faster_whisper", "ctranslate2", "tokenizers", "huggingface_hub",
+    # tts (pyttsx3 SAPI5 driver)
+    "pyttsx3", "pyttsx3.drivers", "pyttsx3.drivers.sapi5", "comtypes",
+    # vision / math
+    "PIL", "numpy",
+    # gemini SDK (live + chat)
+    "google.genai", "google.genai.types",
+    "grpc", "proto",
+    # nova_intelligence package
+    "nova_intelligence", "nova_intelligence.connectivity",
+    "nova_intelligence.provider", "nova_intelligence.ollama_provider",
+    "nova_intelligence.gemini_provider", "nova_intelligence.router",
+    "nova_intelligence.local_model_manager", "nova_intelligence.local_runtime",
+    "nova_intelligence.offline_knowledge", "nova_intelligence.voice_provider",
+    # desk modules
+    "desk", "desk.bridge", "desk.chat", "desk.voice", "desk.store",
+    "desk.settings", "desk.confirm", "desk.projects", "desk.live_session",
+    "desk.win_overlay", "desk.creds", "desk.skills_api", "desk.offline_model",
+    "desk.knowledge_api",
+    # Ambient screen awareness. mss resolves its platform backend at import
+    # time, so naming it here is what stops the packaged build from reporting
+    # "screen sharing unavailable" on a machine where it works fine in source.
+    "desk.screen_share", "mss", "mss.windows", "mss.base",
+    # Document generation. These are imported lazily inside the writers, so
+    # static analysis does not see them and the packaged app would report
+    # "a required library is missing" on a machine where it is not.
+    "actions.generate_document", "docx", "reportlab",
+    "reportlab.platypus", "reportlab.lib.styles", "reportlab.lib.pagesizes",
+    "openpyxl", "pptx",
+    # In-application control. pywinauto is imported inside the functions that
+    # use it, so static analysis never sees it and the packaged app would say
+    # "UI automation is unavailable on this machine" while working fine from
+    # source. The UIA backend reaches Windows through comtypes, which builds
+    # its COM wrappers into comtypes.gen at runtime.
+    "pywinauto", "pywinauto.keyboard", "pywinauto.timings",
+    "pywinauto.controls", "pywinauto.controls.uia_controls",
+    "pywinauto.uia_defines", "pywinauto.uia_element_info",
+    "comtypes.client", "comtypes.gen", "comtypes.stream",
+    # mind map (ES modules served as static files, not imported by Python)
+    # core modules
+    "core", "core.event_bus", "core.boot", "core.verification_engine",
+    # orchestrator modules (used by desk.chat for trust-verified tool execution)
+    "orchestrator", "orchestrator.orchestrator", "orchestrator.plan",
+    # capability registry
+    "capabilities", "capabilities.registry", "capabilities.contracts",
+    # search + offline knowledge — both resolved via importlib at call time,
+    # so static analysis misses them
+    "ddgs", "duckduckgo_search", "libzim",
+    # Imported inside functions: fetch_url's YouTube transcripts, and the
+    # research report's page count of the PDF it made.
+    "youtube_transcript_api", "pypdf",
+    # misc runtime
+    "psutil", "sqlite3",
+]
+
+# Tool modules and subsystems that are resolved dynamically (importlib /
+# function-local imports), so PyInstaller's static analysis cannot see them.
+# Without this, actions.vision, actions.file_processor, core.execution_engine
+# and the memory.* layers were simply absent from the build and the tools
+# reported themselves as missing at runtime.
+for _pkg in ("actions", "capabilities", "core", "orchestrator", "memory",
+             "trust", "integrations", "tools", "agent",
+             # Both are reached only by function-local imports (nova.py's
+             # identity lookup, desk/live_session.py's speaker check), and
+             # both were absent from the last build: a PYZ table-of-contents
+             # dump listed 36 nova_* modules and neither of these.
+             "nova_identity", "nova_self",
+             # Not yet reached from nova.py -- the extension system is built
+             # but not wired in. Listed so the first build after it is wired
+             # carries it, rather than the app reporting it missing on a
+             # machine where it works from source.
+             "nova_extensions",
+             # Self-extending skills, deferred tools, hooks and error classes:
+             # reached through try/except and function-local imports.
+             "nova_skills", "nova_tools", "nova_core", "nova_learning"):
+    try:
+        hidden += [m for m in collect_submodules(_pkg)
+                   if not m.endswith(("._init_", ".__main__", "._smoke_test"))]
+    except Exception:
+        pass
+# Only submodules that actually exist in the installed google-genai. Listing
+# names that do not exist made PyInstaller emit "ERROR: Hidden import not
+# found" for each, which hid real build failures in the noise.
+hidden += [
+    "google.genai", "google.genai.types", "google.genai._api_client",
+    "google.genai._common",
+    "google.genai.live", "google.genai.models",
+    "google.genai.files", "google.genai.caches", "google.genai.batches",
+    "google.genai.tokens",
+    # legacy SDK — still imported lazily by actions/dev_agent.py, agent/executor.py
+    # and agent/planner.py, so it has to be collected for those paths to work.
+    "google.generativeai", "google.generativeai.models",
+]
+
+a = Analysis(
+    [os.path.join(ROOT, "nova_desktop_app.py")],
+    pathex=[ROOT],
+    binaries=_binaries,    datas=[
+        # the SPA + vendored js/css
+        (os.path.join(ROOT, "desk", "static"), "desk/static"),
+        # which commit this bundle came from — see _build_stamp above
+        (_buildinfo, "."),
+        # Gmail's discovery document. Adding it here is not enough on its
+        # own -- see the a.datas filter below, which is what actually keeps
+        # the other 579 out.
+        *_gmail_discovery(),
+        # The speech detector's model (Silero VAD, ~2 MB, shipped inside
+        # faster-whisper). nova_voice._find_vad_model looks for it here.
+        *_silero_vad(),
+        # NOTE: nova_embedder is deliberately NOT bundled. Loading it needs
+        # sentence-transformers, which needs torch + transformers — all three
+        # are excluded below to keep the installer near 200 MB rather than
+        # several GB. Shipping the 90 MB model without its runtime added dead
+        # weight to every download and could never load. Memory still works in
+        # the packaged app: facts persist, and retrieval falls back to the
+        # lexical search in memory_extra._lexical_search / living_memory.search.
+        # To re-enable semantic search, drop torch/transformers from `excludes`,
+        # add "sentence_transformers" to `hidden`, and restore the line below.
+        # (os.path.join(ROOT, "nova_embedder"), "nova_embedder"),
+        # The second element is the destination DIRECTORY, not a filename.
+        # Naming the file there produced _internal/nova_config.toml/ as a
+        # folder with the file inside it, so the config loader -- which quite
+        # correctly tests is_file() -- skipped it and the packaged app ran on
+        # defaults for every setting the file exists to control. It only
+        # looked fine in development because the working directory was the
+        # repo, which has a real nova_config.toml in it.
+        # first-run key template (users copy it next to NOVA.exe as ".env")
+        (os.path.join(ROOT, ".env.template"), "."),
+        # runtime config template (model selection etc.) — no secrets inside
+        (os.path.join(ROOT, "nova_config.toml"), "."),
+        # The release-signing PUBLIC key (tools/release.py keygen). Updates
+        # are verified against it; an empty file means updates are off.
+        (os.path.join(ROOT, "packaging", "update_public_key.txt"), "."),
+    ],
+    hiddenimports=hidden,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        "torch", "torchvision", "torchaudio",       # not required by faster-whisper
+        "matplotlib", "IPython", "pytest", "tkinter",
+        "PyQt5", "PySide2", "PySide6",
+        # onnxruntime is NOT excluded: it is listed in `hidden` above, for the
+        # documented reason that it runs the real embedding model in the
+        # packaged app. Naming it here as well quietly won -- excludes beat
+        # hidden imports -- so the EXE shipped with semantic search degraded
+        # to keyword matching, which is exactly what the hidden import was
+        # added to prevent.
+        "scipy", "sklearn", "transformers", "tensorflow",
+        # NOT "av": faster_whisper/audio.py imports it at the top, so excluding
+        # it switched off offline speech recognition in every EXE.
+        "librosa", "soundfile", "numba",
+        "playwright",
+        # NOT "starlette": mcp/__init__ imports fastmcp, which imports it, so
+        # excluding it switched off every MCP tool. tests/test_packaging_spec.py
+        # runs the app's imports with this list blocked.
+        "uvicorn", "gunicorn",
+        # NOTE: pydantic is REQUIRED by google.genai v2.x — must NOT be excluded.
+        "rich", "pygments", "orjson",
+    ],
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+# Drop the Google API catalogue the googleapiclient hook drags in.
+#
+# hook-googleapiclient.model.py from pyinstaller-hooks-contrib collects every
+# discovery document in the package: 580 files, 95 MB, roughly a sixth of the
+# bundle. NOVA calls exactly one Google service, read-only. Naming gmail.v1
+# in `datas` does not prevent this -- the hook has already run by the time
+# Analysis finishes -- so the collection is undone here, which is the only
+# point where that is possible.
+_kept, _dropped = [], 0
+for _entry in a.datas:
+    _dest = _entry[0].replace("\\", "/")
+    if "discovery_cache/documents/" in _dest and "gmail.v1.json" not in _dest:
+        _dropped += 1
+        continue
+    _kept.append(_entry)
+a.datas = _kept
+print(f"spec: dropped {_dropped} unused Google discovery documents")
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name="NOVA",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=False,          # windowed app; logs land in %APPDATA%\NOVA
+    icon=os.path.join(ROOT, "packaging", "nova.ico") if os.path.exists(
+        os.path.join(ROOT, "packaging", "nova.ico")) else None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="NOVADesktop2",
+)

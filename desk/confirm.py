@@ -54,9 +54,22 @@ class ConfirmationStore:
                 "event": evt,
             }
         timeout = timeout if timeout is not None else self.timeout
-        evt.wait(timeout=timeout)
+        try:
+            from nova_core import cancel as _cancel
+        except Exception:
+            _cancel = None
+        deadline = time.time() + timeout
+        withdrawn = False
+        while not evt.wait(timeout=0.25):
+            if _cancel is not None and _cancel.cancelled():
+                withdrawn = True            # the request was withdrawn: stop asking
+                break
+            if time.time() >= deadline:
+                break
         with self._lock:
             rec = self._pending.pop(req_id, None)
+        if withdrawn:
+            return False, "The request was withdrawn before you answered."
         if rec is None or rec["decision"] is None:
             return None, "No confirmation received in time; action cancelled."
         return rec["decision"], rec["note"]
@@ -100,41 +113,123 @@ class ConfirmationStore:
 
 store = ConfirmationStore()
 
-# Mapping of tool names to permission categories (see desk.settings).
+# Which permission scope a tool call needs (see desk.settings). Most tools
+# need one scope; for files and the browser it depends on the action, because
+# reading and changing are separate decisions.
 TOOL_CATEGORY = {
-    "web_search": "web",
-    "browser_control": "web",
-    "fetch_url": "web",
-    "vision": "screen",
-    "screen": "screen",
-    "screen_analysis": "screen",
-    "desktop_control": "screen",
-    "computer_control": "computer",
-    "computer_settings": "computer",
-    "open_app": "computer",
-    "close_app": "computer",
-    "autostart": "computer",
-    "game_updater": "computer",
-    "wake_detector": "mic",
-    "file_controller": "files",
-    "file_processor": "files",
+    "web_search": "browser_read",
+    "fetch_url": "browser_read",
+    "browser_control": "browser_read",
+    "vision": "screen_read",
+    "screen": "screen_read",
+    "screen_analysis": "screen_read",
+    "desktop_control": "computer_control",
+    "computer_control": "computer_control",
+    "computer_settings": "computer_control",
+    "open_app": "computer_control",
+    "close_app": "computer_control",
+    "autostart": "computer_control",
+    "game_updater": "computer_control",
+    "wake_detector": "microphone",
+    "file_controller": "file_read",
+    "file_processor": "file_read",
     "self_editor": "exec",
     "run": "exec",
     "execute": "exec",
     "run_code": "exec",
     "send_message": "network",
-    "remember_fact": "memory",
-    "nova_memory": "memory",
+    # Tools that act without a scope used to run unasked whatever the person
+    # chose (the settings screen even showed them as "ask").
+    "generate_document": "file_write",
+    "research_report": "file_write",
+    "app_control": "computer_control",
+    "learn_resource": "exec",
+}
+
+#: Actions that cannot be taken back. They are asked about every time, even
+#: when their permission scope is set to Allow: "Allow computer control" means
+#: NOVA may open apps and change the volume unasked, not that she may switch
+#: the computer off. On 2026-09-30 a shutdown ran on Allow without a question.
+IRREVERSIBLE = {
+    "computer_settings": {"shutdown", "restart", "reboot", "sleep", "hibernate", "logoff",
+                          "log_off", "sign_out", "signout", "uninstall_app"},
+    "computer_control": {"shutdown", "restart", "reboot", "sleep", "hibernate", "logoff",
+                         "log_off", "sign_out", "signout"},
+    "desktop_control": {"shutdown", "restart", "sleep", "logoff"},
+    "file_controller": {"delete", "remove", "rmdir", "delete_folder", "empty_trash"},
+    "self_editor": {"apply"},
 }
 
 
-def _permission_for(tool_name: str) -> str:
-    """allow | ask | deny — decided by the per-category permission settings."""
+def irreversible(tool_name: str, args: dict | None) -> bool:
+    action = str((args or {}).get("action") or "").strip().lower()
+    return action in IRREVERSIBLE.get(tool_name, set())
+
+
+# Tools whose memory of the person is NOVA's own business: not a permission.
+_UNGATED = {"remember_fact", "nova_memory", "nova_learning", "nova_capability",
+            # The person's own conversations with NOVA.
+            "recall_conversations",
+            # Read-only mail: connecting Gmail (read-only scope) is the
+            # consent, and disconnecting it in Settings takes it back.
+            "email_search"}
+
+_FILE_READ_ACTIONS = {"list", "read", "find", "info", "search", "exists", "stat",
+                      "summarize", "summarise", "extract", "open"}
+_BROWSER_INTERACT_ACTIONS = {"close_tab", "download"}
+
+
+def scope_for(tool_name: str, args: dict | None = None) -> str:
+    """The permission scope this particular call needs ('' = none)."""
+    args = args or {}
+    action = str(args.get("action") or "").strip().lower()
+    if tool_name in _UNGATED and tool_name not in ("nova_learning", "nova_capability"):
+        return ""
+    if tool_name in ("file_controller", "file_processor"):
+        return "file_read" if (action in _FILE_READ_ACTIONS or not action) else "file_write"
+    if tool_name == "nova_learning":
+        # Studying a folder reads the person's files; asking what was learned does not.
+        return "file_read" if str(args.get("cmd") or "").lower() == "learn" else ""
+    if tool_name == "nova_capability":
+        # Running or testing a skill can send the person's content to an
+        # outside service; discovering one only searches the web.
+        cmd = str(args.get("cmd") or "").lower()
+        if cmd in ("run", "test", "adopt", "propose", "check"):
+            return "network"
+        return "browser_read" if cmd in ("discover", "read") else ""
+    if tool_name.startswith("mcp__") or tool_name in ("use_tool",):
+        return "network"               # a connected service, outside NOVA
+    if tool_name == "browser_control":
+        return "browser_interact" if action in _BROWSER_INTERACT_ACTIONS else "browser_read"
+    return TOOL_CATEGORY.get(tool_name, "")
+
+
+def tool_scopes() -> dict:
+    """tool -> every scope it can need, for the settings screen."""
+    out = {t: [s] for t, s in TOOL_CATEGORY.items()}
+    out["file_controller"] = out["file_processor"] = ["file_read", "file_write"]
+    out["browser_control"] = ["browser_read", "browser_interact"]
+    out["nova_learning"] = ["file_read"]
+    out["nova_capability"] = ["browser_read", "network"]
+    return out
+
+
+_SCOPE_WORDS = {
+    "microphone": "microphone", "screen_read": "screen", "file_read": "reading files",
+    "file_write": "changing files", "browser_read": "web", "browser_interact": "browser control",
+    "computer_control": "computer control", "exec": "running programs", "network": "network",
+}
+
+
+def _permission_for(tool_name: str, args: dict | None = None) -> str:
+    """allow | ask | deny — decided by the per-scope permission settings."""
+    scope = scope_for(tool_name, args)
+    if not scope:
+        return "allow" if tool_name in _UNGATED else "ask"
     try:
         from .settings import get as _get_settings
         perms = _get_settings("permissions", {}) or {}
-        cat = TOOL_CATEGORY.get(tool_name, "ask")
-        return perms.get(cat, "ask")
+        return perms.get(scope, "ask")
     except Exception:
         return "ask"
 
@@ -154,18 +249,23 @@ def _ui_safety_gate(tool_name: str, args: dict, get_confirmation=None, speak_fn=
     action = args.get("action", "")
     _is_consequential = bool(CONSEQUENTIAL_TOOLS.get(tool_name)) and \
         action not in SAFE_ACTIONS.get(tool_name, set())
-    perm = _permission_for(tool_name)
+    perm = _permission_for(tool_name, args)
+    scope = scope_for(tool_name, args)
     if perm == "deny":
-        _log(f"PERM: denied {tool_name} (category {TOOL_CATEGORY.get(tool_name, '?')} = deny)")
-        cat = TOOL_CATEGORY.get(tool_name, "that capability")
-        return (f"I can't do that — {cat} access is disabled in your permission "
-                f"settings. Enable it to let me help with this.")
-    if not _is_consequential:
+        _log(f"PERM: denied {tool_name} (scope {scope or '?'} = deny)")
+        what = _SCOPE_WORDS.get(scope, "that")
+        return (f"I can't do that — {what} is turned off in your permission "
+                f"settings. Turn it on to let me help with this.")
+    if perm == "allow" and not irreversible(tool_name, args):
+        if _is_consequential:
+            _log(f"PERM: auto-approved consequential {tool_name} (scope {scope} allowed)")
         return None
-    if perm == "allow":
-        _log(f"PERM: auto-approved consequential {tool_name} (category allowed)")
+    if not _is_consequential and not scope:
         return None
-    description = CONSEQUENTIAL_TOOLS[tool_name]
+    # "Ask me" means ask. With reading and changing now separate choices, a
+    # person who set "Read your files: Ask me" expects to be asked before a
+    # read, not only before the consequential actions the old gate covered.
+    description = CONSEQUENTIAL_TOOLS.get(tool_name) or         f"use {_SCOPE_WORDS.get(scope, tool_name)} ({tool_name})"
     what = _describe_action(tool_name, args)
     prompt = (
         f"NOVA wants to {description}. Specifically: {what}. "

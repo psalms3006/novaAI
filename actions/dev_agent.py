@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import json
@@ -14,7 +15,11 @@ def get_base_dir():
 
 BASE_DIR         = get_base_dir()
 API_CONFIG_PATH  = BASE_DIR / "config" / "api_keys.json"
-PROJECTS_DIR     = Path.home() / "Users" / "Lenovo" / "project-nova"
+# Path.home() / "Users" / "Lenovo" / "project-nova" resolved to
+# C:/Users/Lenovo/Users/Lenovo/project-nova — a path that exists on no machine,
+# including the one it was written on, so every generated project silently went
+# nowhere. BASE_DIR already handles the frozen case.
+PROJECTS_DIR     = Path(os.getenv("NOVA_PROJECTS_DIR") or BASE_DIR)
 MAX_FIX_ATTEMPTS = 5
 MODEL_PLANNER    = "gemini-2.5-flash"
 MODEL_WRITER     = "gemini-2.5-flash"

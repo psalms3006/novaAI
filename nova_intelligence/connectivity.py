@@ -90,9 +90,13 @@ class ConnectivityManager:
         dns_ok = self._check_dns()
         dns_latency = time.time() - t0
 
+        # Run the API reachability check independently of the raw DNS probe.
+        # The DNS probe (port 53 to 8.8.8.8) is frequently blocked even on a
+        # perfectly good connection, so a reachable API host must be able to
+        # declare the connection ONLINE on its own.
         api_ok = False
         api_latency = 0.0
-        if dns_ok and self._api_check_fn:
+        if self._api_check_fn:
             t1 = time.time()
             try:
                 api_ok = self._api_check_fn()
@@ -106,9 +110,13 @@ class ConnectivityManager:
             self._api_healthy = api_ok
             self._last_check = time.time()
 
-            if not dns_ok:
+            if api_ok:
+                # The actual model service is reachable — that is authoritative.
+                self._state = ConnectivityState.ONLINE
+            elif not dns_ok:
                 self._state = ConnectivityState.OFFLINE
-            elif self._api_check_fn and not api_ok:
+            elif self._api_check_fn:
+                # DNS works but the API host is unreachable → degraded
                 self._state = ConnectivityState.DEGRADED
             elif dns_latency > self._degraded_threshold:
                 self._state = ConnectivityState.DEGRADED
@@ -145,10 +153,33 @@ class ConnectivityManager:
     def _monitor_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                self.check_now()
+                if self._live_traffic():
+                    # A live voice stream is carrying audio both ways, which
+                    # answers "are we online?" better than any probe could.
+                    # Asking anyway costs a DNS lookup and an API round trip
+                    # on the same link the conversation is using -- measured
+                    # at six seconds for the DNS alone on a struggling
+                    # connection, taken out of the bandwidth the microphone
+                    # needed. Stay quiet and let the session have the line.
+                    self._state = ConnectivityState.ONLINE
+                    self._last_check = time.time()
+                else:
+                    self.check_now()
             except Exception as e:
                 log.warning("[CONNECTIVITY] check error: %s", e)
             self._stop.wait(timeout=self._check_interval)
+
+    def _live_traffic(self) -> bool:
+        """Is a live voice session currently streaming?
+
+        Imported lazily and defensively: connectivity sits below the desk
+        layer and must keep working when there is no desk at all.
+        """
+        try:
+            from desk.live_session import get_live_manager
+            return bool(get_live_manager().status().get("state") == "streaming")
+        except Exception:
+            return False
 
     def _check_dns(self) -> bool:
         for host in self._dns_hosts:
