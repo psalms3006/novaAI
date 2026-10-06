@@ -33,6 +33,10 @@ def client(monkeypatch):
     import nova_account
     nova_account._account = None
     monkeypatch.delenv("NOVA_CLOUD_URL", raising=False)
+    # Builds now compile the production backend in; these tests are about
+    # the local-only mode, so take that default away too.
+    import nova_version
+    monkeypatch.setattr(nova_version, "DEFAULT_CLOUD_URL", "")
 
     from desk import account_api
 
