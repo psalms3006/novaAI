@@ -2715,11 +2715,21 @@ def _start_ambient_intelligence(meta: dict):
         except Exception as e:
             log.info("[DESK] scheduled reminders unavailable: %s", e)
 
+        def _on_tick():
+            # Credentials first: a cloud install that booted offline has no
+            # Gemini key until this succeeds, and the voice supervisor's
+            # restart below would only fail again without one.
+            try:
+                if _network_healthy():
+                    from desk import creds as _creds
+                    _creds.recover_cloud_if_back()
+            except Exception as e:
+                log.info("[DESK] cloud recovery check failed: %s", e)
+            if nova_state._voice_supervisor:
+                nova_state._voice_supervisor.check()
+
         scheduler = get_scheduler()
-        scheduler.start(
-            runner, interval_seconds=60.0,
-            on_tick=(nova_state._voice_supervisor.check
-                     if nova_state._voice_supervisor else None))
+        scheduler.start(runner, interval_seconds=60.0, on_tick=_on_tick)
         nova_state._scheduler = scheduler
         nova_state._workflow_runner = runner
         pending = len([w for w in scheduler.workflows()

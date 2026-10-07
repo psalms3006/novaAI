@@ -117,8 +117,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (51):
+Commits in the last 14 days (52):
 
+- 7c1cf44 2026-10-07 Voice: a connection that dies at once is a failure; stop replaying dead resume handles
 - 780c04d 2026-10-07 Offline brain: use an installed model that fits in memory
 - d5a409f 2026-10-07 Permission gates: "no, don't go ahead" is a no; Allow doesn't cover a web page's request
 - 15fe759 2026-10-07 Deliver held proactive messages; greet with their words, not a count
@@ -158,8 +159,7 @@ Commits in the last 14 days (51):
 - 3ade886 2026-09-28 Bundle what offline speech and MCP import; say why an import failed
 - 587cec5 2026-09-28 Search personal memory in the packaged app; stop warning about a disabled MCP server
 - 340d7f7 2026-09-26 Make NOVA an orchestrator: visible, handed-off, reviewed background work
-- 8ce2a4b 2026-09-26 Plan a task submitted as a goal instead of refusing it
-- ...and 11 more
+- ...and 12 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

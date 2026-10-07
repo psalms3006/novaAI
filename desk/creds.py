@@ -569,6 +569,35 @@ def _register_router_gemini() -> None:
         pass
 
 
+def recover_cloud_if_back() -> bool:
+    """Retry NOVA Cloud if startup only fell back because it was unreachable.
+
+    resolve() runs at startup and on explicit user actions. A cloud-mode
+    install that booted without network therefore stayed on the local model,
+    with no voice, until it was restarted -- the network coming back changed
+    nothing, because nothing asked again. This is called from the
+    scheduler's tick when the network looks healthy. True if NOVA is back on
+    the cloud.
+    """
+    st = _last_status or {}
+    if not st.get("cloud_error"):
+        return False                      # never fell back; nothing to recover
+    if _get_setting("auth_mode") == "offline":
+        return False                      # the person chose offline
+    new = apply_runtime()
+    if new.get("cloud_error"):
+        return False
+    log.info("[CREDS] NOVA Cloud is reachable again; mode=%s", new.get("mode"))
+    try:
+        import time as _t
+        from desk import bridge as _br
+        _br.publish_event({"type": "connectivity", "state": "restored",
+                           "mode": new.get("mode"), "ts": _t.time()})
+    except Exception:
+        pass
+    return True
+
+
 def bootstrap() -> dict:
     """Called once at startup before nova.py reads the environment."""
     return resolve()
