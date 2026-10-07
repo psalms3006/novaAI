@@ -172,7 +172,9 @@ _UNGATED = {"remember_fact", "nova_memory", "nova_learning", "nova_capability",
             "recall_conversations",
             # Read-only mail: connecting Gmail (read-only scope) is the
             # consent, and disconnecting it in Settings takes it back.
-            "email_search"}
+            "email_search",
+            # Documents the person added to their own library, read-only.
+            "rag_search"}
 
 _FILE_READ_ACTIONS = {"list", "read", "find", "info", "search", "exists", "stat",
                       "summarize", "summarise", "extract", "open"}

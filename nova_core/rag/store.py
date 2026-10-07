@@ -83,8 +83,20 @@ class Hit:
         # locator already carries the heading for structured formats.
         if heading and heading not in where:
             where = f"{where}, {heading}" if where else heading
-        name = self.document.title or self.document.filename
-        return f"{name} ({where})" if where else name
+        # The file name first: it is what the person calls the document ("my
+        # Exam Timetable"), and the title alone ("Second Semester Examination
+        # Timetable") left NOVA unable to say which file an answer came from.
+        name = self.document.filename or self.document.title
+        title = self.document.title or ""
+        if title and title.lower() not in name.lower():
+            name = f"{name} — {title}"
+        parts = [where] if where else []
+        if self.document.added_at:
+            import time as _t
+            # When it was added, so two documents that disagree can be told
+            # apart by age ("the newer timetable says...").
+            parts.append("added " + _t.strftime("%Y-%m-%d", _t.localtime(self.document.added_at)))
+        return f"{name} ({'; '.join(parts)})" if parts else name
 
 
 _DDL = """
