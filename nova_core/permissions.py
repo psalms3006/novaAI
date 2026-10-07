@@ -308,6 +308,8 @@ TOOL_CAPABILITIES: dict[str, frozenset[Capability]] = {
     # Searching the user's own documents reads their data; adding one writes
     # to the library.
     "rag_search": _caps(C.MEMORY_READ, C.USER_DATA),
+    # Reads NOVA's own status and a hardware summary; changes nothing.
+    "capability_check": _caps(C.MEMORY_READ),
     "rag_add": _caps(C.MEMORY_WRITE, C.USER_DATA, C.FILE_READ),
     "document*": _caps(C.MEMORY_READ, C.USER_DATA),
     "knowledge*": _caps(C.MEMORY_READ),

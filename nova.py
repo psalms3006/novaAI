@@ -1137,6 +1137,24 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "capability_check",
+        "description": (
+            "Check what you can actually do right now, from live state: network and NOVA Cloud, "
+            "which models are running (and whether they can use tools), which tools are installed, "
+            "what is unavailable offline, which permissions are off, and this computer's RAM, disk "
+            "and GPU. Pass the task to get a verdict per need: CAN'T (not possible here), "
+            "SHOULDN'T (needs a permission), NOT YET (needs something installed or connected). "
+            "Use it before a multi-step task you are unsure you can finish, before saying you "
+            "can't do something, when the user asks why you can't, and for ML work (training, "
+            "fine-tuning) to see the hardware. Never guess these facts."),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "task": {"type": "STRING", "description": "Optional: what the user wants done, to assess"}
+            }
+        }
+    },
+    {
         "name": "rag_search",
         "description": (
             "Search the documents the user added to their NOVA library -- timetables, course "
@@ -2059,6 +2077,19 @@ def _execute_tool_core(tool_name: str, args: dict, meta: dict) -> str:
     if _cancel is not None and _cancel.cancelled():
         return _cancel.WITHDRAWN
 
+    # Offline, a tool that needs the internet fails at once with the reason,
+    # rather than after a network timeout with an error the model then has to
+    # interpret -- and the reply says what still works.
+    try:
+        from actions.capability_check import NEEDS_NETWORK, _connectivity
+        if tool_name in NEEDS_NETWORK and _connectivity() == "offline":
+            return (f"Can't do this right now: {NEEDS_NETWORK[tool_name]} needs the "
+                    f"internet and this computer is offline. Nothing was attempted. "
+                    f"Local files, memory, the user's documents and installed skills "
+                    f"still work; say so, and offer to do it when the connection is back.")
+    except Exception:
+        pass
+
     if tool_name == "learn_resource":
         return _execute_learn_resource(args)
     if tool_name == "nova_capability":
@@ -2281,7 +2312,7 @@ def _validate_tool_modules() -> Dict[str, bool]:
         "open_app", "close_app", "web_search", "file_controller",
         "computer_settings", "browser_control", "file_processor",
         "generate_document", "app_control", "research_report",
-        "fetch_url", "recall_conversations", "email_search", "rag_search",
+        "fetch_url", "recall_conversations", "email_search", "rag_search", "capability_check",
     ]
     available: Dict[str, bool] = {}
     if importlib.util.find_spec("actions") is None:

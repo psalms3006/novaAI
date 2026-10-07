@@ -58,6 +58,7 @@ see `offline_extra._select_pyttsx3_voice`.
 | `app_control` | Work *inside* an application that is already open: find its controls by name, click them, type in... |
 | `generate_document` | Create a real document file and save it |
 | `fetch_url` | Read one web page the user names, or a YouTube video's transcript, and get its text: 'summarise t... |
+| `capability_check` | Check what you can actually do right now, from live state: network and NOVA Cloud, which models a... |
 | `rag_search` | Search the documents the user added to their NOVA library -- timetables, course outlines, notes, ... |
 | `recall_conversations` | Search the user's past conversations with you -- typed and spoken -- by topic and date, and quote... |
 | `email_search` | Search the user's Gmail (read-only) when they ask about their mail: 'find the emails from Ada abo... |
@@ -70,7 +71,7 @@ see `offline_extra._select_pyttsx3_voice`.
 | `nova_memory` | Query or manage NOVA's living memory (living_memory) |
 | `nova_task` | Work on something in the background while the conversation continues |
 
-23 tools declared in `nova.py`'s `TOOL_DECLARATIONS`, plus whatever MCP servers extend it with at runtime (`nova_state._mcp_bridge.gemini_declarations()`).
+24 tools declared in `nova.py`'s `TOOL_DECLARATIONS`, plus whatever MCP servers extend it with at runtime (`nova_state._mcp_bridge.gemini_declarations()`).
 <!-- AUTO-END: capabilities -->
 
 ## Sub-agents
@@ -118,8 +119,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (53):
+Commits in the last 14 days (54):
 
+- 487b7ec 2026-10-07 Let chat and voice answer from the person's documents, citing the file
 - e866dbb 2026-10-07 Get the cloud back after booting offline
 - 7c1cf44 2026-10-07 Voice: a connection that dies at once is a failure; stop replaying dead resume handles
 - 780c04d 2026-10-07 Offline brain: use an installed model that fits in memory
@@ -159,8 +161,7 @@ Commits in the last 14 days (53):
 - 07d0a82 2026-09-28 Document NOVA's current architecture and the production target
 - 7bae680 2026-09-28 Fix the uninstaller's runtime error; ask about user data only when uninstalling
 - 3ade886 2026-09-28 Bundle what offline speech and MCP import; say why an import failed
-- 587cec5 2026-09-28 Search personal memory in the packaged app; stop warning about a disabled MCP server
-- ...and 13 more
+- ...and 14 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

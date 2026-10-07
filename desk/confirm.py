@@ -174,7 +174,9 @@ _UNGATED = {"remember_fact", "nova_memory", "nova_learning", "nova_capability",
             # consent, and disconnecting it in Settings takes it back.
             "email_search",
             # Documents the person added to their own library, read-only.
-            "rag_search"}
+            "rag_search",
+            # Reads NOVA's own state and this machine's hardware summary.
+            "capability_check"}
 
 _FILE_READ_ACTIONS = {"list", "read", "find", "info", "search", "exists", "stat",
                       "summarize", "summarise", "extract", "open"}
