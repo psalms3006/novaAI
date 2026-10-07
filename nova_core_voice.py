@@ -39,11 +39,10 @@ def opening_line(meta: dict | None = None) -> str:
     try:
         import nova
         pro = getattr(nova, "_proactive", None)
-        pending = getattr(pro, "pending", None) if pro is not None else None
-        if callable(pending):
-            item = pending()
-            if item:
-                parts.append(str(item))
+        # pending() is a count; reading it out would make NOVA say "2".
+        messages = getattr(pro, "pending_messages", None) if pro is not None else None
+        if callable(messages):
+            parts.extend(m for m in messages() if m)
     except Exception as e:
         log.debug("proactive pending unavailable: %s", e)
 

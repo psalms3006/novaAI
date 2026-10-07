@@ -84,13 +84,33 @@ class ProactiveAgent:
         self._lock = threading.RLock()
         self._running = False
         self._now = time.time          # seam: tests freeze and advance this
+        self._ticker: Optional[threading.Thread] = None
+        self._wake = threading.Event()
+
+    #: How often held events are reconsidered. Anything queued because NOVA
+    #: was mid-sentence, or because a MEDIUM item was inside the spacing gap,
+    #: used to wait forever: nothing ever called flush().
+    TICK_S = 5.0
 
     # ── wiring ──────────────────────────────────────────────────────────────
     def start(self) -> None:
         self._running = True
+        if self._ticker is None or not self._ticker.is_alive():
+            self._wake.clear()
+            self._ticker = threading.Thread(
+                target=self._tick_loop, name="nova-proactive", daemon=True)
+            self._ticker.start()
 
     def stop(self) -> None:
         self._running = False
+        self._wake.set()
+
+    def _tick_loop(self) -> None:
+        while self._running and not self._wake.wait(self.TICK_S):
+            try:
+                self.tick()
+            except Exception:
+                log.exception("[PROACTIVE] tick failed")
 
     def update_speak(self, speak_fn: Optional[Callable[[str], None]]) -> None:
         self.speak_fn = speak_fn
@@ -232,6 +252,35 @@ class ProactiveAgent:
                     self._queue.append(event)
         return spoken
 
+    def tick(self) -> bool:
+        """Release at most one held event, if the moment allows. True if spoken.
+
+        Unlike flush(), this keeps the spacing rule: one MEDIUM finding per
+        MIN_GAP_S. It is what the background ticker calls.
+        """
+        with self._lock:
+            if not self._queue or self._busy():
+                return False
+            ordered = sorted(self._queue, key=lambda e: (
+                Priority.rank(e.priority), e.created))
+            for event in ordered:
+                if self._is_duplicate(event):
+                    self._queue.remove(event)
+                    continue
+                if event.priority != Priority.CRITICAL and not self._gap_elapsed(event):
+                    continue
+                if self._say(event):
+                    self._queue.remove(event)
+                    return True
+                return False          # no voice right now; keep it for later
+            return False
+
     def pending(self) -> int:
         with self._lock:
             return len(self._queue)
+
+    def pending_messages(self) -> list[str]:
+        """The held messages themselves, most urgent first (not consumed)."""
+        with self._lock:
+            return [e.message for e in sorted(self._queue, key=lambda e: (
+                Priority.rank(e.priority), e.created))]
