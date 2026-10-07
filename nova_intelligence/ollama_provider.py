@@ -129,6 +129,10 @@ class OllamaProvider:
     #: always did: not running means not available.
     runtime = None
 
+    #: When the named model is not installed, switch to the best one that is.
+    #: Off for the tinyllama last-resort provider, which must stay itself.
+    auto_resolve = True
+
     def _probe_availability(self) -> bool:
         result = False
         if self.is_running():
@@ -137,6 +141,18 @@ class OllamaProvider:
                 if r.status_code == 200:
                     models = [m.get("name", "") for m in r.json().get("models", [])]
                     result = any(self._model in m for m in models)
+                    if not result and self.auto_resolve:
+                        # The configured model is absent ("qwen2.5:3b" on a
+                        # machine with qwen2.5:1.5b). Use what is installed
+                        # rather than declaring the local brain unavailable
+                        # and dropping to tinyllama, which has no tools.
+                        from nova_intelligence.local_model_manager import resolve_installed
+                        chosen = resolve_installed(self._model, models)
+                        if chosen:
+                            log.warning("[OLLAMA] %r not installed; using %r",
+                                        self._model, chosen)
+                            self._model = chosen
+                            result = True
             except Exception:
                 result = False
         elif self._can_be_started():

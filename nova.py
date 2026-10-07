@@ -3072,6 +3072,7 @@ def main() -> None:
         # startup cost.
         if "tinyllama" not in _ollama_model:
             _ollama_fallback = OllamaProvider(model="tinyllama")
+            _ollama_fallback.auto_resolve = False
             _ollama_fallback.runtime = _local_runtime
             _nova_router.register_provider("ollama-fallback", _ollama_fallback)
 

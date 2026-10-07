@@ -17,6 +17,11 @@ from nova_intelligence.local_model_manager import (
 
 @pytest.fixture
 def manager(monkeypatch):
+    # A machine with plenty of memory, unless a test says otherwise:
+    # selection is now RAM-aware, and the tests must not depend on the PC
+    # they happen to run on.
+    monkeypatch.setattr(
+        "nova_intelligence.local_model_manager.total_ram_gb", lambda: 32.0)
     return LocalModelManager()
 
 
@@ -98,3 +103,59 @@ def test_unknown_installed_model_is_still_usable(manager, monkeypatch):
 
 def test_default_model_id_is_present_in_the_catalog():
     assert any(m["id"] == DEFAULT_MODEL_ID for m in KNOWN_MODELS)
+
+
+# -- memory and the configured-but-absent default (2026-10 audit) -----------
+
+def test_a_model_too_big_for_this_machine_loses_to_one_that_fits(manager, monkeypatch):
+    """On 8 GB, mistral (recommended 8 GB) made offline replies take minutes
+    while qwen2.5:1.5b sat installed."""
+    monkeypatch.setattr(
+        "nova_intelligence.local_model_manager.total_ram_gb", lambda: 8.0)
+    _fake_installed(monkeypatch, ["mistral:latest", "qwen2.5:1.5b", "tinyllama:latest"])
+    _configured(monkeypatch, manager, "qwen2.5:3b")
+    assert manager._load_current_model() == "qwen2.5:1.5b"
+
+
+def test_a_fitting_model_beats_a_big_one_even_with_better_reasoning():
+    from nova_intelligence.local_model_manager import LocalModelManager
+    best = LocalModelManager._best_installed(
+        ["mistral:latest", "gemma2:2b"], ram_gb=8.0)
+    assert best == "gemma2:2b"
+
+
+def test_resolve_installed_does_not_need_a_substring_match(monkeypatch):
+    """'qwen2.5:3b' is not a substring of 'qwen2.5:1.5b'; that used to make
+    the local provider 'unavailable' and send every offline turn to
+    tinyllama, which cannot call tools."""
+    from nova_intelligence.local_model_manager import resolve_installed
+    monkeypatch.setattr(
+        "nova_intelligence.local_model_manager.total_ram_gb", lambda: 8.0)
+    got = resolve_installed("qwen2.5:3b",
+                            ["qwen2.5:1.5b", "tinyllama:latest", "mistral:latest"])
+    assert got == "qwen2.5:1.5b"
+    assert resolve_installed("mistral", ["mistral:latest"]) == "mistral:latest"
+    assert resolve_installed("x", []) is None
+
+
+def test_the_provider_switches_to_an_installed_model_instead_of_going_dark(monkeypatch):
+    from nova_intelligence import ollama_provider as op
+    monkeypatch.setattr(
+        "nova_intelligence.local_model_manager.total_ram_gb", lambda: 8.0)
+
+    class _R:
+        status_code = 200
+        def json(self):
+            return {"models": [{"name": "qwen2.5:1.5b"}, {"name": "tinyllama:latest"}]}
+
+    monkeypatch.setattr(op.requests, "get", lambda *a, **k: _R())
+    p = op.OllamaProvider(model="qwen2.5:3b")
+    monkeypatch.setattr(p, "is_running", lambda: True)
+    assert p._probe_availability() is True
+    assert p.model == "qwen2.5:1.5b"
+
+    last_resort = op.OllamaProvider(model="phi3:mini")
+    last_resort.auto_resolve = False
+    monkeypatch.setattr(last_resort, "is_running", lambda: True)
+    assert last_resort._probe_availability() is False
+    assert last_resort.model == "phi3:mini"

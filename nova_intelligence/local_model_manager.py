@@ -118,6 +118,32 @@ KNOWN_MODELS: List[Dict[str, Any]] = [
 DEFAULT_MODEL_ID = "qwen2.5:3b"
 
 
+def total_ram_gb() -> Optional[float]:
+    """Physical memory in GB, or None if it cannot be read."""
+    try:
+        import psutil
+        return psutil.virtual_memory().total / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def resolve_installed(model: str, installed: List[str]) -> Optional[str]:
+    """The installed model to use for `model`, or None if nothing usable.
+
+    Exact or tag-less match first ("mistral" -> "mistral:latest"); otherwise
+    the best installed model. A bare substring test used to decide this, and
+    "qwen2.5:3b" is not a substring of "qwen2.5:1.5b" -- so the local provider
+    was declared unavailable and every offline turn went to tinyllama, which
+    cannot call tools.
+    """
+    if not installed:
+        return None
+    for name in installed:
+        if name == model or name.split(":")[0] == model or model in name:
+            return name
+    return LocalModelManager._best_installed(installed)
+
+
 class LocalModelManager:
     """Manages Ollama model lifecycle and metadata."""
 
@@ -176,14 +202,25 @@ class LocalModelManager:
         return configured
 
     @staticmethod
-    def _best_installed(installed: List[str]) -> Optional[str]:
-        """Pick the most capable installed model.
+    def _best_installed(installed: List[str],
+                        ram_gb: Optional[float] = None) -> Optional[str]:
+        """Pick the most capable installed model this machine can hold.
 
         NOVA's core loop is tool calling, so a model that cannot call tools
         (tinyllama) is a last resort no matter how fast it is.
+
+        Memory comes next. Ranking by reasoning and then size alone picked
+        mistral (recommended 8 GB) on an 8 GB laptop already running a browser
+        and an antivirus: the "offline brain" then took minutes per reply or
+        failed outright, while qwen2.5:1.5b sat installed. A model whose
+        recommended RAM exceeds 75% of the machine is ranked below every model
+        that fits.
         """
         _REASONING_RANK = {"very good": 3, "good": 2, "basic": 1}
         meta_by_id = {m["id"]: m for m in KNOWN_MODELS}
+        if ram_gb is None:
+            ram_gb = total_ram_gb()
+        budget = ram_gb * 0.75 if ram_gb else None
 
         def score(name: str) -> tuple:
             meta = None
@@ -192,10 +229,13 @@ class LocalModelManager:
                     meta = m
                     break
             if meta is None:
-                # Unknown model: assume it calls tools, rank mid.
-                return (1, 2, 0.0)
+                # Unknown model: assume it calls tools and fits, rank mid.
+                return (1, 1, 2, 0.0)
+            need = float(meta.get("recommended_ram_gb", 0.0) or 0.0)
+            fits = 1 if (budget is None or need <= budget) else 0
             return (
                 1 if meta.get("tool_calling") else 0,
+                fits,
                 _REASONING_RANK.get(meta.get("reasoning", "basic"), 1),
                 float(meta.get("size_gb", 0.0)),
             )
