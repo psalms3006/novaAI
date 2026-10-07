@@ -292,8 +292,19 @@ export const PresenceScreen: React.FC = () => {
                   </div>
                   <div className="flex items-center justify-between mt-1 text-[10px] font-sans" style={{ color: theme.palette.textMuted }}>
                     <span className="truncate" title={active ? a.action : undefined}>{active ? a.action || 'running' : 'standby'}</span>
-                    {active && a.since ? <span className="font-mono shrink-0 ml-1">{fmtDuration(Date.now() / 1000 - a.since)}</span> : null}
+                    {active && a.since ? (
+                      <span className="font-mono shrink-0 ml-1">
+                        {a.steps ? `${a.step}/${a.steps} · ` : ''}{fmtDuration(Date.now() / 1000 - a.since)}
+                      </span>
+                    ) : null}
                   </div>
+                  {active && a.steps ? (
+                    // Counted stages only: no bar at all when the work cannot count.
+                    <div className="mt-1 h-0.5 rounded-full overflow-hidden" style={{ backgroundColor: theme.palette.glassBorder }}
+                         role="progressbar" aria-valuemin={0} aria-valuemax={a.steps} aria-valuenow={a.step}>
+                      <div className="h-full" style={{ width: `${Math.min(100, Math.round(((a.step || 0) / a.steps) * 100))}%`, backgroundColor: '#10b981' }} />
+                    </div>
+                  ) : null}
                   {open && (
                     <div className="mt-2 pt-1.5 border-t text-[10px] leading-relaxed animate-fade-in font-sans" style={{ borderColor: theme.palette.glassBorder, color: theme.palette.textSecondary }}>
                       {a.role}

@@ -27,7 +27,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 log = logging.getLogger("nova.agents")
 
-__all__ = ["AGENTS", "agent_for_tool", "begin", "end", "snapshot", "set_observer", "reset",
+__all__ = ["AGENTS", "agent_for_tool", "begin", "update", "end", "snapshot", "set_observer", "reset",
            "resource_for_tool", "resource_lock"]
 
 #: The roster, in display order: (id, label, what it does).
@@ -123,6 +123,8 @@ def _row(agent: str) -> Dict[str, Any]:
         "state": "running",
         "action": latest["action"],
         "task_id": latest["task_id"],
+        "step": latest.get("step", 0),
+        "steps": latest.get("steps", 0),
         "since": work[0]["since"],
         "work": [dict(w) for w in work],
     }
@@ -141,6 +143,23 @@ def begin(agent: str, action: str, *, source: str, task_id: str = "", key: str =
                         "task_id": task_id or "", "since": time.time()}
     _emit(agent)
     return token
+
+
+def update(token: str, action: str, *, step: int = 0, steps: int = 0) -> None:
+    """Say what open work is doing now, and how far through it is.
+
+    Long work (a research report runs for minutes) used to show the one line
+    it began with until it finished. step/steps are counted stages the work
+    actually reached -- never an estimate; 0 means "not countable".
+    """
+    with _lock:
+        work = _open.get(token)
+        if work is None:
+            return
+        work["action"] = (action or "")[:160]
+        work["step"], work["steps"] = int(step or 0), int(steps or 0)
+        agent = work["agent"]
+    _emit(agent)
 
 
 def end(token: str) -> None:

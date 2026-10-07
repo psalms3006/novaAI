@@ -226,3 +226,30 @@ def test_research_report_is_a_declared_permitted_background_tool():
     assert "research_report" in permissions.TOOL_CAPABILITIES
     assert confirm.scope_for("research_report", {}) == "file_write"
     assert "research_report" in live_session.NON_BLOCKING_TOOLS
+
+
+# -- the window sees each stage (2026-10 audit) -------------------------------
+
+def test_each_stage_reaches_the_agents_panel_with_counted_steps(offline, monkeypatch):
+    """A report runs for minutes; the Agents panel used to show only the line
+    it began with. Each stage now updates the research agent's row, and the
+    step counts are stages actually reached, not an estimate."""
+    import agent_activity as aa
+    aa.reset()
+    seen = []
+    aa.set_observer(lambda ev: seen.append((ev.get("state"), ev.get("action"),
+                                            ev.get("step"), ev.get("steps"))))
+    try:
+        out = rr.execute({"topic": "Trillion AI vs Zoe OS", "pages": 2, "format": "md"})
+    finally:
+        aa.set_observer(None)
+    assert out.startswith("Saved "), out
+    running = [s for s in seen if s[0] == "running"]
+    actions = [s[1] for s in running]
+    assert any("planning" in a for a in actions)
+    assert any("searching" in a for a in actions)
+    assert any("writing section 1 of" in a for a in actions)
+    counted = [s for s in running if s[3]]
+    assert counted, "no stage carried a real step count"
+    assert all(0 < step <= steps for _, _, step, steps in counted)
+    assert seen[-1][0] == "standby", "the research agent was left running"

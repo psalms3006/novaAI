@@ -34,6 +34,9 @@ export interface SystemAgent {
   action?: string;
   task_id?: string;
   since?: number | null;
+  /** Stages reached and the real total, when the work can count them (0 = not countable). */
+  step?: number;
+  steps?: number;
   /** How many pieces of work it has open. */
   busy?: number;
 }

@@ -332,9 +332,24 @@ def _pictures(queries: list, folder: Path, notes: list, entities: Optional[list]
 
 
 def build_report(topic: str, pages: int = 5, focus: str = "", images: bool = True,
-                 workdir: Optional[Path] = None, progress: Optional[Callable[[str], None]] = None) -> dict:
-    """Plan, research, write. Returns {"title", "markdown", "words", "sources", "figures", "notes"}."""
-    say = progress or (lambda m: log.info("research_report: %s", m))
+                 workdir: Optional[Path] = None, progress: Optional[Callable[..., None]] = None) -> dict:
+    """Plan, research, write. Returns {"title", "markdown", "words", "sources", "figures", "notes"}.
+
+    progress(message, step, steps) is told each stage as it starts. steps is
+    0 until the plan says how many sections there are; after that it is the
+    real count: plan + search + read + one per section + save.
+    """
+    _counted = {"step": 0, "steps": 0}
+
+    def say(message: str) -> None:
+        log.info("research_report: %s", message)
+        if progress is None:
+            return
+        _counted["step"] += 1
+        try:
+            progress(message, _counted["step"], _counted["steps"])
+        except TypeError:
+            progress(message)                      # older one-argument callers
     notes: list = []
     workdir = workdir or Path(tempfile.mkdtemp(prefix="nova_report_"))
     target_words = pages * WORDS_PER_PAGE
@@ -342,6 +357,7 @@ def build_report(topic: str, pages: int = 5, focus: str = "", images: bool = Tru
     say("planning the report")
     plan = _plan(topic, focus, pages)
     title = (plan.get("title") or topic).strip()
+    _counted["steps"] = 3 + len(plan["sections"]) + 1
 
     say(f"searching {len(plan['queries'])} angles")
     sources = _gather(plan["queries"], notes, plan.get("entities"))
@@ -365,7 +381,7 @@ def build_report(topic: str, pages: int = 5, focus: str = "", images: bool = Tru
                                               sources=block)).strip()
         text = _drop_repeated_heading(text, sec["heading"])
         if _words(text) < per_section * 0.85:
-            say(f"expanding section {i}")
+            log.info("research_report: expanding section %d", i)
             longer = generate(EXPAND_PROMPT.format(title=title, have=_words(text),
                                                    want=int(per_section * 1.3),
                                                    heading=sec["heading"], text=text,
@@ -390,7 +406,8 @@ def build_report(topic: str, pages: int = 5, focus: str = "", images: bool = Tru
     for i, s in enumerate(sources, 1):
         md.append(f"{i}. {s.get('title') or s['url']} -- {s['url']}")
     return {"title": title, "markdown": "\n".join(md), "words": sum(_words(b) for b in bodies),
-            "sources": len(sources), "cited": len(used), "figures": len(figures), "notes": notes}
+            "sources": len(sources), "cited": len(used), "figures": len(figures), "notes": notes,
+            "_steps": _counted["steps"]}
 
 
 def _pdf_pages(path: Path) -> Optional[int]:
@@ -413,11 +430,29 @@ def execute(args: dict) -> str:
     if fmt not in ("docx", "pdf", "md"):
         fmt = "docx"
     want_images = str(args.get("images", True)).lower() not in ("false", "0", "no")
+    # The Agents panel shows each stage as it starts, counted rather than
+    # guessed; before, a multi-minute report showed only the line it began with.
     try:
-        rep = build_report(topic, pages, (args.get("focus") or "").strip(), want_images)
+        import agent_activity as _aa
+        token = _aa.begin("research", f"Researching: {topic[:80]}", source="research_report")
+    except Exception:
+        _aa, token = None, ""
+
+    def _progress(message, step=0, steps=0):
+        if _aa is not None:
+            _aa.update(token, f"{topic[:60]}: {message}", step=step, steps=steps)
+
+    try:
+        rep = build_report(topic, pages, (args.get("focus") or "").strip(), want_images,
+                           progress=_progress)
     except Exception as e:
         log.exception("research report failed")
+        if _aa is not None:
+            _aa.end(token)
         return f"FAILED: I could not produce the report on {topic!r}: {e}"
+    _progress("saving the document", (rep.get("_steps") or 0), rep.get("_steps") or 0)
+    if _aa is not None:
+        _aa.end(token)
 
     from actions import generate_document
     saved = generate_document.execute({"content": rep["markdown"], "title": rep["title"],
