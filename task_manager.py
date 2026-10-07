@@ -38,6 +38,10 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Callable, Dict, List, Optional
 
 import agent_activity
+try:
+    from nova_core import errors as _errors
+except Exception:                       # keep the task manager importable alone
+    _errors = None
 import nova_personality as _persona
 import nova_paths
 
@@ -152,6 +156,9 @@ class TaskStep:
     started: float = 0.0
     finished: float = 0.0
     error: str = ""
+    #: nova_core.errors class of the failure: transient / auth / permission /
+    #: invalid_input / unavailable / internal. Decides whether to retry.
+    error_class: str = ""
     agent: str = ""
     description: str = ""
 
@@ -309,6 +316,9 @@ class Task:
 
 class TaskManager:
     """Background task executor running on a pool of daemon threads."""
+
+    #: Waits before each retry of a TRANSIENT failure. Two retries, backed off.
+    RETRY_DELAYS_S = (2.0, 6.0)
 
     def __init__(self, path: Optional[str] = None,
                  tool_executor: Optional[Callable[[str, Dict, Dict], Any]] = None,
@@ -860,22 +870,38 @@ class TaskManager:
             return
         work = agent_activity.begin(step.agent, step.description, source="task", task_id=t.id)
         try:
-            # One retry on an exception -- a transient network or device error
-            # is common. A retry that succeeds is judged like any other result;
-            # it used to stay FAILED, so the task failed on work that had worked.
-            for attempt in range(2):
+            # Retry what is worth retrying, and only that. Every exception
+            # used to get exactly one retry, while a tool that *returned*
+            # "timed out" got none -- and a refusal or a missing module was
+            # retried as if waiting could fix it. The failure is classified
+            # (nova_core.errors): TRANSIENT waits and tries again; AUTH,
+            # PERMISSION, INVALID_INPUT and UNAVAILABLE stop at once with the
+            # reason, since repeating the same call cannot change them.
+            for attempt in range(len(self.RETRY_DELAYS_S) + 1):
+                failure, cls = "", ""
                 try:
                     result = tool_exec(step.tool, step.args, {"task_id": t.id, "background": True})
                     step.result = (result if isinstance(result, str) else str(result))[:4000]
                     step.error = ""
-                    break
+                    if _errors is not None and _errors.looks_failed(step.result):
+                        failure, cls = step.result, _errors.classify(step.result).value
                 except Exception as e:
                     step.result = ""
                     step.error = str(e)[:500]
+                    failure = str(e)
+                    cls = _errors.classify(e).value if _errors is not None else "transient"
                     t.errors.append(f"step {i + 1} ({step.tool}): {e}")
-                    if attempt == 0:
-                        step.retries += 1
-                        self._event(t, "task.retry", f"step {i + 1} ({step.tool}): {e}", step=i)
+                step.error_class = cls
+                if not failure or cls != "transient" or attempt >= len(self.RETRY_DELAYS_S):
+                    break
+                if t.status == "CANCELLED":
+                    break
+                step.retries += 1
+                delay = self.RETRY_DELAYS_S[attempt]
+                self._event(t, "task.retry",
+                            f"step {i + 1} ({step.tool}) hit a temporary problem; retrying in "
+                            f"{delay:g}s: {failure[:120]}", step=i)
+                time.sleep(delay)
         finally:
             agent_activity.end(work)
             if lock is not None:
