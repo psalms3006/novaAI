@@ -17,8 +17,6 @@ from trust.trust_engine import TrustDecision, TrustDecisionKind
 
 log = logging.getLogger("nova.trust.confirmation")
 
-_AFFIRMATIVE = {"yes", "yeah", "yep", "sure", "ok", "okay", "go", "proceed", "do it", "confirm"}
-
 
 class ConfirmationRequester(Protocol):
     """Ask the user a yes/no question; returns their raw text reply."""
@@ -60,7 +58,10 @@ class NoOpConfirmationRequester:
 
 
 def parse_confirmation(reply: str) -> bool:
-    return any(w in reply.lower() for w in _AFFIRMATIVE)
+    # One definition of "yes" for every gate; the substring match that lived
+    # here read "no, don't go ahead" as consent.
+    from nova_safety import is_affirmative
+    return is_affirmative(reply)
 
 
 @dataclass

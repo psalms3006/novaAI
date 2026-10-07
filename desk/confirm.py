@@ -234,6 +234,21 @@ def _permission_for(tool_name: str, args: dict | None = None) -> str:
         return "ask"
 
 
+def _taint_requires_confirmation(tool_name: str, args: dict) -> bool:
+    """True when this call happens under untrusted content and the
+    permission engine wants the person asked first."""
+    try:
+        from nova_core import permissions as _perm
+        from nova_core import trust as _trust
+        trust = _trust.current_trust()
+        if str(getattr(trust, "value", trust)) == "user":
+            return False
+        decision = _perm.check_tool("nova", tool_name, trust=trust, args=args)
+        return decision.effect is not _perm.Effect.ALLOW
+    except Exception:
+        return False
+
+
 def _ui_safety_gate(tool_name: str, args: dict, get_confirmation=None, speak_fn=None):
     """Drop-in replacement for nova_safety.safety_gate driven by the UI store.
 
@@ -256,11 +271,17 @@ def _ui_safety_gate(tool_name: str, args: dict, get_confirmation=None, speak_fn=
         what = _SCOPE_WORDS.get(scope, "that")
         return (f"I can't do that — {what} is turned off in your permission "
                 f"settings. Turn it on to let me help with this.")
-    if perm == "allow" and not irreversible(tool_name, args):
+    # Under taint (the turn read a web page, a document, an email) "Allow" in
+    # Settings means "when I ask", not "when a page asks". The permission
+    # engine already returns CONFIRM for that case; this gate replaced
+    # nova_safety.safety_gate and used to drop the taint branch, so a page
+    # that said "open this" was obeyed unasked whenever the scope was Allow.
+    tainted_confirm = _taint_requires_confirmation(tool_name, args)
+    if perm == "allow" and not irreversible(tool_name, args) and not tainted_confirm:
         if _is_consequential:
             _log(f"PERM: auto-approved consequential {tool_name} (scope {scope} allowed)")
         return None
-    if not _is_consequential and not scope:
+    if not _is_consequential and not scope and not tainted_confirm:
         return None
     # "Ask me" means ask. With reading and changing now separate choices, a
     # person who set "Read your files: Ask me" expects to be asked before a

@@ -117,8 +117,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (49):
+Commits in the last 14 days (50):
 
+- 15fe759 2026-10-07 Deliver held proactive messages; greet with their words, not a count
 - 29da1e7 2026-10-06 Account API tests: clear the compiled-in backend for the local-only cases
 - e477242 2026-10-04 Commit local changes to email search functionality and Zoey gaps tests
 - 65f4717 2026-10-01 Zoey audit: item-by-item comparison and verdicts
@@ -158,8 +159,7 @@ Commits in the last 14 days (49):
 - 8ce2a4b 2026-09-26 Plan a task submitted as a goal instead of refusing it
 - 59c1134 2026-09-26 Honour Gemini's GoAway and resume the session instead of being cut off
 - 0ed5309 2026-09-26 Stop the window saying "Working" after a tool call that never answers
-- ae5a4ef 2026-09-26 Port setup, account, library and ambient into the new UI; retire desk/static
-- ...and 9 more
+- ...and 10 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

@@ -34,6 +34,7 @@ For the /audit REPL command:
 
 from __future__ import annotations
 import json
+import re
 import time
 import threading
 from datetime import datetime
@@ -212,6 +213,30 @@ def safety_gate(
     return _ask_permission(tool_name, args, get_confirmation, speak_fn)
 
 
+_NEGATIONS = re.compile(
+    r"\b(no|nope|nah|not|don'?t|do not|never|cancel|stop|wait|hold on|"
+    r"abort|negative|deny|refuse)\b")
+_AFFIRMATIONS = re.compile(
+    r"\b(yes|yeah|yep|yup|sure|ok|okay|go ahead|go for it|proceed|do it|"
+    r"confirm(ed)?|affirmative|approved?|allow(ed)?)\b")
+
+
+def is_affirmative(response: str) -> bool:
+    """Did the person clearly say yes?
+
+    This used to accept any reply *containing* "go", "ok" or "yes", so
+    "no, don't go ahead" confirmed a destructive action, and so did any
+    word that merely contains "ok" ("look", "broken"). Any negation now
+    wins, and words must be whole.
+    """
+    text = (response or "").strip().lower()
+    if not text:
+        return False
+    if _NEGATIONS.search(text):
+        return False
+    return bool(_AFFIRMATIONS.search(text))
+
+
 def _ask_permission(
     tool_name: str,
     args: dict,
@@ -252,10 +277,7 @@ def _ask_permission(
     except Exception:
         response = ""
 
-    confirmed = bool(response) and any(
-        w in response.lower()
-        for w in ["yes", "yeah", "sure", "ok", "okay", "go", "proceed", "do it", "confirm"]
-    )
+    confirmed = is_affirmative(response)
 
     if confirmed:
         _log(f"CONFIRMED: {tool_name}")
