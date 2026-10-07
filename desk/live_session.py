@@ -577,6 +577,10 @@ class VoiceSupervisor:
             if status.get("state") != "error" and not status.get("gave_up"):
                 self._attempts = 0
                 return False
+            if status.get("auth_rejected"):
+                # A rejected key will be rejected again; the person has been
+                # told to fix it in Settings, and a new key restarts voice.
+                return False
 
             now = self._now()
             if self._attempts >= self.MAX_CONSECUTIVE:
@@ -1220,6 +1224,13 @@ class LiveManager:
     #: shortly after the connection does.
     OFFLINE_RETRY_DELAY = 5.0
 
+    #: A connection only counts as "back" once it has stayed up this long.
+    #: The failure counter used to reset the instant a socket opened, so a
+    #: session that connected and was closed straight away (a dead resume
+    #: handle, a server-side reject after setup) retried every ~2 s forever
+    #: and the window said "Reconnecting" indefinitely.
+    STABLE_CONNECTION_S = 30.0
+
     def __init__(self, model: str | None = None, voice: str | None = None):
         self._model = model or os.getenv("LIVE_MODEL", LIVE_MODEL_DEFAULT)
         self._voice = voice or os.getenv("NOVA_VOICE", _resolve("NOVA_VOICE", "Aoede"))
@@ -1287,6 +1298,7 @@ class LiveManager:
         #: handle lets the next connection continue the same conversation
         #: instead of starting a stranger with no memory of it.
         self._resume_handle: str | None = None
+        self._last_drop_was_error = False
         #: Set by GoAway: reconnect at the next quiet moment, before this.
         self._go_away_deadline: float | None = None
         #: Tool calls running beside the receiver, and ones Gemini withdrew.
@@ -1505,6 +1517,8 @@ class LiveManager:
             "voice": self._voice,
             "native_audio": True,
             "engine": "gemini-live",
+            # The key was refused: restarting cannot help until it changes.
+            "auth_rejected": bool(getattr(self, "_auth_rejected", False)),
             "t_first_audio_ms": t_first,
             "last_turn_ms": self._trace.last_turn_ms if self._trace else 0,
             "uptime_s": uptime,
@@ -2572,7 +2586,12 @@ class LiveManager:
                 or "timed out during opening handshake" in e
                 or "handshake operation timed out" in e
                 or "timed out during handshake" in e
-                or "connection timed out" in e)
+                or "connection timed out" in e
+                # Managed mode mints a Live token from NOVA Cloud before each
+                # connect. Offline, that fails with this message -- which is
+                # an outage, not a refusal, and used to burn the budget.
+                or "nova cloud is unreachable" in e
+                or "failed to establish a new connection" in e)
 
     @staticmethod
     def _is_auth_failure(err: str) -> bool:
@@ -2729,7 +2748,6 @@ class LiveManager:
                             asyncio.TaskGroup() as tg):
                     self._session = session
                     connected_ok = True
-                    consecutive_failures = 0
                     if self._offline:
                         self._offline = False
                         _log("[LIVE] network is back")
@@ -2844,11 +2862,30 @@ class LiveManager:
                 else:
                     consecutive_failures = self._on_connection_error(
                         e, connected_ok, consecutive_failures)
+                    self._last_drop_was_error = True
             finally:
                 self._screen.stop()
                 self._stop_mic()
                 self._stop_playback()
                 self._session = None
+
+            if connected_ok and not requested_reconnect:
+                lived = time.time() - self._t_connected
+                if lived >= self.STABLE_CONNECTION_S and not self._last_drop_was_error:
+                    consecutive_failures = 0
+                elif lived < self.STABLE_CONNECTION_S and not self._last_drop_was_error:
+                    # Closed cleanly but immediately: still not working.
+                    consecutive_failures += 1
+                    _log("[LIVE] connection closed after %.1fs (failure %d/%d)",
+                         lived, consecutive_failures, self.MAX_RECONNECT_ATTEMPTS)
+            self._last_drop_was_error = False
+
+            # A resume handle that keeps failing is probably dead (they
+            # expire); start a fresh conversation rather than replaying it.
+            if consecutive_failures >= 2 and self._resume_handle:
+                _log("[LIVE] dropping the resume handle after %d failures; "
+                     "starting a fresh session", consecutive_failures)
+                self._resume_handle = None
 
             # Reconnect on transient drops (keepalive timeout, network blip, 5xx)
             if not self._should_reconnect():
@@ -2897,8 +2934,11 @@ class LiveManager:
     def _on_connection_error(self, e: BaseException, connected_ok: bool,
                              failures: int) -> int:
         """Log and report a connection that failed; returns the new count."""
-        if not connected_ok:
+        lived = (time.time() - self._t_connected) if connected_ok else 0.0
+        if not connected_ok or lived < self.STABLE_CONNECTION_S:
             failures += 1
+        else:
+            failures = 1          # it was up and working; this is a fresh drop
         # While offline the same error repeats every few seconds by design
         # (so voice resumes the moment the network does); it once filled the
         # log with hundreds of identical lines. Log it once per outage.
