@@ -1,6 +1,5 @@
-# nova_config.toml Ã¢â‚¬â€ Project NOVA configuration
+# nova_config.toml — Project NOVA configuration
 # All tuneable values live here. Edit this file instead of changing source code.
-# Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 [nova]
 name        = "NOVA"
@@ -64,3 +63,66 @@ timeouts = {tinyllama = 15, llama3_2 = 30, phi3 = 30, mistral = 45}
 assistant_name = "Nova"
 company = "Omniel"
 aliases = []
+
+[comms]
+# Proactive calling and notification settings
+enabled = true
+
+# User contact information
+phone_number = ""              # E.164 format: +15551234567
+phone_verified = false
+timezone = "UTC"               # User's timezone for scheduling
+
+# Quiet hours (no proactive calls)
+quiet_hours_enabled = true
+quiet_start = 22               # 10 PM local time
+quiet_end = 7                  # 7 AM local time
+
+# Voice call provider settings
+voice_provider = "bland"       # bland | twilio | mock
+bland_voice = "june"           # Voice persona for Bland AI
+max_call_duration = 10         # Maximum call duration in minutes
+
+# Rate limiting for outbound calls
+max_calls_per_hour = 3
+max_calls_per_day = 10
+
+# Retry policy for failed deliveries
+retry_max_attempts = 3
+retry_base_interval_seconds = 300      # 5 minutes
+retry_max_interval_seconds = 3600      # 1 hour
+retry_exponential_backoff = true
+retry_jitter = true
+
+# Escalation rules
+# After max retries, fall back to these channels
+escalation_fallback_channels = ["desktop"]  # desktop, sms, email
+
+# Event-specific channel preferences
+# morning_brief = ["voice", "desktop"]
+# reminder = ["voice", "desktop"]
+# critical_event = ["voice", "desktop"]
+
+# Permissions
+# Actions that require explicit user confirmation
+require_confirmation_for = [
+  "send_message",
+  "autostart",
+  "game_updater",
+  "self_editor",
+]
+# Actions NOVA may perform without reaching user
+allowed_auto_actions = [
+  "web_search",
+  "file_controller:read",
+  "file_controller:list",
+  "recall",
+  "nova_memory:read",
+]
+
+# Webhook configuration
+webhook_base_url = ""            # Base URL for inbound webhooks (e.g., https://yourdomain.com)
+
+# Provider-specific settings (credentials via environment variables)
+# BLAND_API_KEY - Bland AI API key
+# TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN - Twilio credentials

@@ -1,4 +1,4 @@
-"""
+﻿"""
 task_manager.py
 ════════════════
 AIOS Concurrent Task Manager — background multi-step tasks that NEVER block the
@@ -1223,20 +1223,28 @@ class TaskManager:
 
     def plan_steps(self, goal: str) -> List[Dict[str, Any]]:
         """Steps for a goal: NOVA's planner, else its keyword fallback, else []."""
+        from memory_extra import load_memory, build_memory_context
+        # Build memory context
+        meta = load_memory()
+        context = build_memory_context(meta, goal)
         if self.planner is not None:
             try:
-                return list(self.planner(goal) or [])
+                # Try to call the planner with context; if it fails due to missing argument, fall back to goal only
+                try:
+                    return list(self.planner(goal, context) or [])
+                except TypeError:
+                    # planner might not accept context
+                    return list(self.planner(goal) or [])
             except Exception as e:
                 log.warning("task planner failed for %r: %s", goal, e)
                 return []
         import sys
-        nova_mod = sys.modules.get("nova")
         declarations = list(getattr(nova_mod, "TOOL_DECLARATIONS", None) or [])
         try:
             from agent import planner as _planner
             try:
-                plan = (_planner.create_plan(goal, tool_declarations=declarations)
-                        if declarations else _planner.create_plan(goal))
+                plan = (_planner.create_plan(goal, context=context, tool_declarations=declarations)
+                        if declarations else _planner.create_plan(goal, context=context))
             except Exception as e:
                 log.warning("planning %r failed (%s); using the fallback plan", goal, e)
                 plan = None
@@ -1253,7 +1261,6 @@ class TaskManager:
             log.warning("plan for %r named tools NOVA does not have: %s", goal,
                         sorted({s["tool"] for s in steps} - {s["tool"] for s in runnable}))
         return runnable or self._fallback_steps(goal)
-
     @staticmethod
     def _can_run(tool: str, declarations: List[Dict[str, Any]]) -> bool:
         """A step NOVA can dispatch and authorise. Anything else is refused at

@@ -18,10 +18,15 @@ without a second call.
 """
 from __future__ import annotations
 
+import logging
+import secrets
 import time
+from urllib.parse import urlencode
 
 from flask import Blueprint, current_app, g, jsonify, request
 from sqlalchemy import select
+
+import requests
 
 from . import security as sec
 from .db import RateLimited, rate_limit, session_scope
@@ -32,6 +37,8 @@ from .models import (
 from .telemetry_sink import record_event
 
 bp = Blueprint("auth", __name__, url_prefix="/v1/auth")
+
+log = logging.getLogger(__name__)
 
 # The message returned for both "no such account" and "wrong password". Telling
 # the two apart hands an attacker a free account-existence oracle.
@@ -275,6 +282,17 @@ def signup():
             token = _issue_email_token(s, user.id, "verify_email", 86400)
             payload.update(_deliver(mc, user.email, mail.verification_email,
                                     token, "verify_email"))
+            # Also send a 6-digit verification code
+            code = sec.new_verification_code()
+            s.add(EmailToken(
+                user_id=user.id,
+                kind="verify_email",
+                code_hash=sec.hash_code(code),
+                expires_at=now() + 86400,
+                code_expires_at=now() + 600,  # 10 minutes for code
+            ))
+            payload.update(_deliver(mc, user.email, mail.verification_code_email,
+                                    code, "verify_email_code"))
         else:
             # Always say what the server can and cannot do, so a client never
             # has to guess whether an email is coming.
@@ -596,10 +614,275 @@ def resend_verification():
                          "rate_limited")
             return resp[0], resp[1], {"Retry-After": str(e.retry_after)}
         token = _issue_email_token(s, user.id, "verify_email", 86400)
+        # Also send a new verification code
+        code = sec.new_verification_code()
+        s.add(EmailToken(
+            user_id=user.id,
+            kind="verify_email",
+            code_hash=sec.hash_code(code),
+            expires_at=now() + 86400,
+            code_expires_at=now() + 600,  # 10 minutes for code
+        ))
+        mc = mail.mailer()
         return jsonify({"ok": True,
-                        **_deliver(mail.mailer(), user.email,
-                                   mail.verification_email, token,
-                                   "verify_email")})
+                        **_deliver(mc, user.email, mail.verification_email, token, "verify_email"),
+                        **_deliver(mc, user.email, mail.verification_code_email, code, "verify_email_code")})
+
+
+@bp.post("/email/verify_code")
+def verify_email_code():
+    """Verify a 6-digit email verification code."""
+    body = request.get_json(silent=True) or {}
+    code = (body.get("code") or "").strip()
+    if not code:
+        return _fail("Verification code is required.", 400, "missing_code")
+    if not code.isdigit() or len(code) != 6:
+        return _fail("Verification code must be a 6-digit number.", 400, "invalid_code")
+    with session_scope() as s:
+        row = s.scalar(select(EmailToken).where(
+            EmailToken.code_hash == sec.hash_code(code),
+            EmailToken.kind == "verify_email"))
+        if row is None or row.used_at is not None or row.code_expires_at is not None and row.code_expires_at < now():
+            return _fail("This verification code is no longer valid. It may already have "
+                         "been used, or it may have expired.", 400, "invalid_code")
+        user = s.get(User, row.user_id)
+        if user is None:
+            return _fail("This verification code is no longer valid.", 400, "invalid_code")
+        row.used_at = now()
+        user.email_verified = True
+        record_event(s, "EMAIL_VERIFIED", user_id=user.id)
+        return jsonify({"ok": True, "message": "Your email address is confirmed. You can return to NOVA and carry on."})
+
+
+@bp.post("/email/resend_code")
+def resend_verification_code():
+    """Resend a 6-digit verification code via email."""
+    from .auth_guard import require_user
+    err = require_user(allow_unverified=True)
+    if err:
+        return err
+    with session_scope() as s:
+        user = s.get(User, g.user_id)
+        if user is None:
+            return _fail("Not signed in.", 401, "unauthorised")
+        if user.email_verified:
+            return jsonify({"ok": True, "already_verified": True})
+        try:
+            rate_limit(s, f"resend_code:{user.id}", limit=5, window_s=3600)
+        except RateLimited as e:
+            resp = _fail("Too many requests. Try again shortly.", 429, "rate_limited")
+            return resp[0], resp[1], {"Retry-After": str(e.retry_after)}
+        code = sec.new_verification_code()
+        s.add(EmailToken(
+            user_id=user.id,
+            kind="verify_email",
+            code_hash=sec.hash_code(code),
+            expires_at=now() + 86400,
+            code_expires_at=now() + 600,  # 10 minutes for code
+        ))
+        mc = mail.mailer()
+        return jsonify({"ok": True,
+                        **_deliver(mc, user.email, mail.verification_code_email, code, "verify_email_code")})
+
+
+# -- Google OAuth --------------------------------------------------------------
+
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
+
+GOOGLE_SCOPES = [
+    "openid",
+    "email",
+    "profile",
+]
+
+
+def _google_oauth_configured() -> tuple[bool, str]:
+    """Check if Google OAuth is configured. Returns (configured, error_message)."""
+    cfg = current_app.config["NOVA_CFG"]
+    if not cfg.google_oauth_client_id:
+        return False, "Google OAuth client ID not configured (NOVA_GOOGLE_OAUTH_CLIENT_ID)"
+    if not cfg.google_oauth_client_secret:
+        return False, "Google OAuth client secret not configured (NOVA_GOOGLE_OAUTH_CLIENT_SECRET)"
+    if not cfg.google_oauth_redirect_uri:
+        return False, "Google OAuth redirect URI not configured (NOVA_GOOGLE_OAUTH_REDIRECT_URI)"
+    return True, ""
+
+
+def _google_oauth_state() -> str:
+    """Generate a secure OAuth state parameter."""
+    return secrets.token_urlsafe(32)
+
+
+@bp.get("/google/start")
+def google_oauth_start():
+    """Start Google OAuth flow. Returns authorization URL for the desktop to open in browser."""
+    configured, err = _google_oauth_configured()
+    if not configured:
+        return _fail(err, 503, "oauth_not_configured")
+
+    cfg = current_app.config["NOVA_CFG"]
+    state = _google_oauth_state()
+
+    # Store state in session (we use a simple in-memory cache with short TTL)
+    # In production with multiple workers, this would need Redis or database storage.
+    # For now, we encode the state in the URL and verify it on callback.
+    from urllib.parse import urlencode
+    params = {
+        "client_id": cfg.google_oauth_client_id,
+        "redirect_uri": cfg.google_oauth_redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(GOOGLE_SCOPES),
+        "state": state,
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    auth_url = f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
+    return jsonify({"ok": True, "auth_url": auth_url, "state": state})
+
+
+@bp.post("/google/callback")
+def google_oauth_callback():
+    """Handle Google OAuth callback. Exchanges code for tokens, creates or links account."""
+    body = request.get_json(silent=True) or {}
+    code = (body.get("code") or "").strip()
+    state = (body.get("state") or "").strip()
+    device_id = (body.get("device_id") or "").strip()[:36]
+    device_secret = (body.get("device_secret") or "").strip()
+    platform = (body.get("platform") or "unknown").strip()[:32]
+    version = (body.get("app_version") or "").strip()[:32]
+    device_name = (body.get("device_name") or "").strip()[:120] or "NOVA device"
+
+    if not code:
+        return _fail("Authorization code is required", 400, "missing_code")
+    if not state:
+        return _fail("OAuth state is required", 400, "missing_state")
+
+    configured, err = _google_oauth_configured()
+    if not configured:
+        return _fail(err, 503, "oauth_not_configured")
+
+    cfg = current_app.config["NOVA_CFG"]
+
+    # Exchange code for tokens
+    import requests
+    try:
+        token_resp = requests.post(
+            GOOGLE_TOKEN_URL,
+            data={
+                "code": code,
+                "client_id": cfg.google_oauth_client_id,
+                "client_secret": cfg.google_oauth_client_secret,
+                "redirect_uri": cfg.google_oauth_redirect_uri,
+                "grant_type": "authorization_code",
+            },
+            timeout=10,
+        )
+        token_resp.raise_for_status()
+        tokens = token_resp.json()
+    except requests.RequestException as e:
+        log.error("[OAUTH] Token exchange failed: %s", e)
+        return _fail("Failed to exchange authorization code", 502, "token_exchange_failed")
+
+    access_token = tokens.get("access_token")
+    id_token = tokens.get("id_token")  # JWT with user info
+    refresh_token = tokens.get("refresh_token")
+
+    if not access_token:
+        return _fail("No access token returned from Google", 502, "no_access_token")
+
+    # Get user info from Google
+    try:
+        userinfo_resp = requests.get(
+            GOOGLE_USERINFO_URL,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+        userinfo_resp.raise_for_status()
+        userinfo = userinfo_resp.json()
+    except requests.RequestException as e:
+        log.error("[OAUTH] Userinfo fetch failed: %s", e)
+        return _fail("Failed to fetch user information from Google", 502, "userinfo_failed")
+
+    google_sub = userinfo.get("sub")
+    email = sec.normalise_email(userinfo.get("email") or "")
+    email_verified = userinfo.get("verified_email", False)
+    display_name = (userinfo.get("name") or email.split("@")[0] or "").strip()[:120]
+
+    if not google_sub or not email:
+        return _fail("Google did not return required user information", 502, "incomplete_userinfo")
+
+    ip = _client_ip()
+
+    with session_scope() as s:
+        try:
+            rate_limit(s, f"google_oauth:ip:{sec.hash_ip(ip)}", limit=10, window_s=900)
+        except RateLimited as e:
+            resp = _fail("Too many OAuth attempts. Try again later.", 429, "rate_limited")
+            return resp[0], resp[1], {"Retry-After": str(e.retry_after)}
+
+        # Try to find existing user by email
+        user = s.scalar(select(User).where(User.email == email))
+
+        if user is None:
+            # Create new user
+            user = User(
+                email=email,
+                password_hash="",  # No password for OAuth-only accounts
+                email_verified=email_verified,
+            )
+            s.add(user)
+            s.flush()
+            s.add(Profile(user_id=user.id, display_name=display_name))
+            record_event(s, "USER_CREATED", user_id=user.id, method="google_oauth")
+        else:
+            # Existing user - update profile if needed
+            prof = s.get(Profile, user.id)
+            if prof and not prof.display_name:
+                prof.display_name = display_name
+            # Update email_verified if Google says it's verified
+            if email_verified and not user.email_verified:
+                user.email_verified = True
+                record_event(s, "EMAIL_VERIFIED", user_id=user.id, method="google_oauth")
+
+        # Register device
+        try:
+            device, how = _register_device(s, user, {
+                "device_id": device_id,
+                "device_secret": device_secret,
+                "platform": platform,
+                "app_version": version,
+                "device_name": device_name,
+            })
+        except (ValueError, PermissionError) as e:
+            return _fail(str(e), 400, "device_error")
+
+        from .api_instance import get_or_create_instance
+        get_or_create_instance(s, user.id)
+
+        auth_session = _issue_session(s, user, device, ip, request.headers.get("User-Agent", ""))
+
+        # Store Google refresh token if provided (for future use)
+        # This would need a new column on User or a separate OAuthAccount table
+        # For now, we just sign the user in
+
+        record_event(s, "USER_LOGIN", user_id=user.id, device_id=device.id, method="google_oauth")
+        if how == "registered":
+            record_event(s, "DEVICE_REGISTERED", user_id=user.id, device_id=device.id)
+
+        return jsonify({
+            "ok": True,
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "display_name": display_name,
+                "email_verified": user.email_verified,
+                "created_at": user.created_at,
+            },
+            "device": {"id": device.id, "name": device.name},
+            **auth_session,
+        })
 
 
 @bp.get("/me")

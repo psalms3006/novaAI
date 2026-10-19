@@ -48,55 +48,55 @@ export const TopHud: React.FC = () => {
 
   return (
     <header
-      className="h-11 px-6 flex items-center justify-between z-30 shrink-0 font-sans text-xs border-b backdrop-blur-2xl transition-colors duration-300 relative select-none"
+      className="h-11 px-5 flex items-center justify-between z-30 shrink-0 font-sans text-xs border-b backdrop-blur-2xl transition-colors duration-300 relative select-none"
       style={{ backgroundColor: theme.palette.glassSurface, borderColor: theme.palette.glassBorder, color: theme.palette.textPrimary }}
     >
-      <div className="flex items-center space-x-3.5">
-        <span className="font-semibold tracking-[0.18em] uppercase text-xs flex items-center gap-2">
-          <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: theme.palette.accent }} />
+      <div className="flex items-center space-x-3">
+        <span className="font-semibold tracking-[0.2em] uppercase text-[11px] flex items-center gap-2">
+          <span className="w-1.5 h-1.5 rounded-full shadow-sm" style={{ backgroundColor: theme.palette.accent }} />
           NOVA
         </span>
 
-        <span className="text-xs opacity-30">/</span>
+        <span className="text-xs opacity-20">/</span>
 
         <div className="relative">
           <button
             onClick={() => setShowStatus(!showStatus)}
-            className="text-[11px] flex items-center gap-1.5 font-normal transition-colors hover:opacity-100 cursor-pointer"
-            style={{ color: theme.palette.textSecondary }}
+            className="text-[11px] flex items-center gap-1.5 font-normal px-2 py-1 rounded-lg border transition-all hover:brightness-110 cursor-pointer"
+            style={{ backgroundColor: theme.palette.glassSurface, borderColor: theme.palette.glassBorder, color: theme.palette.textSecondary }}
             aria-expanded={showStatus}
           >
             <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: linkColor }} />
-            <span>{linkLabel}</span>
+            <span className="font-sans">{linkLabel}</span>
             <i className="fa-solid fa-chevron-down text-[8px] opacity-40 ml-0.5" />
           </button>
 
           {showStatus && (
             <div
-              className="absolute left-0 top-8 w-64 p-3.5 rounded-2xl border shadow-xl backdrop-blur-2xl z-40 text-xs space-y-2 animate-fade-in"
+              className="absolute left-0 top-9 w-68 p-4 rounded-2xl border shadow-2xl backdrop-blur-3xl z-40 text-xs space-y-2.5 animate-fade-in"
               style={{
                 backgroundColor: theme.palette.bgElevated,
                 borderColor: theme.palette.glassBorder,
-                boxShadow: `0 20px 40px -10px ${theme.palette.ambientShadow}, inset 0 1px 1px 0 ${theme.palette.glassHighlight}`,
+                boxShadow: `0 20px 45px -10px ${theme.palette.ambientShadow}, inset 0 1px 1px 0 ${theme.palette.glassHighlight}`,
               }}
             >
-              <div className="flex items-center justify-between font-mono text-[10px]" style={{ color: theme.palette.textMuted }}>
-                <span>NOVA BACKEND</span>
-                <span className="font-medium" style={{ color: linkColor }}>
-                  {rt.backendReachable ? 'CONNECTED' : 'UNREACHABLE'}
+              <div className="flex items-center justify-between font-mono text-[10px] pb-1 border-b" style={{ borderColor: theme.palette.glassBorder, color: theme.palette.textMuted }}>
+                <span>CORE TELEMETRY</span>
+                <span className="font-medium tracking-wider" style={{ color: linkColor }}>
+                  {rt.backendReachable ? 'CONNECTED' : 'OFFLINE'}
                 </span>
               </div>
               <div className="space-y-1.5 text-[11px]">
                 {[
-                  ['Internet', rt.status ? (rt.status.online ? 'Online' : 'Offline') : '—'],
-                  ['Answering with', rt.status ? `${rt.status.serving === 'cloud' ? 'Cloud' : 'Local'} · ${rt.status.model}` : '—'],
-                  ['Voice', rt.voiceRunning ? (rt.muted ? 'On · muted' : 'On') : 'Off'],
-                  ['CPU / memory', `${fmtPct(v?.cpu_pct)} / ${fmtPct(v?.mem_pct)}`],
-                  ['Last turn', rt.system?.intelligence?.last_turn_ms ? `${rt.system.intelligence.last_turn_ms} ms` : '—'],
+                  ['Network Status', rt.status ? (rt.status.online ? 'Online (REST + Live)' : 'Local Intelligence') : 'Connecting…'],
+                  ['Active Model', rt.status ? `${rt.status.serving === 'cloud' ? 'Cloud' : 'Local'} · ${rt.status.model}` : '—'],
+                  ['Voice Mode', rt.voiceRunning ? (rt.muted ? 'Running (Muted)' : 'Active Full-Duplex') : 'Standby / Inactive'],
+                  ['System Vitals', `CPU ${fmtPct(v?.cpu_pct)} · RAM ${fmtPct(v?.mem_pct)}`],
+                  ['Latency', rt.system?.intelligence?.last_turn_ms ? `${rt.system.intelligence.last_turn_ms} ms` : 'Standby'],
                 ].map(([k, val]) => (
-                  <div key={k} className="flex justify-between gap-3" style={{ color: theme.palette.textSecondary }}>
-                    <span>{k}</span>
-                    <span className="font-mono font-medium truncate text-right" style={{ color: theme.palette.textPrimary }}>
+                  <div key={k} className="flex justify-between gap-3 items-center" style={{ color: theme.palette.textSecondary }}>
+                    <span className="text-[10px] font-sans opacity-70">{k}</span>
+                    <span className="font-mono text-[10px] font-medium truncate text-right" style={{ color: theme.palette.textPrimary }}>
                       {val}
                     </span>
                   </div>
@@ -106,23 +106,23 @@ export const TopHud: React.FC = () => {
           )}
         </div>
 
-        <span className="hidden md:inline text-[11px] opacity-50" style={{ color: theme.palette.textMuted }}>
+        <span className="hidden md:inline text-[11px] opacity-40 font-mono tracking-wider text-[10px] uppercase" style={{ color: theme.palette.textMuted }}>
           {currentScreen === 'substrate' && 'Presence'}
           {currentScreen === 'runtime' && 'Settings'}
-          {currentScreen === 'synaptic' && 'Memory map'}
+          {currentScreen === 'synaptic' && 'Synaptic Map'}
           {currentScreen === 'library' && 'Library'}
         </span>
       </div>
 
-      <div className="flex items-center space-x-2 text-[11px] font-sans" role="status" aria-live="polite">
-        <span className={`w-1.5 h-1.5 rounded-full transition-all ${ACTIVE.includes(rt.phase) ? 'animate-pulse' : 'opacity-70'}`} style={{ backgroundColor: color }} />
+      <div className="flex items-center space-x-2 px-3 py-1 rounded-full border text-[11px] font-sans shadow-sm" style={{ backgroundColor: theme.palette.glassSurface, borderColor: theme.palette.glassBorder }} role="status" aria-live="polite">
+        <span className={`w-1.5 h-1.5 rounded-full transition-all ${ACTIVE.includes(rt.phase) ? 'animate-pulse' : 'opacity-80'}`} style={{ backgroundColor: color }} />
         <span style={{ color: rt.phase === 'idle' ? theme.palette.textSecondary : theme.palette.textPrimary }}>{rt.phaseLabel}</span>
       </div>
 
       <div className="flex items-center space-x-3 text-xs">
         <button
           onClick={() => setThemeModalOpen(true)}
-          className="flex items-center gap-1.5 px-2.5 py-1 rounded-xl border text-[11px] transition-all hover:opacity-100 cursor-pointer"
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded-xl border text-[11px] transition-all hover:brightness-110 cursor-pointer"
           style={{ backgroundColor: theme.palette.glassSurface, borderColor: theme.palette.glassBorder, color: theme.palette.textSecondary }}
           title="Change theme"
         >
@@ -133,7 +133,7 @@ export const TopHud: React.FC = () => {
 
         <div className="h-3 w-px" style={{ backgroundColor: theme.palette.glassBorder }} />
 
-        <span className="font-mono text-[11px] tabular-nums min-w-[75px] text-right" style={{ color: theme.palette.textSecondary }}>
+        <span className="font-mono text-[11px] tabular-nums min-w-[70px] text-right" style={{ color: theme.palette.textSecondary }}>
           {timeString}
         </span>
       </div>

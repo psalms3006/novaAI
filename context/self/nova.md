@@ -119,8 +119,9 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (57):
+Commits in the last 14 days (11):
 
+- 8883237 2026-10-07 Chat: a tool that failed did not succeed
 - d20efeb 2026-10-07 Background steps retry only what waiting can fix
 - b868bbd 2026-10-07 Show a research report's real stages and counted progress
 - 17dd1ad 2026-10-07 NOVA knows what she can't do and why; recommends instead of listing
@@ -131,37 +132,6 @@ Commits in the last 14 days (57):
 - d5a409f 2026-10-07 Permission gates: "no, don't go ahead" is a no; Allow doesn't cover a web page's request
 - 15fe759 2026-10-07 Deliver held proactive messages; greet with their words, not a count
 - 29da1e7 2026-10-06 Account API tests: clear the compiled-in backend for the local-only cases
-- e477242 2026-10-04 Commit local changes to email search functionality and Zoey gaps tests
-- 65f4717 2026-10-01 Zoey audit: item-by-item comparison and verdicts
-- df317f8 2026-10-01 From the Zoey self-audit: reminders that arrive, automations, recall, page reading, mail search, continuity
-- 6f9280d 2026-10-01 Ignore the dev-run knowledge store
-- dbfb924 2026-10-01 Learned knowledge keeps its exact values and is used; honest fallback when the quota runs out
-- 907048c 2026-10-01 Thinking-orbs presence: states in the window, a see-through ambient orb, no humanoid
-- 1927731 2026-10-01 Extensive research reports with sources and pictures; narrate computer work
-- a507b14 2026-10-01 Keep passing moments, NOVA's own reports and dead facts out of memory
-- b101410 2026-10-01 Always confirm irreversible actions; never run a withdrawn call; open Settings pages directly
-- 8702b0c 2026-09-30 Stop a still-connecting voice session when the microphone is withdrawn; learning and UI audit docs
-- 81abe0e 2026-09-30 Fix empty chat replies; say when settings were not saved; finish the UI audit fixes
-- c29806e 2026-09-30 Acquire a missing capability from research, with the person's OK asked once
-- 913ce56 2026-09-30 Learning system, permission enforcement, and the UI interaction audit fixes
-- 1e2370d 2026-09-29 Record the partial agentic benchmark run on gemini-flash-latest (1/1 before the daily quota)
-- 4d979b2 2026-09-29 Fix what NOVA's own 2026-09-29 session log showed going wrong
-- 8e54747 2026-09-29 Self-extending skills, tool hooks, deferred MCP tools, and the Claude Code audit
-- b6d42fb 2026-09-29 Eval: selectable model, fairer confidence rubric, first partial live results
-- 9ac080b 2026-09-29 Add NOVA's release-signing public key; make the live eval patient with 503s
-- 5629540 2026-09-29 Give NOVA a persistent behavioural identity above the model layer
-- 1446abe 2026-09-29 Remove the rollback copy and installer once an update proves healthy
-- 1efd3e0 2026-09-29 Start the update helper with CREATE_NO_WINDOW, not DETACHED_PROCESS
-- b37f54b 2026-09-29 Let the installer's version be set at build time (ISCC /DMyAppVersion)
-- 039f989 2026-09-29 Update NOVA automatically, safely; add the owner's setup guide and EC2 deploy
-- bb8bc14 2026-09-29 Add NOVA's first-run screens: welcome, account, verify, profile, this PC
-- 7d168ad 2026-09-29 Require sign-in before NOVA starts; one-time setup per account and per PC
-- a3fe7e7 2026-09-29 Give each account its own local data folder; keep installation state apart
-- 3110a0b 2026-09-28 Show instances, versions, usage and update rollout to admins
-- cde539e 2026-09-28 Add the owner's release tools: keygen, sign, publish-release, set-channel
-- b11d22f 2026-09-28 Give each account a NOVA instance, managed model access, and signed updates
-- 907ebe4 2026-09-28 Close four account-security holes found in the backend audit
-- ...and 17 more
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

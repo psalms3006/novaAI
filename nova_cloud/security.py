@@ -100,6 +100,16 @@ def new_opaque_token(nbytes: int = 32) -> str:
     return secrets.token_urlsafe(nbytes)
 
 
+def new_verification_code() -> str:
+    """Generate a 6-digit numeric verification code."""
+    return str(secrets.randbelow(1_000_000)).zfill(6)
+
+
+def hash_code(code: str) -> str:
+    """SHA-256 hash of a verification code. Codes are low-entropy so hashing is essential."""
+    return hashlib.sha256((code or "").encode("utf-8")).hexdigest()
+
+
 def token_hash(token: str) -> str:
     """SHA-256. The token is already 256 bits of entropy, so a slow KDF adds
     nothing here and would make every authenticated request expensive."""

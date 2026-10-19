@@ -19,3 +19,15 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+"""Entry point: python -m agent - runs NOVA in text mode."""
+
+import sys
+from nova import main
+
+
+def main() -> None:
+    # Replace arguments with just the script name and --text to run NOVA in text mode.
+    # The original agent/__main__.py did not accept arguments, so we ignore any
+    # passed arguments and run in text mode.
+    sys.argv = [sys.argv[0], "--text"]
+    sys.exit(main())

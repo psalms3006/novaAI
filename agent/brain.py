@@ -121,7 +121,7 @@ class AgentBrain:
 
         except ProviderError as exc:
             reply = str(exc)
-            sink.write(f"{ASSISTANT_NAME}: {reply}\n")
+            sink.write(f"{self._assistant_name}: {reply}\n")
             sink.flush()
             self._history.pop()
             return reply

@@ -294,14 +294,17 @@ def execute(parameters):
                 result = f"Review of {path.name}:\n" + "\n".join(issues) if issues else f"No obvious issues found in {path.name}."
 
             elif action == "run" and ext == '.py':
-                import subprocess
+                from core.shell_manager import execute_safe, ShellExecutionError
                 try:
-                    output = subprocess.run(
+                    output = execute_safe(
                         ['python', str(path)],
-                        capture_output=True, text=True,
                         timeout=parameters.get("timeout", 30)
                     )
+                    if not output.is_success():
+                        raise ShellExecutionError(output)
                     result = f"Exit code: {output.returncode}\nStdout:\n{output.stdout}\nStderr:\n{output.stderr}"
+                except ShellExecutionError as e:
+                    result = f"Run failed: {e}"
                 except Exception as e:
                     result = f"Run failed: {e}"
 

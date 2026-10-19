@@ -62,7 +62,7 @@ class ToolDispatchTests(unittest.TestCase):
         self.m = manager()
         self.calls = []
 
-        def fake_exec(name, args, cancel=None):
+        def fake_exec(name, args, cancel=None, tainted_by=""):
             self.calls.append((name, args))
             return f"{name} done"
 

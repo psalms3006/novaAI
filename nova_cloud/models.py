@@ -162,6 +162,9 @@ class EmailToken(Base):
     created_at = Column(Float, nullable=False, default=now)
     expires_at = Column(Float, nullable=False)
     used_at = Column(Float, nullable=True)
+    # Verification code (6-digit) fallback
+    code_hash = Column(String(64), nullable=True, index=True)
+    code_expires_at = Column(Float, nullable=True)
 
 
 # -- synced preferences ------------------------------------------------------

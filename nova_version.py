@@ -17,7 +17,7 @@ import os
 
 APP_VERSION = "1.0.0"
 
-DEFAULT_CLOUD_URL = ""
+DEFAULT_CLOUD_URL = "https://api.omniel.com.ng"
 
 
 def cloud_base_url() -> str:

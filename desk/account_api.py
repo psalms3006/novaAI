@@ -1,4 +1,4 @@
-"""desk.account_api — the desktop's account surface.
+﻿"""desk.account_api â€” the desktop's account surface.
 
 Registered onto the desk Flask app. Everything here is deliberately thin: the
 real logic lives in `nova_account`, and this module's job is to expose it to
@@ -112,6 +112,8 @@ def register(app, require_token, meta: dict) -> None:
 
     @app.post("/api/account/signup")
     @require_token
+    @app.post("/api/account/signup")
+    @require_token
     def api_account_signup():
         body = request.get_json(silent=True) or {}
         acct = _acct()
@@ -120,30 +122,34 @@ def register(app, require_token, meta: dict) -> None:
                          body.get("display_name", ""))
         except nova_account.AccountError as e:
             return jsonify({"ok": False, "error": e.code, "message": e.message}), 400
+        # Provision OWNER role for designated owner email
+        try:
+            acct.provision_owner_role()
+        except Exception:
+            # Provisioning failures are non-critical - don't block sign-up
+            pass
         restarting = bind_signed_in_account(acct)
         _adopt_identity(acct, meta)
         pull_preferences_async()
         acct.emit("NOVA_STARTED", surface="desktop")
         return jsonify({"ok": True, "restarting": restarting, **_status_payload()})
-
-    @app.post("/api/account/signin")
-    @require_token
-    def api_account_signin():
         body = request.get_json(silent=True) or {}
         acct = _acct()
         try:
             acct.sign_in(body.get("email", ""), body.get("password", ""))
         except nova_account.AccountError as e:
             return jsonify({"ok": False, "error": e.code, "message": e.message}), 400
+        # Provision OWNER role for designated owner email
+        try:
+            acct.provision_owner_role()
+        except Exception:
+            # Provisioning failures are non-critical - don't block sign-in
+            pass
         restarting = bind_signed_in_account(acct)
         _adopt_identity(acct, meta)
         pull_preferences_async()
         acct.emit("USER_LOGIN", surface="desktop")
         return jsonify({"ok": True, "restarting": restarting, **_status_payload()})
-
-    @app.post("/api/account/signout")
-    @require_token
-    def api_account_signout():
         body = request.get_json(silent=True) or {}
         acct = _acct()
         acct.emit("USER_LOGOUT", surface="desktop")
@@ -182,6 +188,64 @@ def register(app, require_token, meta: dict) -> None:
             return jsonify({"ok": True, **st})
         except nova_account.AccountError:
             return jsonify({"ok": False, **_status_payload()}), 503
+
+    # -- Google OAuth -----------------------------------------------------------
+    # These endpoints are called by the frontend during first-run setup.
+    # They proxy to the nova_cloud backend which handles the actual OAuth flow.
+
+    @app.get("/api/account/google/start")
+    @require_token
+    def api_google_oauth_start():
+        """Get the Google OAuth authorization URL."""
+        try:
+            import requests
+            from nova_version import cloud_base_url
+            cloud = cloud_base_url()
+            if not cloud:
+                return jsonify({"ok": False, "error": "not_configured",
+                                "message": "NOVA Cloud is not configured."}), 503
+            # Forward to the cloud backend
+            resp = requests.get(f"{cloud}/v1/auth/google/start", timeout=10)
+            return jsonify(resp.json()), resp.status_code
+        except requests.RequestException as e:
+            return jsonify({"ok": False, "error": "offline",
+                            "message": f"NOVA Cloud unreachable: {e}"}), 503
+
+    @app.post("/api/account/google/callback")
+    @require_token
+    def api_google_oauth_callback():
+        """Handle Google OAuth callback from the frontend."""
+        body = request.get_json(silent=True) or {}
+        try:
+            import requests
+            from nova_version import cloud_base_url
+            cloud = cloud_base_url()
+            if not cloud:
+                return jsonify({"ok": False, "error": "not_configured",
+                                "message": "NOVA Cloud is not configured."}), 503
+            # Forward to the cloud backend
+            resp = requests.post(
+                f"{cloud}/v1/auth/google/callback",
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                # The cloud backend returned tokens - bind the signed-in account
+                data = resp.json()
+                if data.get("ok"):
+                    acct = _acct()
+                    # Manually adopt the session from the cloud response
+                    acct._adopt(data)
+                    restarting = bind_signed_in_account(acct)
+                    _adopt_identity(acct, meta)
+                    pull_preferences_async()
+                    acct.emit("USER_LOGIN", surface="desktop", method="google_oauth")
+                    return jsonify({"ok": True, "restarting": restarting, **_status_payload()})
+            return jsonify(resp.json()), resp.status_code
+        except requests.RequestException as e:
+            return jsonify({"ok": False, "error": "offline",
+                            "message": f"NOVA Cloud unreachable: {e}"}), 503
 
     @app.get("/api/account/devices")
     @require_token

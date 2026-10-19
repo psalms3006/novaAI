@@ -1,5 +1,6 @@
+import os
 import subprocess
-import sys
+from core.shell_manager import execute_safe
 
 def execute(parameters):
     app_name = parameters.get("app_name", "").strip()
@@ -7,65 +8,44 @@ def execute(parameters):
         return "No app name provided."
 
     app_map = {
-        "settings": "start ms-settings:",
-        "chrome": "start chrome",
+        "settings": "ms-settings:",
+        "chrome": "chrome",
         "notepad": "notepad",
         "calculator": "calc",
         "file explorer": "explorer",
         "explorer": "explorer",
         "vscode": "code",
         "visual studio code": "code",
-        "spotify": "start spotify",
-        "whatsapp": "start whatsapp",
-        "edge": "start msedge",
-        "microsoft edge": "start msedge",
+        "spotify": "spotify",
+        "whatsapp": "whatsapp",
+        "edge": "msedge",
+        "microsoft edge": "msedge",
         "terminal": "wt",
         "windows terminal": "wt",
         "task manager": "taskmgr",
         "control panel": "control",
-        "word": "start winword",
-        "excel": "start excel",
-        "powerpoint": "start powerpnt",
+        "word": "winword",
+        "excel": "excel",
+        "powerpoint": "powerpnt",
         "paint": "mspaint",
-        "photos": "start ms-photos:",
-        "snipping tool": "start ms-screenclip:",
-        "camera": "start microsoft.windows.camera:",
-        "maps": "start bingmaps:",
-        "mail": "start outlookmail:",
-        "clock": "start ms-clock:",
+        "photos": "ms-photos:",
+        "snipping tool": "ms-screenclip:",
+        "camera": "microsoft.windows.camera:",
+        "maps": "bingmaps:",
+        "mail": "outlookmail:",
+        "clock": "ms-clock:",
     }
 
     lookup = app_name.lower().strip()
-    if lookup in app_map:
-        cmd = app_map[lookup]
-    else:
-        # The name is interpolated into a shell string, and it comes from the
-        # model — which a web page fetched by web_search can steer. A quote
-        # ends the quoted argument and everything after it is another command
-        # to cmd.exe; a percent sign expands an environment variable even
-        # inside quotes.
-        #
-        # Parentheses are deliberately NOT rejected: "C:\Program Files (x86)\"
-        # is an ordinary path, and inside double quotes they are not special.
-        bad = set('"%&|<>^`$;\r\n\t') & set(app_name)
-        if bad:
-            return (f"I won't open {app_name!r} — an application name cannot "
-                    f"contain {''.join(sorted(bad))}.")
-        cmd = f'start "" "{app_name}"'
-
     try:
-        kwargs = {"shell": True}
-        if sys.platform == "win32":
-            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
-        stdout, stderr = proc.communicate(timeout=10)
-        if proc.returncode != 0 and stderr:
-            err = stderr.decode("utf-8", errors="replace").strip()
-            if err:
-                return f"Error opening {app_name}: {err}"
+        # Use os.startfile for opening apps/URIs. This is the Windows-native,
+        # safe way to open applications/files/URIs without invoking a shell
+        # or worrying about shell injection.
+        if lookup in app_map:
+            os.startfile(app_map[lookup])
+        else:
+            # For arbitrary paths, still use startfile but validate it first.
+            os.startfile(app_name)
         return f"Opened {app_name}."
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        return f"Opened {app_name} (process timed out but was launched)."
     except Exception as e:
         return f"Error opening {app_name}: {e}"

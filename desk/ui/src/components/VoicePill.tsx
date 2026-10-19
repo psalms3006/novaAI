@@ -45,13 +45,13 @@ export const VoicePill: React.FC = () => {
         style={{
           backgroundColor: theme.palette.glassSurface,
           borderColor: theme.palette.glassBorder,
-          boxShadow: `0 20px 40px -10px ${theme.palette.ambientShadow}, inset 0 1px 1px 0 ${theme.palette.glassHighlight}`,
+          boxShadow: `0 24px 48px -12px ${theme.palette.ambientShadow}, inset 0 1px 1px 0 ${theme.palette.glassHighlight}`,
         }}
       >
         <button
           onClick={onMic}
           disabled={!rt.backendReachable}
-          className={`w-7 h-7 rounded-full flex items-center justify-center transition-all cursor-pointer active:scale-95 border disabled:opacity-40 ${micLive ? 'scale-105 shadow-md' : 'hover:scale-105'}`}
+          className={`w-8 h-8 rounded-full flex items-center justify-center transition-all cursor-pointer active:scale-95 border disabled:opacity-40 ${micLive ? 'scale-105 shadow-md ring-2 ring-emerald-500/30' : 'hover:scale-105 hover:brightness-110'}`}
           style={{
             backgroundColor: micLive ? color : rt.voiceRunning ? theme.palette.glassSurface : theme.palette.accent,
             color: micLive ? '#ffffff' : rt.voiceRunning ? theme.palette.textSecondary : theme.isDark ? theme.palette.bgBase : '#ffffff',
@@ -67,7 +67,7 @@ export const VoicePill: React.FC = () => {
         {(speaking || replying) && (
           <button
             onClick={speaking ? rt.interrupt : rt.stopReply}
-            className="w-7 h-7 rounded-full flex items-center justify-center border cursor-pointer hover:scale-105 active:scale-95 transition-all"
+            className="w-8 h-8 rounded-full flex items-center justify-center border cursor-pointer hover:scale-105 active:scale-95 transition-all hover:brightness-110"
             style={{ borderColor: theme.palette.glassBorder, color: theme.palette.textPrimary, backgroundColor: theme.palette.bgElevated }}
             title={speaking ? 'Stop her speaking (Esc)' : 'Stop the reply'}
             aria-label={speaking ? 'Interrupt NOVA' : 'Stop the reply'}
@@ -76,7 +76,7 @@ export const VoicePill: React.FC = () => {
           </button>
         )}
 
-        <div className="flex items-center space-x-2 text-xs font-sans pr-3 border-r min-w-[280px]" style={{ borderColor: theme.palette.glassBorder }}>
+        <div className="flex items-center space-x-2.5 text-xs font-sans pr-3 border-r min-w-[300px]" style={{ borderColor: theme.palette.glassBorder }}>
           {editing || text ? (
             <input
               type="text"
@@ -86,7 +86,7 @@ export const VoicePill: React.FC = () => {
               onBlur={() => !text && setEditing(false)}
               autoFocus
               maxLength={4000}
-              placeholder="Type to NOVA and press Enter…"
+              placeholder="Ask or tell NOVA anything…"
               aria-label="Message NOVA"
               className="bg-transparent outline-none w-full text-xs font-sans placeholder:opacity-40 select-text"
               style={{ color: theme.palette.textPrimary }}
@@ -94,25 +94,25 @@ export const VoicePill: React.FC = () => {
           ) : (
             <button
               onClick={() => setEditing(true)}
-              className="cursor-text transition-colors flex items-center gap-2 w-full truncate opacity-80 hover:opacity-100 text-left"
+              className="cursor-text transition-colors flex items-center gap-2.5 w-full truncate opacity-75 hover:opacity-100 text-left"
               style={{ color: theme.palette.textPrimary }}
               aria-label="Type a message to NOVA"
             >
               <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: color }} />
-              <span className="truncate">
+              <span className="truncate text-xs">
                 {rt.phase === 'listening' || rt.phase === 'idle' ? `${rt.phaseLabel} · speak, or click to type` : rt.phaseLabel}
               </span>
             </button>
           )}
           {text && (
-            <button onClick={send} className="cursor-pointer opacity-70 hover:opacity-100" style={{ color: theme.palette.accent }} aria-label="Send">
-              <i className="fa-solid fa-paper-plane text-[11px]" />
+            <button onClick={send} className="cursor-pointer opacity-80 hover:opacity-100 transition-opacity p-1" style={{ color: theme.palette.accent }} aria-label="Send">
+              <i className="fa-solid fa-paper-plane text-xs" />
             </button>
           )}
         </div>
 
-        <div className="flex items-center space-x-2 text-[10px] font-sans opacity-60" style={{ color: theme.palette.textSecondary }}>
-          <kbd className="px-1.5 py-0.5 rounded text-[9px] border font-mono" style={{ backgroundColor: theme.palette.glassSurface, borderColor: theme.palette.glassBorder }}>
+        <div className="flex items-center space-x-2 text-[10px] font-sans opacity-60 hover:opacity-90 transition-opacity" style={{ color: theme.palette.textSecondary }}>
+          <kbd className="px-1.5 py-0.5 rounded text-[9px] border font-mono shadow-xs" style={{ backgroundColor: theme.palette.glassSurface, borderColor: theme.palette.glassBorder }}>
             Ctrl K
           </kbd>
           <button

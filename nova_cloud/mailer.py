@@ -30,7 +30,7 @@ import threading
 import time
 from dataclasses import dataclass
 from email.message import EmailMessage
-from typing import Callable
+from typing import Callable, Tuple
 
 log = logging.getLogger("nova.mail")
 
@@ -227,7 +227,7 @@ def _link(cfg: EmailConfig, path: str, token: str) -> str:
     return f"{base}{path}?token={token}"
 
 
-def verification_email(cfg: EmailConfig, token: str) -> tuple[str, str, str]:
+def verification_email(cfg: EmailConfig, token: str) -> Tuple[str, str, str]:
     url = _link(cfg, "/verify", token)
     subject = f"Verify your {cfg.brand} account"
     text = (f"Welcome to {cfg.brand}.\n\n"
@@ -243,7 +243,7 @@ def verification_email(cfg: EmailConfig, token: str) -> tuple[str, str, str]:
     return subject, text, _render(cfg, "Verify your email", body)
 
 
-def reset_email(cfg: EmailConfig, token: str) -> tuple[str, str, str]:
+def reset_email(cfg: EmailConfig, token: str) -> Tuple[str, str, str]:
     url = _link(cfg, "/reset", token)
     subject = f"Reset your {cfg.brand} password"
     text = (f"Someone asked to reset the password for this {cfg.brand} "
@@ -260,8 +260,21 @@ def reset_email(cfg: EmailConfig, token: str) -> tuple[str, str, str]:
     return subject, text, _render(cfg, "Reset your password", body)
 
 
-def new_device_email(cfg: EmailConfig, device_name: str, platform: str,
-                     when: str) -> tuple[str, str, str]:
+def verification_code_email(cfg: EmailConfig, code: str) -> Tuple[str, str, str]:
+    subject = f"Your {cfg.brand} verification code"
+    text = (f"Your verification code is: {code}\n\n"
+            f"Enter this code in NOVA to verify your email address.\n\n"
+            "This code expires in 10 minutes. If you did not request this, "
+            f"you can ignore this message.\n")
+    body = ("<p style='font-size:14px;line-height:1.6;margin:0'>"
+            "Your verification code is:</p>"
+            + _BUTTON.format(url=html.escape(code), label=code) +
+            "<p style='font-size:13px;color:#5c6270;margin:22px 0 0'>"
+            "This code expires in 10 minutes. If you did not request this, "
+            "you can ignore this message.</p>")
+    return subject, text, _render(cfg, "Your verification code", body)
+
+
     subject = f"New sign-in to your {cfg.brand} account"
     text = (f"{cfg.brand} was signed in on a new device.\n\n"
             f"Device:   {device_name}\nPlatform: {platform}\nWhen:     {when}\n\n"

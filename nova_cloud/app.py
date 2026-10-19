@@ -12,6 +12,7 @@ route, because the guard verifies a different signing key and audience.
 """
 from __future__ import annotations
 
+import os
 import time
 
 from flask import Flask, jsonify, request, send_from_directory
@@ -137,6 +138,39 @@ def create_app(cfg=None) -> Flask:
         return _outcome_page(
             "Email confirmed" if ok else "This link did not work",
             message, ok), (200 if ok else 400)
+
+    # -- diagnostic endpoint for verification flow -------------------------
+    # Helps operators debug email verification without needing a real token.
+    # Returns configuration status and a test token validation (without DB write).
+    @app.get("/api/health/verify")
+    def verify_health():
+        from .mailer import email_config
+        from .api_auth import _consume_email_token
+        from . import security as sec
+
+        mc = email_config()
+        nova_domain = os.getenv("NOVA_DOMAIN", "").strip()
+        app_base_url = os.getenv("APP_BASE_URL", "").strip()
+
+        # Test token validation logic with a dummy token (won't match any real token)
+        # This verifies the token hashing/validation logic works without hitting the DB
+        test_token = "test-token-not-valid"
+        token_hash = sec.token_hash(test_token)
+
+        return jsonify({
+            "ok": True,
+            "verify_endpoint": "/verify",
+            "reset_endpoint": "/reset",
+            "configuration": {
+                "nova_domain": nova_domain or "(unset)",
+                "app_base_url": app_base_url or "(unset)",
+                "email_provider": mc.provider,
+                "email_configured": mc.configured,
+                "domain_match": nova_domain and app_base_url and nova_domain in app_base_url,
+            },
+            "test_token_hash": token_hash[:16] + "...",
+            "note": "This endpoint verifies configuration only. Real token validation requires a valid token from email.",
+        })
 
     @app.get("/reset")
     def reset_page():

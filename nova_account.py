@@ -1,4 +1,4 @@
-"""nova_account — the NOVA desktop's account client.
+﻿"""nova_account â€” the NOVA desktop's account client.
 
 Three properties this module exists to guarantee:
 
@@ -191,6 +191,30 @@ class NovaAccount:
         last = float(self._session.get("last_verified") or 0)
         return bool(last) and (time.time() - last) > grace
 
+    def _inactivity_expired(self) -> bool:
+        """Check if the session has been inactive for longer than the threshold."""
+        threshold = float(self._session.get("inactivity_threshold_s") or 30 * 86400)
+        last = float(self._session.get("last_activity") or 0)
+        return bool(last) and (time.time() - last) > threshold
+
+    def update_activity(self) -> None:
+        """Update the last activity timestamp to now."""
+        with self._lock:
+            if self._session.get("user"):
+                self._session["last_activity"] = time.time()
+                store.set_json(_K_SESSION, self._session)
+
+    @property
+    def signed_in(self) -> bool:
+        with self._lock:
+            if not self._session.get("user"):
+                return False
+            if self._grace_expired():
+                return False
+            if self._inactivity_expired():
+                return False
+            return True
+
     def status(self) -> dict:
         """Everything a UI needs, with no network access."""
         with self._lock:
@@ -205,8 +229,11 @@ class NovaAccount:
             "credential_backend": store.backend(),
             "hardware_backed": store.is_hardware_backed(),
             "last_verified": sess.get("last_verified"),
+            "last_activity": sess.get("last_activity"),
             "offline_grace_s": sess.get("offline_grace_s"),
+            "inactivity_threshold_s": sess.get("inactivity_threshold_s"),
             "grace_expired": self._grace_expired() if sess.get("user") else False,
+            "inactivity_expired": self._inactivity_expired() if sess.get("user") else False,
             # Verification is reported honestly: an unverified account says so
             # rather than being displayed as if it were confirmed.
             "email_verified": bool((sess.get("user") or {}).get("email_verified")),
@@ -267,16 +294,20 @@ class NovaAccount:
                 "access_expires": time.time() + float(payload.get("expires_in") or 900),
                 "refresh_token": payload.get("refresh_token") or "",
                 "offline_grace_s": float(payload.get("offline_grace_s") or 30 * 86400),
+                "inactivity_threshold_s": float(payload.get("inactivity_threshold_s") or 30 * 86400),
                 "last_verified": time.time(),
+                "last_activity": time.time(),
                 "verification_required": bool(payload.get("verification_required")),
                 "email_delivery": payload.get("email_delivery") or {},
             }
             store.set_json(_K_SESSION, self._session)
         self._last_online = time.time()
         self._notify()
-        self.start_background()
+       self.start_background()
 
-    def sign_out(self, everywhere: bool = False) -> dict:
+        # Provision owner role if this is the designated owner email
+        self.provision_owner_role()
+   def sign_out(self, everywhere: bool = False) -> dict:
         """Clear the account from this device.
 
         Local resources are explicitly untouched: models, knowledge files and
@@ -336,6 +367,7 @@ class NovaAccount:
                 payload.get("expires_in") or 900)
             self._session["refresh_token"] = payload.get("refresh_token") or refresh
             self._session["last_verified"] = time.time()
+            self._session["last_activity"] = time.time()
             store.set_json(_K_SESSION, self._session)
             return self._session["access_token"]
 
@@ -467,7 +499,135 @@ class NovaAccount:
             self._tel_q.put_nowait({"kind": "agent_run", "agent": agent, **kw})
         except queue.Full:
             pass
-
+    def _sync_role_to_settings(self, role: str) -> None:
+        """Sync the user role to local settings for personalization."""
+        if not role:
+            return
+        try:
+            import desk.settings as desk_settings
+            current_role = desk_settings.get("user_role", "")
+            if current_role != role:
+                desk_settings.set_many({"user_role": role})
+        except Exception:
+            # Settings sync failure is non-critical
+            pass
+    
+    def provision_owner_role(self) -> bool:
+        """Provision the OWNER role for the designated owner email.
+        
+        This should be called after a user signs in to ensure the designated
+        owner account has the OWNER role. Returns True if the role was
+        successfully set or already had the role.
+        
+        Security note: This only works if the backend permits the role update.
+        The backend should verify email ownership and authorization before
+        granting the OWNER role.
+        """
+        try:
+            # Check if this is the designated owner email
+            owner_email = "psalmistasagwara3006@gmail.com"
+            user_email = self._email().lower()
+            
+            if user_email == owner_email:
+                current_role = self.get_user_role()
+                if current_role != "OWNER":
+                    # Attempt to provision the OWNER role
+                    self.update_profile(role="OWNER")
+                    # Verify it was set
+                    new_role = self.get_user_role()
+                    result = new_role == "OWNER"
+                else:
+                    # Already has the OWNER role
+                    result = True
+            else:
+                result = True  # Not the owner email, nothing to provision
+            
+            # Audit log the ownership provisioning attempt
+            if user_email == owner_email:
+                self.emit("OWNER_PROVISIONING_ATTEMPT", 
+                         success=result,
+                         target_email=owner_email,
+                         role_assigned="OWNER" if result else self.get_user_role())
+             
+            return result
+        except Exception as e:
+            # Log but don't fail - provisioning is best-effort for security
+            import logging
+            logger = logging.getLogger("nova.account")
+            logger.debug(f"Owner provisioning failed: {e}")
+           return False
+            
+   def get_user_role(self) -> str:
+        """Get the user's role from the current session.
+        
+        Returns:
+            str: The user's role (USER, ADMIN, or OWNER). Defaults to USER if 
+                 no account is signed in or role is not set.
+        """
+        try:
+            # Return the role from session if available
+            with self._lock:
+                return self._session.get("user", {}).get("role", "USER")
+        except Exception:
+            return "USER"
+   
+   def set_user_role(self, target_user_id: str, role: str) -> bool:
+        """Set the role for a specific user (requires OWNER privileges).
+        
+        Args:
+            target_user_id: The user ID of the target user
+            role: The role to set (USER, ADMIN, or OWNER)
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        # Verify caller has OWNER role
+        if not self._has_owner_role():
+            # Audit log unauthorized attempt
+            self.emit("USER_ROLE_CHANGE_ATTEMPT", 
+                     success=False,
+                     error="INSUFFICIENT_PERMISSIONS",
+                     actor_user_id=self.user_id,
+                     target_user_id=target_user_id,
+                     requested_role=role)
+            return False
+        
+        # Validate role
+        if role not in ("USER", "ADMIN", "OWNER"):
+            # Audit log invalid role attempt
+            self.emit("USER_ROLE_CHANGE_ATTEMPT", 
+                     success=False,
+                     error="INVALID_ROLE",
+                     actor_user_id=self.user_id,
+                     target_user_id=target_user_id,
+                     requested_role=role)
+            return False
+        
+        # Prevent self-removal of OWNER role
+        if target_user_id == self.user_id and role != "OWNER":
+            # Audit log self-removal attempt
+            self.emit("USER_ROLE_CHANGE_ATTEMPT", 
+                     success=False,
+                     error="SELF_REMOVAL_PREVENTED",
+                     actor_user_id=self.user_id,
+                     target_user_id=target_user_id,
+                     requested_role=role)
+            return False
+        
+        # For now, return False as this requires backend admin API support
+        # In a full implementation, this would call an admin endpoint to update another user's role
+        # Audit log the attempt (even though it will fail)
+        self.emit("USER_ROLE_CHANGE_ATTEMPT", 
+                 success=False,
+                 error="BACKEND_NOT_IMPLEMENTED",
+                 actor_user_id=self.user_id,
+                 target_user_id=target_user_id,
+                 requested_role=role)
+        return False
+    
+    def _has_owner_role(self) -> bool:
+        """Check if the current user has OWNER role."""
+        return self.get_user_role() == "OWNER"
     def emit_error(self, code: str, **context) -> None:
         try:
             self._tel_q.put_nowait({"kind": "error", "code": code,

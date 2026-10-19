@@ -51,13 +51,20 @@ def _open_settings(page: str) -> str:
     return f"Opened Settings at {page.strip() or uri} (ms-settings:{uri})."
 
 
+from core.shell_manager import execute_safe, ShellExecutionError
+
 def _winget(*argv, timeout=120) -> tuple:
     exe = shutil.which("winget")
     if not exe:
         raise FileNotFoundError("winget is not available on this computer")
-    r = subprocess.run([exe, *argv, "--accept-source-agreements", "--disable-interactivity"],
-                       capture_output=True, text=True, timeout=timeout, encoding="utf-8", errors="replace")
-    return r.returncode, (r.stdout or "") + (r.stderr or "")
+    
+    # Use ShellManager for consistent execution and error handling
+    result = execute_safe([exe, *argv, "--accept-source-agreements", "--disable-interactivity"], timeout=timeout)
+    
+    if not result.is_success():
+        raise ShellExecutionError(result)
+    
+    return result.returncode, (result.stdout or "") + (result.stderr or "")
 
 
 def _list_apps(name: str) -> str:

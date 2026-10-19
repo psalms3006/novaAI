@@ -254,18 +254,15 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
         return f"All dependencies already installed: {', '.join(dependencies)}"
 
     print(f"[DevAgent] 📦 Installing: {to_install}")
+    from core.shell_manager import execute_safe
     try:
-        result = subprocess.run(
+        result = execute_safe(
             [sys.executable, "-m", "pip", "install"] + to_install,
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
             timeout=120, cwd=str(project_dir)
         )
-        if result.returncode == 0:
+        if result.is_success():
             return f"Installed: {', '.join(to_install)}"
         return f"Install warning (non-fatal): {result.stderr[:200]}"
-    except subprocess.TimeoutExpired:
-        return "Dependency install timed out (non-fatal)."
     except Exception as e:
         return f"Install error (non-fatal): {e}"
 

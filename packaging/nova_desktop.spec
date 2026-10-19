@@ -95,14 +95,23 @@ def _silero_vad():
 
 _buildinfo = _build_stamp()
 
-# Auto-detect Python shared library
+# Auto-detect Python shared library (portable across machines)
 _python_dll = os.path.join(os.path.dirname(sys.executable), "python311.dll")
 if not os.path.exists(_python_dll):
-    # Try uv-managed Python
-    _python_dll = r'C:\Users\Lenovo\AppData\Roaming\uv\python\cpython-3.11-windows-x86_64-none\python311.dll'
+    # Try common Python installations
+    for candidate in [
+        os.path.join(os.path.dirname(sys.executable), "python311.dll"),
+        os.path.join(sys.base_prefix, "python311.dll"),
+        os.path.join(sys.prefix, "python311.dll"),
+    ]:
+        if os.path.exists(candidate):
+            _python_dll = candidate
+            break
 _binaries = []
 if os.path.exists(_python_dll):
     _binaries = [(_python_dll, '.')]
+else:
+    print("WARNING: python311.dll not found; build may fail on target machines")
 
 hidden = [
     # web stack

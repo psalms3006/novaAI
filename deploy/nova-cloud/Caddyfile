@@ -1,5 +1,18 @@
 # HTTPS for NOVA Cloud. Caddy gets a Let's Encrypt certificate for the domain
 # in NOVA_DOMAIN (set in .env) as soon as DNS points at this server.
+#
+# HTTP/3 (QUIC) is explicitly disabled to avoid ERR_QUIC_PROTOCOL_ERROR
+# on domains where UDP/443 is blocked, TLS config is incompatible, or
+# intermediate proxies interfere with QUIC. Can be re-enabled once the
+# deployment is verified working over HTTP/2.
+{
+	servers {
+		protocol {
+			experimental_http3 off
+		}
+	}
+}
+
 {$NOVA_DOMAIN} {
 	encode zstd gzip
 	reverse_proxy api:8080 {

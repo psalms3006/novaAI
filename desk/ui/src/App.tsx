@@ -12,8 +12,7 @@ import { ThemeSelectorModal } from './components/ThemeSelectorModal';
 import { NotificationToasts } from './components/NotificationToasts';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { AmbientView } from './components/AmbientView';
-import { Onboarding } from './components/Onboarding';
-import { FirstRun } from './components/FirstRun';
+import { OnboardingEntry } from './onboarding/OnboardingEntry';
 import { PresenceScreen } from './screens/PresenceScreen';
 import { SettingsScreen } from './screens/settings/SettingsScreen';
 import { SynapticMapScreen } from './screens/SynapticMapScreen';
@@ -142,8 +141,7 @@ function AppContent() {
       <ThemeSelectorModal />
       <NotificationToasts />
       <ConfirmDialog />
-      <Onboarding />
-      <FirstRun />
+      <OnboardingEntry />
     </div>
   );
 }

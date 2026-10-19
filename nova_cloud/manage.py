@@ -362,6 +362,35 @@ def check(_args) -> int:
     if mc.configured and not mc.base_url:
         problems.append("APP_BASE_URL is unset; email links would point nowhere")
 
+    # Domain configuration validation
+    nova_domain = os.getenv("NOVA_DOMAIN", "").strip()
+    app_base_url = os.getenv("APP_BASE_URL", "").strip()
+    if not nova_domain:
+        problems.append("NOVA_DOMAIN is unset; Caddy will not know which domain to serve")
+    if not app_base_url:
+        problems.append("APP_BASE_URL is unset; email verification links will point nowhere")
+    elif not app_base_url.startswith("https://"):
+        problems.append("APP_BASE_URL must use https:// for production")
+    if nova_domain and app_base_url:
+        # Extract domain from APP_BASE_URL and compare with NOVA_DOMAIN
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(app_base_url)
+            base_domain = parsed.netloc
+            if base_domain != nova_domain:
+                warnings.append(f"NOVA_DOMAIN ({nova_domain}) differs from APP_BASE_URL domain ({base_domain}); they should match")
+        except Exception:
+            warnings.append("Could not parse APP_BASE_URL for domain validation")
+
+    mc = mail.email_config()
+    print(f"email provider     : {mc.provider}"
+          f"{'' if mc.configured else '  (not configured)'}")
+    if cfg.require_email_verification and not mc.configured:
+        problems.append("email verification is required but no provider is "
+                        "configured; new users could not finish signing up")
+    if mc.configured and not mc.base_url:
+        problems.append("APP_BASE_URL is unset; email links would point nowhere")
+
     print(f"admin MFA required : {cfg.admin_require_mfa}")
     if not cfg.admin_require_mfa:
         warnings.append("admin MFA is disabled")

@@ -1304,6 +1304,12 @@ class LiveManager:
         #: Tool calls running beside the receiver, and ones Gemini withdrew.
         self._tool_tasks: set = set()
         self._cancelled_tool_ids: set = set()
+        #: What outside content the current voice turn has read (a web page,
+        #: a document, an email). Typed chat marks the rest of its turn
+        #: untrusted after such a tool; voice never did, so a page NOVA had
+        #: just read aloud could steer her next tool call with the person's
+        #: full authority. Cleared when the person speaks again.
+        self._tainted_by: str = ""
         self._send_total = 0.0
         self._send_count = 0
         self._send_worst = 0.0
@@ -3216,6 +3222,7 @@ class LiveManager:
                             if self._trace:
                                 self._trace.turn_started()
                             self._watchdog.user_spoke()
+                            self._tainted_by = ""        # the person is speaking again
                             heard.append(text)
                             self._publish(LiveEvent("user_transcript", text=text))
 
@@ -3603,9 +3610,12 @@ class LiveManager:
         # Agents panel reads this, whichever path (voice, chat, task) ran it.
         work = agent_activity.begin(agent_activity.agent_for_tool(name),
                                     _tool_action(name, args), source="voice")
+        tainted_by = getattr(self, "_tainted_by", "")
         try:
             result = await self._await_tool(
-                asyncio.ensure_future(asyncio.to_thread(self._execute_tool, name, args, cancel_ev)),
+                asyncio.ensure_future(asyncio.to_thread(
+                    self._execute_tool, name, args, cancel_ev,
+                    **({"tainted_by": tainted_by} if tainted_by else {}))),
                 budget)
         except asyncio.TimeoutError:
             # Say it failed, and say not to try again.
@@ -3625,6 +3635,12 @@ class LiveManager:
             _log("[LIVE] tool %s failed: %s", name, e)
         finally:
             agent_activity.end(work)
+        try:
+            from nova_core import trust as _trust
+            if _trust.taints(name):
+                self._tainted_by = f"what {name.replace('_', ' ')} returned"
+        except Exception:
+            pass
         _log("[LIVE] tool %s finished in %.1fs", name, time.time() - t0)
         self._publish(LiveEvent("tool_result", tool=name,
                                 summary=str(result)[:200]))
@@ -3686,14 +3702,24 @@ class LiveManager:
                 raise asyncio.TimeoutError()
 
     @staticmethod
-    def _execute_tool(name: str, args: dict, cancel: "threading.Event | None" = None) -> Any:
-        """NOVA Core owns what tools are and what they do; this only calls it."""
+    def _execute_tool(name: str, args: dict, cancel: "threading.Event | None" = None,
+                      tainted_by: str = "") -> Any:
+        """NOVA Core owns what tools are and what they do; this only calls it.
+
+        tainted_by: what outside content this voice turn has already read. The
+        call then runs untrusted, so the permission engine asks before a
+        consequential action a page or document may have asked for.
+        """
         import nova as _nova
         meta = _load_meta()
         if cancel is not None:
             meta = {**meta, "_cancel": cancel}
         # remember_fact stores through NOVA Core like every other tool; a
         # second write here skipped its checks (2026-09-30 log).
+        if tainted_by:
+            from nova_core import trust as _trust
+            with _trust.untrusted(tainted_by):
+                return _nova._execute_tool_sync(name, args, meta)
         return _nova._execute_tool_sync(name, args, meta)
 
     async def _video_sender(self, session: Any) -> None:

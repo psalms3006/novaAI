@@ -100,5 +100,10 @@ end;
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if (CurUninstallStep = usPostUninstall) and DeleteUserData then
+  begin
+    // Remove APPDATA user data
     DelTree(ExpandConstant('{userappdata}\NOVA'), True, True, True);
+    // Remove LOCALAPPDATA runtime artifacts (updates, logs, etc.)
+    DelTree(ExpandConstant('{localappdata}\NOVA'), True, True, True);
+  end;
 end;

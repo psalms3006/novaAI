@@ -11,6 +11,8 @@ from typing import Any, Callable, Dict, Optional
 
 from core.goal_engine import GoalEngine, GoalStep
 from core.capability_bus import CapabilityBus, Capability
+from core.shell_manager import ShellExecutionError
+from core.recovery_manager import RecoveryManager
 
 log = logging.getLogger("nova.execution")
 
@@ -67,6 +69,7 @@ class ExecutionEngine:
     ) -> None:
         self.goals = goal_engine
         self.bus = capability_bus or CapabilityBus()
+        self.recovery = RecoveryManager(self.bus)
         self.tool_fn = tool_fn
         self.agent_fn = agent_fn
 
@@ -91,8 +94,13 @@ class ExecutionEngine:
                 raw_output = self.tool_fn(step.tool, step.input or {}, meta)
             else:
                 raw_output = f"[no-op] {step.description}"
+        except ShellExecutionError as se:
+            diagnosis = self.recovery.diagnose_and_repair(se)
+            log.warning(f"Shell execution failed, diagnosis: {diagnosis}")
+            self.goals.fail_step(goal_id, step.step_id, f"Shell failed: {diagnosis}", retry=True)
+            return StepResult(step_id=step.step_id, status="FAILED", output=None, verification=None, outcome=StepOutcome.FAILURE, error=f"Shell failed: {diagnosis}")
         except Exception as e:
-            log.error("Step execution failed: %s", e)
+            log.error(f"Step execution failed for step {step.step_id} (tool: {step.tool}, agent: {step.agent}): {e}", exc_info=True)
             self.goals.fail_step(goal_id, step.step_id, str(e), retry=True)
             return StepResult(
                 step_id=step.step_id,
@@ -100,7 +108,7 @@ class ExecutionEngine:
                 output=None,
                 verification=None,
                 outcome=StepOutcome.FAILURE,
-                error=str(e),
+                error=str(e)
             )
 
         verification = self._verify(step, raw_output, capability)

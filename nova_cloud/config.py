@@ -106,6 +106,13 @@ class Config:
     free_live_per_day: int = field(default_factory=lambda: _int("NOVA_PLAN_FREE_LIVE", 60))
     free_generate_per_day: int = field(default_factory=lambda: _int("NOVA_PLAN_FREE_GENERATE", 400))
 
+    # -- Google OAuth ------------------------------------------------------
+    # Google OAuth 2.0 credentials for "Sign in with Google"
+    google_oauth_client_id: str = field(default_factory=lambda: os.getenv("NOVA_GOOGLE_OAUTH_CLIENT_ID", ""))
+    google_oauth_client_secret: str = field(default_factory=lambda: os.getenv("NOVA_GOOGLE_OAUTH_CLIENT_SECRET", ""))
+    # Where Google redirects after consent. Must match the authorized redirect URI in Google Cloud Console.
+    google_oauth_redirect_uri: str = field(default_factory=lambda: os.getenv("NOVA_GOOGLE_OAUTH_REDIRECT_URI", ""))
+
     # Public half of the owner's release-signing key (base64, 32 bytes). Used
     # to refuse publishing a release whose signature does not verify. The
     # private half is never on the server.
