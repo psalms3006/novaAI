@@ -209,3 +209,14 @@ desk/ui/node_modules/
 desk/ui/tsconfig.tsbuildinfo
 memory_texts.before-cleanup.*.json
 /knowledge/
+# Owner scratch notes and local tool dirs (never distributed)
+/*.txt
+.agents/
+.opencode/
+.zcode/
+brag-output/
+nova-demo/
+.pytest_cache/
+pytest-of-*/
+nova-test-data-*/
+nova-test-machine-/
