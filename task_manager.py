@@ -1223,10 +1223,16 @@ class TaskManager:
 
     def plan_steps(self, goal: str) -> List[Dict[str, Any]]:
         """Steps for a goal: NOVA's planner, else its keyword fallback, else []."""
-        from memory_extra import load_memory, build_memory_context
-        # Build memory context
-        meta = load_memory()
-        context = build_memory_context(meta, goal)
+        # Memory context is best-effort: it must never break planning, and
+        # importing it here must not drag in the world (memory_extra imports
+        # nova at module level, so this stays inside a try).
+        context = ""
+        try:
+            from memory_extra import load_memory, build_memory_context
+            meta = load_memory()
+            context = build_memory_context(meta, goal)
+        except Exception as e:
+            log.debug("memory context unavailable for planning: %s", e)
         if self.planner is not None:
             try:
                 # Try to call the planner with context; if it fails due to missing argument, fall back to goal only
@@ -1239,6 +1245,7 @@ class TaskManager:
                 log.warning("task planner failed for %r: %s", goal, e)
                 return []
         import sys
+        nova_mod = sys.modules.get("nova")
         declarations = list(getattr(nova_mod, "TOOL_DECLARATIONS", None) or [])
         try:
             from agent import planner as _planner

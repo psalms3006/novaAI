@@ -287,6 +287,10 @@ def signup():
             s.add(EmailToken(
                 user_id=user.id,
                 kind="verify_email",
+                # token_hash is NOT NULL; a code-only row carries a
+                # derived placeholder that cannot collide with a link
+                # token (opaque tokens are urlsafe base64: no colon).
+                token_hash="code:" + sec.hash_code(code),
                 code_hash=sec.hash_code(code),
                 expires_at=now() + 86400,
                 code_expires_at=now() + 600,  # 10 minutes for code
@@ -619,6 +623,10 @@ def resend_verification():
         s.add(EmailToken(
             user_id=user.id,
             kind="verify_email",
+            # token_hash is NOT NULL; a code-only row carries a
+            # derived placeholder that cannot collide with a link
+            # token (opaque tokens are urlsafe base64: no colon).
+            token_hash="code:" + sec.hash_code(code),
             code_hash=sec.hash_code(code),
             expires_at=now() + 86400,
             code_expires_at=now() + 600,  # 10 minutes for code
@@ -676,6 +684,10 @@ def resend_verification_code():
         s.add(EmailToken(
             user_id=user.id,
             kind="verify_email",
+            # token_hash is NOT NULL; a code-only row carries a
+            # derived placeholder that cannot collide with a link
+            # token (opaque tokens are urlsafe base64: no colon).
+            token_hash="code:" + sec.hash_code(code),
             code_hash=sec.hash_code(code),
             expires_at=now() + 86400,
             code_expires_at=now() + 600,  # 10 minutes for code

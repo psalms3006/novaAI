@@ -143,12 +143,18 @@ def test_signup_sends_a_verification_email(env, monkeypatch):
     assert "dev_token" not in j["email_delivery"], "token leaked despite delivery"
 
     mailer.mailer().flush(timeout=10)
-    assert len(fake.messages) == 1
-    msg = fake.messages[0]
-    assert msg["to"] == "sam@example.com"
-    assert "verify" in msg["subject"].lower()
-    assert "https://nova.omniel.com.ng/verify?token=" in msg["text"]
-    assert msg["from"] == "NOVA <hello@omniel.com.ng>"
+    # Signup now sends two messages: the verification *link* and the 6-digit
+    # verification *code* (either may be used; the code exists for clients
+    # that cannot open links). Both go to the same address.
+    assert len(fake.messages) == 2, \
+        f"expected link + code, got {len(fake.messages)}"
+    for msg in fake.messages:
+        assert msg["to"] == "sam@example.com"
+        assert "verif" in msg["subject"].lower()   # verify / verification
+        assert msg["from"] == "NOVA <hello@omniel.com.ng>"
+    link_msgs = [m for m in fake.messages
+                 if "https://nova.omniel.com.ng/verify?token=" in m["text"]]
+    assert len(link_msgs) == 1, "exactly one message carries the link"
 
 
 def test_the_verification_link_actually_verifies(env, monkeypatch):

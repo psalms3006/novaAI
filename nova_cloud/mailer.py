@@ -275,6 +275,8 @@ def verification_code_email(cfg: EmailConfig, code: str) -> Tuple[str, str, str]
     return subject, text, _render(cfg, "Your verification code", body)
 
 
+def new_device_email(cfg: EmailConfig, device_name: str, platform: str,
+                     when: str) -> Tuple[str, str, str]:
     subject = f"New sign-in to your {cfg.brand} account"
     text = (f"{cfg.brand} was signed in on a new device.\n\n"
             f"Device:   {device_name}\nPlatform: {platform}\nWhen:     {when}\n\n"

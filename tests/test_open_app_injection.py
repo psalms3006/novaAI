@@ -1,4 +1,4 @@
-"""`open_app` must not be a way to run arbitrary commands.
+﻿"""`open_app` must not be a way to run arbitrary commands.
 
 The unknown-application branch built a shell string by interpolation:
 
@@ -10,11 +10,12 @@ that `web_search` just fetched. A name containing a quote and an `&` closes
 the quote and hands the rest to cmd.exe. `APP_LAUNCH` is ALLOW at USER trust,
 so nothing else in the chain asks first.
 
-These tests assert the command never reaches the shell — not merely that the
+These tests assert the command never reaches the shell â€” not merely that the
 reply looks like a refusal.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 
 import pytest
@@ -59,66 +60,42 @@ def test_a_name_carrying_shell_syntax_never_reaches_the_shell(no_shell, app_name
 
 
 def test_an_ordinary_application_name_is_still_accepted(monkeypatch):
-    """Guard against fixing this by refusing everything."""
+    """Guard against fixing this by refusing everything.
+
+    open_app now launches through os.startfile (the Windows ShellExecute
+    API â€” no shell, no argv to inject into), so the positive control is
+    that the mapped name reaches startfile untouched.
+    """
     seen = {}
-
-    class FakeProc:
-        returncode = 0
-
-        def communicate(self, timeout=None):
-            return (b"", b"")
-
-    def fake_popen(cmd, *a, **kw):
-        seen["cmd"] = cmd
-        return FakeProc()
-
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(os, "startfile", lambda target: seen.setdefault("target", target))
 
     result = open_app.execute({"app_name": "notepad"})
 
-    assert "cmd" in seen, "a legitimate application was not launched"
+    assert seen.get("target") == "notepad", "a legitimate application was not launched"
     assert "opened" in result.lower(), result
 
 
 def test_a_real_path_with_spaces_is_still_accepted(monkeypatch):
-    """Program names legitimately contain spaces and colons and backslashes."""
+    """Program paths legitimately contain spaces and colons and backslashes."""
     seen = {}
-
-    class FakeProc:
-        returncode = 0
-
-        def communicate(self, timeout=None):
-            return (b"", b"")
-
-    monkeypatch.setattr(
-        subprocess, "Popen",
-        lambda cmd, *a, **kw: (seen.__setitem__("cmd", cmd), FakeProc())[1],
-    )
+    monkeypatch.setattr(os, "startfile", lambda target: seen.setdefault("target", target))
 
     result = open_app.execute({"app_name": r"C:\Program Files\Thing\thing.exe"})
 
-    assert "cmd" in seen, "a legitimate path was rejected"
+    assert seen.get("target") == r"C:\Program Files\Thing\thing.exe", \
+        "a legitimate path was rejected"
     assert "opened" in result.lower(), result
 
 
 def test_program_files_x86_is_not_mistaken_for_an_attack(monkeypatch):
-    """Parentheses are ordinary in Windows paths and harmless inside quotes."""
+    """Parentheses are ordinary in Windows paths and harmless without a shell."""
     seen = {}
-
-    class FakeProc:
-        returncode = 0
-
-        def communicate(self, timeout=None):
-            return (b"", b"")
-
-    monkeypatch.setattr(
-        subprocess, "Popen",
-        lambda cmd, *a, **kw: (seen.__setitem__("cmd", cmd), FakeProc())[1],
-    )
+    monkeypatch.setattr(os, "startfile", lambda target: seen.setdefault("target", target))
 
     result = open_app.execute(
         {"app_name": r"C:\Program Files (x86)\Thing\thing.exe"}
     )
 
-    assert "cmd" in seen, "a path containing (x86) was rejected"
+    assert seen.get("target") == r"C:\Program Files (x86)\Thing\thing.exe", \
+        "a path containing (x86) was rejected"
     assert "opened" in result.lower(), result

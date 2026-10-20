@@ -1411,6 +1411,14 @@ try:
 except Exception as _lf_err:
     log.warning("tool failure logging not installed: %s", _lf_err)
 
+# The filesystem boundary runs at dispatch: credential material is never
+# read by the file tools, system areas never written, whatever asked. The
+# tools check too; this is the net under a future caller that forgets.
+try:
+    import nova_core.fs_policy as _fs_policy          # noqa: F401 (installs on import)
+except Exception as _fsp_err:
+    log.warning("filesystem policy not installed: %s", _fsp_err)
+
 # OpenAI-compatible tool definitions (used by Ollama when model supports tools)
 TOOL_DEFINITIONS_OPENAI = [
     {

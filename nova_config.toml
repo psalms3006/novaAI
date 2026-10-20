@@ -55,6 +55,18 @@ audit_max_lines     = 500
 phone_port = 5050
 ui_port    = 8080
 
+[dev_agent]
+# Packages the dev agent may pip-install from a model-generated plan.
+# Anything outside this list is named back to the user to install themselves.
+# The generated code that triggers an install is model output, so this list
+# is the boundary between "helpful" and "runs whatever a web page asked".
+allowed_dependencies = [
+  "requests", "httpx", "aiohttp", "numpy", "pandas", "matplotlib",
+  "pillow", "openpyxl", "python-docx", "rich", "tqdm", "pydantic",
+  "flask", "fastapi", "uvicorn", "sqlalchemy", "beautifulsoup4", "lxml",
+  "pytest", "scikit-learn", "python-dateutil", "dotenv", "colorama",
+]
+
 [offline]
 models   = ["tinyllama", "llama3.2", "phi3", "mistral"]
 timeouts = {tinyllama = 15, llama3_2 = 30, phi3 = 30, mistral = 45}

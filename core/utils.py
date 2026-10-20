@@ -107,9 +107,21 @@ def sanitize_shell_arg(arg: str) -> str:
     """
     Sanitize a string for safe use in shell commands.
     Returns the original string if it looks safe, raises ValueError otherwise.
+
+    Commands here run as an argument list (no shell), so most shell
+    metacharacters are inert: a backslash is a Windows path separator and
+    parentheses are ordinary characters. What stays forbidden is anything
+    that survives into a *later* shell context — this output gets pasted
+    into logs, error messages and model context that may end up in a
+    quoted command somewhere else — plus control characters and NUL.
     """
-    # Block common shell metacharacters
-    dangerous = set(';|&$`\\(){}[]<>!#~\'"')
+    if not isinstance(arg, str):
+        raise ValueError("shell argument must be a string")
+    # NUL truncates argv at the C level; other control chars are never
+    # legitimate in a command argument.
+    if any(ord(c) < 32 or c == "\x7f" for c in arg):
+        raise ValueError(f"Control character in shell argument: {arg!r}")
+    dangerous = set(";|&$`'\"<>")
     if any(c in dangerous for c in arg):
         raise ValueError(f"Potentially dangerous shell argument: {arg!r}")
     return arg

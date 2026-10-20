@@ -118,6 +118,30 @@ def execute(args: dict) -> str:
     action = args.get("action", "")
     path = _resolve_path(args.get("path", ""))
 
+    # ── The one filesystem boundary ────────────────────────────────────────
+    # Every path this tool touches goes through the policy, judged as the
+    # intent the action implies, and the access then uses the canonical
+    # path the policy checked. The dispatcher's pre-hook asks the same
+    # question; asking here too means the tool is safe from any caller that
+    # reaches it without going through the dispatcher.
+    try:
+        from nova_core.fs_policy import FilePolicyError, require
+    except ImportError:
+        require = None                        # nova_core always present; belt
+
+    if require is not None:
+        is_write = action in ("write", "create_file", "create_folder",
+                              "copy", "move")
+        is_delete = action == "delete"
+        try:
+            path = require(str(path), write=is_write, delete=is_delete)
+            if isinstance(args.get("destination"), str) and args["destination"].strip():
+                dest_raw = str(_resolve_path(args["destination"]))
+                dest_canon = require(dest_raw, write=is_write, delete=is_delete)
+                args = {**args, "destination": str(dest_canon)}
+        except FilePolicyError as e:
+            return f"Refused: {e}"
+
     try:
         if action == "list":
             if not path.exists():

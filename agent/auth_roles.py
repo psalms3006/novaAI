@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from typing import Literal, Optional
 
-from agent import nova_account
+import nova_account
 
 logger = logging.getLogger("nova.auth_roles")
 
@@ -49,8 +49,15 @@ def has_role(required_role: str) -> bool:
     if required_role not in VALID_ROLES:
         logger.warning(f"Invalid role checked: {required_role}")
         return False
-        
-    user_role = get_user_role()
+
+    try:
+        user_role = get_user_role()
+    except Exception:
+        # An authorization check that cannot resolve the role must not
+        # raise into the caller and must not assume the best: fail closed.
+        logger.warning("Role resolution failed; denying %s", required_role,
+                       exc_info=True)
+        return False
     return ROLE_HIERARCHY.get(user_role, 0) >= ROLE_HIERARCHY.get(required_role, 0)
 
 def require_role(required_role: str) -> bool:

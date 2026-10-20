@@ -1,4 +1,4 @@
-﻿"""nova_account â€” the NOVA desktop's account client.
+"""nova_account â€” the NOVA desktop's account client.
 
 Three properties this module exists to guarantee:
 
@@ -157,13 +157,6 @@ class NovaAccount:
         return bool(self.base)
 
     @property
-    def signed_in(self) -> bool:
-        with self._lock:
-            if not self._session.get("user"):
-                return False
-            return not self._grace_expired()
-
-    @property
     def user(self) -> dict:
         with self._lock:
             return dict(self._session.get("user") or {})
@@ -303,11 +296,9 @@ class NovaAccount:
             store.set_json(_K_SESSION, self._session)
         self._last_online = time.time()
         self._notify()
-       self.start_background()
+        self.start_background()
 
-        # Provision owner role if this is the designated owner email
-        self.provision_owner_role()
-   def sign_out(self, everywhere: bool = False) -> dict:
+    def sign_out(self, everywhere: bool = False) -> dict:
         """Clear the account from this device.
 
         Local resources are explicitly untouched: models, knowledge files and
@@ -423,7 +414,11 @@ class NovaAccount:
         tok = self.ensure_access_token()
         if not tok:
             raise Offline()
-        body = {k: v for k, v in fields.items() if k in ("preferred_name", "role", "about")}
+        # Deliberately excludes "role": authorization roles are granted by the
+        # backend only. The profile endpoint's "role" is a personalization
+        # persona, and a privilege name sent from here would be either
+        # rejected or, on a lenient backend, a self-escalation vector.
+        body = {k: v for k, v in fields.items() if k in ("preferred_name", "about")}
         return self._cache_instance(
             self._request("PATCH", "/v1/instance/profile", body=body, token=tok)["instance"])
 
@@ -499,79 +494,26 @@ class NovaAccount:
             self._tel_q.put_nowait({"kind": "agent_run", "agent": agent, **kw})
         except queue.Full:
             pass
-    def _sync_role_to_settings(self, role: str) -> None:
-        """Sync the user role to local settings for personalization."""
-        if not role:
-            return
-        try:
-            import desk.settings as desk_settings
-            current_role = desk_settings.get("user_role", "")
-            if current_role != role:
-                desk_settings.set_many({"user_role": role})
-        except Exception:
-            # Settings sync failure is non-critical
-            pass
-    
-    def provision_owner_role(self) -> bool:
-        """Provision the OWNER role for the designated owner email.
-        
-        This should be called after a user signs in to ensure the designated
-        owner account has the OWNER role. Returns True if the role was
-        successfully set or already had the role.
-        
-        Security note: This only works if the backend permits the role update.
-        The backend should verify email ownership and authorization before
-        granting the OWNER role.
-        """
-        try:
-            # Check if this is the designated owner email
-            owner_email = "psalmistasagwara3006@gmail.com"
-            user_email = self._email().lower()
-            
-            if user_email == owner_email:
-                current_role = self.get_user_role()
-                if current_role != "OWNER":
-                    # Attempt to provision the OWNER role
-                    self.update_profile(role="OWNER")
-                    # Verify it was set
-                    new_role = self.get_user_role()
-                    result = new_role == "OWNER"
-                else:
-                    # Already has the OWNER role
-                    result = True
-            else:
-                result = True  # Not the owner email, nothing to provision
-            
-            # Audit log the ownership provisioning attempt
-            if user_email == owner_email:
-                self.emit("OWNER_PROVISIONING_ATTEMPT", 
-                         success=result,
-                         target_email=owner_email,
-                         role_assigned="OWNER" if result else self.get_user_role())
-             
-            return result
-        except Exception as e:
-            # Log but don't fail - provisioning is best-effort for security
-            import logging
-            logger = logging.getLogger("nova.account")
-            logger.debug(f"Owner provisioning failed: {e}")
-           return False
-            
-   def get_user_role(self) -> str:
+    def get_user_role(self) -> str:
         """Get the user's role from the current session.
-        
+
+        The role is whatever the *backend* put in the session's user payload.
+        It is authoritative because only the backend can put it there: no
+        client request can set it (the profile endpoint only accepts the
+        personalization personas), and this module never writes it.
+
         Returns:
-            str: The user's role (USER, ADMIN, or OWNER). Defaults to USER if 
-                 no account is signed in or role is not set.
+            str: The user's role (USER, ADMIN, or OWNER). Defaults to USER if
+                 no account is signed in or the backend sent no role.
         """
         try:
             # Return the role from session if available
             with self._lock:
-                return self._session.get("user", {}).get("role", "USER")
+                return (self._session.get("user", {}) or {}).get("role") or "USER"
         except Exception:
             return "USER"
-   
-   def set_user_role(self, target_user_id: str, role: str) -> bool:
+
+    def set_user_role(self, target_user_id: str, role: str) -> bool:
         """Set the role for a specific user (requires OWNER privileges).
         
         Args:

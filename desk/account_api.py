@@ -1,4 +1,4 @@
-﻿"""desk.account_api â€” the desktop's account surface.
+"""desk.account_api â€” the desktop's account surface.
 
 Registered onto the desk Flask app. Everything here is deliberately thin: the
 real logic lives in `nova_account`, and this module's job is to expose it to
@@ -112,8 +112,6 @@ def register(app, require_token, meta: dict) -> None:
 
     @app.post("/api/account/signup")
     @require_token
-    @app.post("/api/account/signup")
-    @require_token
     def api_account_signup():
         body = request.get_json(silent=True) or {}
         acct = _acct()
@@ -122,34 +120,34 @@ def register(app, require_token, meta: dict) -> None:
                          body.get("display_name", ""))
         except nova_account.AccountError as e:
             return jsonify({"ok": False, "error": e.code, "message": e.message}), 400
-        # Provision OWNER role for designated owner email
-        try:
-            acct.provision_owner_role()
-        except Exception:
-            # Provisioning failures are non-critical - don't block sign-up
-            pass
+        # The role comes from the backend's session payload; nothing here
+        # grants one. (The previous in-flight patch had the client asking to
+        # set its own OWNER role -- the backend refused it, and the attempt
+        # is gone rather than left hoping the refusal stays.)
         restarting = bind_signed_in_account(acct)
         _adopt_identity(acct, meta)
         pull_preferences_async()
         acct.emit("NOVA_STARTED", surface="desktop")
         return jsonify({"ok": True, "restarting": restarting, **_status_payload()})
+
+    @app.post("/api/account/signin")
+    @require_token
+    def api_account_signin():
         body = request.get_json(silent=True) or {}
         acct = _acct()
         try:
             acct.sign_in(body.get("email", ""), body.get("password", ""))
         except nova_account.AccountError as e:
             return jsonify({"ok": False, "error": e.code, "message": e.message}), 400
-        # Provision OWNER role for designated owner email
-        try:
-            acct.provision_owner_role()
-        except Exception:
-            # Provisioning failures are non-critical - don't block sign-in
-            pass
         restarting = bind_signed_in_account(acct)
         _adopt_identity(acct, meta)
         pull_preferences_async()
         acct.emit("USER_LOGIN", surface="desktop")
         return jsonify({"ok": True, "restarting": restarting, **_status_payload()})
+
+    @app.post("/api/account/signout")
+    @require_token
+    def api_account_signout():
         body = request.get_json(silent=True) or {}
         acct = _acct()
         acct.emit("USER_LOGOUT", surface="desktop")

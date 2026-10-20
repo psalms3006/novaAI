@@ -5,8 +5,15 @@ NOVA file_processor — Handles images, PDFs, documents, CSVs, code files, audio
 import os
 import json
 import traceback
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from datetime import datetime
+
+
+#: Actions that write output files; used by the filesystem policy.
+_WRITE_ACTIONS = frozenset({
+    "resize", "compress", "convert", "to_word", "to_csv", "extract_audio",
+    "extract_frame", "trim", "extract", "run", "edit", "append",
+})
 
 
 def execute(parameters):
@@ -35,9 +42,28 @@ def execute(parameters):
     if not file_path:
         return "Error: file_path is required"
 
-    path = Path(file_path)
-    if not path.exists():
-        return f"Error: File not found: {file_path}"
+    # ── The one filesystem boundary ────────────────────────────────────────
+    # The tool judges the path for the intent this action implies and then
+    # works with the canonical path it was given. Reads of credential
+    # material and writes into system areas stop here, whatever asked.
+    try:
+        from nova_core.fs_policy import FilePolicyError, check, require
+        _has_policy = True
+    except ImportError:
+        _has_policy = False
+
+    if _has_policy:
+        try:
+            path = require(str(file_path),
+                            write=action in _WRITE_ACTIONS,
+                            delete=False,
+                            must_exist=True)
+        except FilePolicyError as e:
+            return f"Refused: {e}"
+    else:
+        path = Path(file_path)
+        if not path.exists():
+            return f"Error: File not found: {file_path}"
 
     ext = path.suffix.lower()
     result = f"Processed {path.name}"
@@ -294,19 +320,17 @@ def execute(parameters):
                 result = f"Review of {path.name}:\n" + "\n".join(issues) if issues else f"No obvious issues found in {path.name}."
 
             elif action == "run" and ext == '.py':
-                from core.shell_manager import execute_safe, ShellExecutionError
-                try:
-                    output = execute_safe(
-                        ['python', str(path)],
-                        timeout=parameters.get("timeout", 30)
-                    )
-                    if not output.is_success():
-                        raise ShellExecutionError(output)
-                    result = f"Exit code: {output.returncode}\nStdout:\n{output.stdout}\nStderr:\n{output.stderr}"
-                except ShellExecutionError as e:
-                    result = f"Run failed: {e}"
-                except Exception as e:
-                    result = f"Run failed: {e}"
+                # This tool is charged as a *read* capability by the
+                # permission engine (FILE_READ), but "run" executes the
+                # file's contents with the user's full privileges -- an act
+                # nothing about reading entitles. Running code is what
+                # run_command is for, where it costs CODE_EXECUTE and the
+                # confirmation gate asks the person. Refuse here and say
+                # where to go, so the model can route correctly.
+                return ("Refused: file_processor can read and analyse code, "
+                        "but not run it. Ask for run_command to execute "
+                        "this file; that goes through the confirmation "
+                        "gate.")
 
             else:
                 result = f"Code file loaded ({len(code)} chars). Action: {action}"
@@ -398,12 +422,66 @@ def execute(parameters):
             elif action == "extract":
                 dest = destination or str(path.parent / path.stem)
                 os.makedirs(dest, exist_ok=True)
+                # An archive is content the user did not author. Its member
+                # names are attacker-controlled strings: "../../startup"
+                # in a tar, absolute paths, drive letters on Windows. The
+                # extractall default trusts all of that (CVE-2007-4559
+                # family), so every member is judged before any file lands.
+                if _has_policy:
+                    try:
+                        dest = str(require(dest, write=True))
+                    except FilePolicyError as e:
+                        return f"Refused: {e}"
+                base = Path(dest).resolve(strict=False)
+
+                def _member_ok(name: str) -> bool:
+                    # No absolute paths, no drive letters, no parent hops,
+                    # no NUL or reserved-device tricks.
+                    if not name or "\x00" in name:
+                        return False
+                    pure = PureWindowsPath(name.replace("/", "\\"))
+                    if pure.drive or name.startswith(("/", "\\")):
+                        return False
+                    candidate = (base / Path(name)).resolve(strict=False)
+                    try:
+                        candidate.relative_to(base)
+                    except ValueError:
+                        return False
+                    # The member's own policy check: a tar that drops
+                    # id_rsa or an .env is the same secret read as asking
+                    # for it directly.
+                    if _has_policy:
+                        v = check(str(candidate), write=True)
+                        return bool(v)
+                    return True
+
                 if ext == '.zip':
                     with zipfile.ZipFile(path, 'r') as z:
+                        bad = [n for n in z.namelist() if not _member_ok(n)]
+                        if bad:
+                            return ("Refused: this archive contains entries "
+                                    f"that would write outside {base} or into "
+                                    "protected locations "
+                                    f"({bad[0]!r} and {len(b)-1} more)."
+                                    if len(bad) > 1 else
+                                    f"Refused: this archive contains an entry "
+                                    f"that would write outside {base} or into "
+                                    f"protected locations ({bad[0]!r}).")
                         z.extractall(dest)
                 elif ext in ('.tar', '.gz', '.bz2'):
                     with tarfile.open(path, 'r') as t:
-                        t.extractall(dest)
+                        members = t.getmembers()
+                        # Devices, absolute links and hardlinks out of the
+                        # tree are not files to land on disk.
+                        if any(m.isdev() for m in members):
+                            return ("Refused: this archive contains device "
+                                    "entries; NOVA will not extract it.")
+                        bad = [m.name for m in members if not _member_ok(m.name)]
+                        if bad:
+                            return ("Refused: this archive contains entries "
+                                    f"that would write outside {base} or into "
+                                    f"protected locations ({bad[0]!r}).")
+                        t.extractall(dest, members=members)
                 result = f"Extracted to {dest}"
 
             else:

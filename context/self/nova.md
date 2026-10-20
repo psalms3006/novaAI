@@ -121,6 +121,7 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 <!-- AUTO-START: recent_activity -->
 Commits in the last 14 days (11):
 
+- df5b221 2026-10-19 Shell manager, role authorization, onboarding UI, and comms package
 - 8883237 2026-10-07 Chat: a tool that failed did not succeed
 - d20efeb 2026-10-07 Background steps retry only what waiting can fix
 - b868bbd 2026-10-07 Show a research report's real stages and counted progress
@@ -131,7 +132,6 @@ Commits in the last 14 days (11):
 - 780c04d 2026-10-07 Offline brain: use an installed model that fits in memory
 - d5a409f 2026-10-07 Permission gates: "no, don't go ahead" is a no; Allow doesn't cover a web page's request
 - 15fe759 2026-10-07 Deliver held proactive messages; greet with their words, not a count
-- 29da1e7 2026-10-06 Account API tests: clear the compiled-in backend for the local-only cases
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

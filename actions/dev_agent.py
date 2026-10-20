@@ -24,6 +24,39 @@ MAX_FIX_ATTEMPTS = 5
 MODEL_PLANNER    = "gemini-2.5-flash"
 MODEL_WRITER     = "gemini-2.5-flash"
 
+# ── Supply-chain boundary ─────────────────────────────────────────────────
+# The plan's "dependencies" list and the module names parsed out of traceback
+# output are *model output*. Letting either reach `pip install` directly means
+# generated code that does `import <typosquat>` results in that package being
+# installed — code execution from a string an outsider may have steered. So
+# only packages on this list install automatically; everything else is named
+# back to the user to install themselves. The list lives in
+# nova_config.toml [dev_agent] allowed_dependencies so it can be extended
+# without touching source.
+_DEFAULT_ALLOWED_DEPS = {
+    "requests", "httpx", "aiohttp", "numpy", "pandas", "matplotlib",
+    "pillow", "openpyxl", "python-docx", "rich", "tqdm", "pydantic",
+    "flask", "fastapi", "uvicorn", "sqlalchemy", "beautifulsoup4", "lxml",
+    "pytest", "scikit-learn", "python-dateutil", "dotenv", "colorama",
+}
+
+def _allowed_dependencies() -> set[str]:
+    try:
+        import tomllib
+        cfg = tomllib.loads((BASE_DIR / "nova_config.toml").read_text(encoding="utf-8"))
+        listed = cfg.get("dev_agent", {}).get("allowed_dependencies")
+        if isinstance(listed, list) and listed:
+            return {str(x).strip().lower() for x in listed if str(x).strip()}
+    except Exception:
+        pass
+    return _DEFAULT_ALLOWED_DEPS
+
+#: The only executables a generated run_command may name. `python` is
+#: rewritten to the running interpreter. Anything else in parts[0] — curl,
+#: powershell, cmd — is a download-and-run waiting to be phrased innocently.
+_ALLOWED_RUNTIMES = {"python", "python3", "py", "node", "npm", "npx", "yarn",
+                     "deno", "bun", "go", "cargo", "dotnet", "java"}
+
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
@@ -238,19 +271,34 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
     if not dependencies:
         return "No external dependencies."
 
+    allowed = _allowed_dependencies()
     to_install = []
+    refused = []
     for dep in dependencies:
-        pkg_name = re.split(r"[>=<!]", dep)[0].strip()
+        # `pkg>=1.0` → `pkg`; the version clause is never a name we look up.
+        pkg_name = re.split(r"[>=<!\[;]", dep)[0].strip().lower()
+        if not pkg_name:
+            continue
+        if pkg_name not in allowed:
+            refused.append(dep)
+            continue
         result = subprocess.run(
             [sys.executable, "-m", "pip", "show", pkg_name],
             capture_output=True, text=True
         )
         if result.returncode != 0:
-            to_install.append(dep)
+            to_install.append(pkg_name)
         else:
             print(f"[DevAgent] ✓ Already installed: {pkg_name}")
 
+    if refused:
+        print(f"[DevAgent] Not auto-installing (not on the allowlist): {refused}")
+
     if not to_install:
+        if refused:
+            return (f"Dependency install skipped: {', '.join(refused)} is not "
+                    "on the allowlist. Install it yourself with pip if the "
+                    "project needs it.")
         return f"All dependencies already installed: {', '.join(dependencies)}"
 
     print(f"[DevAgent] 📦 Installing: {to_install}")
@@ -261,7 +309,9 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
             timeout=120, cwd=str(project_dir)
         )
         if result.is_success():
-            return f"Installed: {', '.join(to_install)}"
+            msg = f"Installed: {', '.join(to_install)}"
+            return msg + (f" (skipped, not allowlisted: {', '.join(refused)})"
+                          if refused else "")
         return f"Install warning (non-fatal): {result.stderr[:200]}"
     except Exception as e:
         return f"Install error (non-fatal): {e}"
@@ -291,8 +341,38 @@ def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
     print(f"[DevAgent] 🚀 Running: {run_command}")
     try:
         parts = run_command.split()
-        if parts[0].lower() == "python":
+        if not parts:
+            return "Run failed: empty run command."
+
+        # The run command is model output. It names an executable, and the
+        # only ones a generated project may launch are language runtimes:
+        # `python` (rewritten to the running interpreter), node, and kin.
+        # Anything else — curl, powershell, cmd, a path — is refused, not
+        # interpreted.
+        exe = parts[0].lower()
+        # A bare script name ("main.py") means one inside the project —
+        # the subprocess will run with cwd=project_dir, so the check must
+        # resolve there too, not against NOVA's own working directory.
+        raw0 = Path(parts[0])
+        exe_path = raw0 if raw0.is_absolute() else (project_dir / raw0)
+        # Judge the *command as given*: the rewritten interpreter is
+        # sys.executable, whose .exe suffix would fail its own check.
+        if exe_path.suffix.lower() in (".cmd", ".bat", ".exe", ".ps1", ".sh"):
+            return f"Refused to run {parts[0]!r}: not a language runtime."
+        if exe == "python" or exe == "python3":
             parts[0] = sys.executable
+        elif exe == "py":
+            parts = [sys.executable] + parts[1:]
+        elif exe in _ALLOWED_RUNTIMES:
+            pass
+        elif exe_path.is_file() and exe_path.suffix.lower() in (".py", ".js", ".ts"):
+            # "main.py" as the command: run it with the right interpreter.
+            runner = sys.executable if exe_path.suffix == ".py" else "node"
+            parts = [runner] + parts
+        else:
+            return (f"Refused to run {parts[0]!r}: the run command a project "
+                    "plan provides may only name a language runtime "
+                    "(python, node, npm, ...). Run anything else yourself.")
 
         result = subprocess.run(
             parts,
@@ -329,7 +409,12 @@ def _try_auto_install(error_output: str, project_dir: Path) -> bool:
     if not match:
         return False
 
-    pkg = match.group(1).replace("_", "-").split(".")[0]
+    pkg = match.group(1).replace("_", "-").split(".")[0].lower()
+    # The "missing module" in a traceback is a string the generated code
+    # produced; only allowlisted packages install from it.
+    if pkg not in _allowed_dependencies():
+        print(f"[DevAgent] Not auto-installing {pkg!r}: not on the allowlist.")
+        return False
     print(f"[DevAgent] 🔧 Auto-installing missing package: {pkg}")
     try:
         result = subprocess.run(
