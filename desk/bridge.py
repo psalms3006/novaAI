@@ -804,6 +804,15 @@ def _run_chat_raw(cid, message, image_path, streaming):
 @app.post("/api/chat")
 @require_token
 def api_chat():
+    # Onboarding isolation: the assistant answers only after setup is
+    # finished. This is enforced here, in the application's request path --
+    # hiding the composer in the UI is not a boundary.
+    import nova_runtime as _nr
+    allowed, stage = _nr.assistant_allowed()
+    if not allowed:
+        return jsonify({"error": "setup_incomplete", "stage": stage,
+                        "message": ("Finish setting up NOVA first. The "
+                                    "assistant is not active yet.")}), 403
     data = request.get_json(silent=True) or {}
     cid = (data.get("conversation_id") or "").strip()
     if not cid:
@@ -1086,6 +1095,15 @@ def api_vision():
 @app.post("/api/voice/start")
 @require_token
 def api_voice_start():
+    # Onboarding isolation: until setup is finished there is no assistant to
+    # talk to, and nothing on this machine should be listening.
+    import nova_runtime as _nr
+    allowed, stage = _nr.assistant_allowed()
+    if not allowed:
+        return jsonify({"ok": False, "error": "setup_incomplete",
+                        "stage": stage,
+                        "message": ("Finish setting up NOVA before using "
+                                    "your voice. Nothing is listening.")}), 403
     # Push-to-talk is the fallback for when the live session cannot run. It is
     # not a second way to listen *while* it is running: that would be two
     # capture streams on one device, which on Windows generally succeeds and
@@ -1152,6 +1170,18 @@ def _permission(scope: str) -> str:
 @app.post("/api/live/start")
 @require_token
 def api_live_start():
+    # Onboarding isolation: the SPA starts the live voice session on load, so
+    # this is the door that has to be shut. Without the check a half-onboarded
+    # account gets a listening, talking NOVA behind the setup screens -- the
+    # UI merely hiding the orb is not a boundary.
+    import nova_runtime as _nr
+    allowed, stage = _nr.assistant_allowed()
+    if not allowed:
+        _nr.silence_voice()
+        return jsonify({"ok": False, "error": "setup_incomplete",
+                        "stage": stage,
+                        "message": ("Finish setting up NOVA before using "
+                                    "voice. Nothing is listening.")}), 403
     # The microphone permission governs voice itself, not only the wake word.
     #   deny -> never;  ask -> only when the person presses the mic (an
     #   automatic start on opening the window is not them asking);  allow -> yes.
@@ -2425,7 +2455,15 @@ def api_onboarding_cloud():
 @require_token
 def api_onboarding_complete():
     _creds().mark_onboarded()
-    return jsonify({"ok": True, "auth": _auth_status()})
+    # The last step of setup is what unlocks the assistant. Idempotent: a
+    # refresh, a repeat POST or a restart that lands here cannot start a
+    # second brain -- start_brain runs at most once per process.
+    import nova_runtime as _nr
+    allowed, stage = _nr.assistant_allowed()
+    if allowed:
+        _nr.start_brain()
+    return jsonify({"ok": True, "auth": _auth_status(),
+                    "assistant_started": allowed, "assistant_stage": stage})
 
 
 @app.get("/api/update")

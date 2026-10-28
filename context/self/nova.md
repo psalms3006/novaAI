@@ -119,20 +119,11 @@ Barge-in (`nova_voice.VoiceGate`/`EchoCanceller`) is shared by both paths. Full-
 ## Recent activity
 
 <!-- AUTO-START: recent_activity -->
-Commits in the last 14 days (12):
+Commits in the last 14 days (3):
 
+- 2e55389 2026-10-20 Ignore owner scratch notes and local tool dirs
 - 143ee33 2026-10-20 Security hardening: filesystem boundary, gated execution, client role fixes, broken-merge repairs
 - df5b221 2026-10-19 Shell manager, role authorization, onboarding UI, and comms package
-- 8883237 2026-10-07 Chat: a tool that failed did not succeed
-- d20efeb 2026-10-07 Background steps retry only what waiting can fix
-- b868bbd 2026-10-07 Show a research report's real stages and counted progress
-- 17dd1ad 2026-10-07 NOVA knows what she can't do and why; recommends instead of listing
-- 487b7ec 2026-10-07 Let chat and voice answer from the person's documents, citing the file
-- e866dbb 2026-10-07 Get the cloud back after booting offline
-- 7c1cf44 2026-10-07 Voice: a connection that dies at once is a failure; stop replaying dead resume handles
-- 780c04d 2026-10-07 Offline brain: use an installed model that fits in memory
-- d5a409f 2026-10-07 Permission gates: "no, don't go ahead" is a no; Allow doesn't cover a web page's request
-- 15fe759 2026-10-07 Deliver held proactive messages; greet with their words, not a count
 <!-- AUTO-END: recent_activity -->
 
 ## Open questions / unknowns

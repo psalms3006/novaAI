@@ -13,7 +13,9 @@ route, because the guard verifies a different signing key and audience.
 from __future__ import annotations
 
 import os
+import threading
 import time
+from collections import defaultdict
 
 from flask import Flask, jsonify, request, send_from_directory
 from sqlalchemy import text
@@ -23,6 +25,14 @@ from .db import engine, init_db
 
 START_TIME = time.time()
 APP_VERSION = "0.1.0"
+
+# Per-process request counters. Deliberately no user identifiers: these are
+# scraped by operators and must never become a second, un-audited copy of who
+# used NOVA. `max_in_flight` is the number that says whether the worker pool is
+# saturated -- the first sign of a capacity problem.
+_STATS_LOCK = threading.Lock()
+_STATS = {"requests": 0, "in_flight": 0, "max_in_flight": 0}
+_STATUS = defaultdict(int)
 
 
 def create_app(cfg=None) -> Flask:
@@ -57,6 +67,9 @@ def create_app(cfg=None) -> Flask:
 
     @app.after_request
     def _headers(resp):
+        with _STATS_LOCK:
+            _STATS["in_flight"] = max(0, _STATS["in_flight"] - 1)
+            _STATUS[resp.status_code] += 1
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
         resp.headers.setdefault("X-Frame-Options", "DENY")
         resp.headers.setdefault("Referrer-Policy", "no-referrer")
@@ -70,6 +83,74 @@ def create_app(cfg=None) -> Flask:
             resp.headers.setdefault("Strict-Transport-Security",
                                     "max-age=31536000; includeSubDomains")
         return resp
+
+    @app.before_request
+    def _count_in_flight():
+        with _STATS_LOCK:
+            _STATS["requests"] += 1
+            _STATS["in_flight"] += 1
+            if _STATS["in_flight"] > _STATS["max_in_flight"]:
+                _STATS["max_in_flight"] = _STATS["in_flight"]
+
+    # A saturated connection pool is a capacity problem, not a bug in the
+    # request. Answer immediately with 503 and a retry hint so clients back off
+    # instead of each waiting out the pool timeout.
+    from sqlalchemy.exc import TimeoutError as _PoolTimeout
+
+    @app.errorhandler(_PoolTimeout)
+    def _pool_exhausted(_e):
+        resp = jsonify({"ok": False, "error": "busy",
+                        "message": "NOVA is at capacity right now. Try again shortly."})
+        resp.status_code = 503
+        resp.headers["Retry-After"] = "2"
+        return resp
+
+    @app.get("/ready")
+    def ready():
+        """Readiness: can this process actually serve a request right now?
+
+        Separate from /health on purpose. A liveness probe should restart a
+        wedged process; a readiness probe should take it out of the load
+        balancer while its database is unreachable, without restarting
+        anything.
+        """
+        try:
+            with engine().connect() as conn:
+                conn.execute(text("SELECT 1"))
+        except Exception as e:
+            return jsonify({"ok": False, "ready": False,
+                            "reason": type(e).__name__}), 503
+        return jsonify({"ok": True, "ready": True, "version": APP_VERSION})
+
+    @app.get("/metrics")
+    def metrics():
+        """Aggregate operational numbers, and nothing about any person.
+
+        Per-process: with N workers, scrape all N (or read the sum from the
+        proxy). Deliberately JSON rather than Prometheus so it needs no new
+        dependency on a small server.
+        """
+        pool = None
+        try:
+            st = engine().pool.status()
+            pool = {"size": st.size, "checked_in": st.checkedin(),
+                    "checked_out": st.checkedout(), "overflow": st.overflow()}
+        except Exception:
+            pass
+        with _STATS_LOCK:
+            snapshot = dict(_STATS)
+            statuses = dict(_STATUS)
+        return jsonify({
+            "ok": True,
+            "version": APP_VERSION,
+            "uptime_s": int(time.time() - START_TIME),
+            "requests_total": snapshot["requests"],
+            "in_flight": snapshot["in_flight"],
+            "max_in_flight": snapshot["max_in_flight"],
+            "responses_by_status": statuses,
+            "db_pool": pool,
+            "gateway": _gateway_metrics(),
+        })
 
     @app.get("/health")
     def health():

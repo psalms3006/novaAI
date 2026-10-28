@@ -326,26 +326,69 @@ OFFLINE_TIMEOUTS       = _cfg("offline",    "timeouts",       {"tinyllama": 15})
 #: associated with test: 7319", four competing answers about which English
 #: the user prefers. That file is what NOVA reads in development, so the
 #: tests were teaching her things nobody had said.
-_env_data_dir = os.getenv("NOVA_DATA_DIR", "").strip()
-if _env_data_dir:
-    _DATA_DIR = Path(_env_data_dir)
-    try:
-        _DATA_DIR.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        _DATA_DIR = Path(".")
-elif getattr(sys, "frozen", False) and os.getenv("APPDATA"):
-    _DATA_DIR = Path(os.getenv("APPDATA")) / "NOVA"
-    try:
-        _DATA_DIR.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        _DATA_DIR = Path(".")
-else:
-    _DATA_DIR = Path(".")
+def _resolve_data_dir() -> Path:
+    env_data_dir = os.getenv("NOVA_DATA_DIR", "").strip()
+    if env_data_dir:
+        d = Path(env_data_dir)
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            d = Path(".")
+    elif getattr(sys, "frozen", False) and os.getenv("APPDATA"):
+        d = Path(os.getenv("APPDATA")) / "NOVA"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            d = Path(".")
+    else:
+        d = Path(".")
+    return d
+
+
+_DATA_DIR = _resolve_data_dir()
+#: The folder this process was pointed at when nova loaded. Lets the account
+#: system tell "same person as before" from "the folder moved under us"
+#: without guessing.
+IMPORTED_DATA_DIR = _DATA_DIR
 MEMORY_META_FILE    = _DATA_DIR / "memory_meta.json"
 MEMORY_TEXTS_FILE   = _DATA_DIR / "memory_texts.json"
 MEMORY_INDEX_FILE   = _DATA_DIR / "memory.index"
 PLANNER_FILE        = _DATA_DIR / "nova_tasks.json"
 REFERENCE_FACE_PATH = _DATA_DIR / "nova_reference_face.jpg"
+
+
+def data_dir_for_active_account() -> Path:
+    """Where user data belongs for the account active right now.
+
+    Resolves the rule without changing this process's paths, so a caller
+    can tell "same folder, nothing to do" from "the folder moved".
+    """
+    return _resolve_data_dir()
+
+
+def refresh_data_paths() -> Path:
+    """Re-resolve every user-data path for the account active right now.
+
+    These were computed once, at import. A desk process that launched with
+    nobody signed in therefore kept pointing at the machine-wide folder for
+    its whole life: signing in bound an account, but the brain -- started
+    afterwards in that same process -- still read the previous person's
+    living memory and facts, and greeted the next person by the old name.
+
+    Called by nova_runtime.rebind_data_dir() after the account is bound and
+    before the brain starts, so no thread is holding the old path. Modules
+    that copy these constants at import (memory_extra, planner_extra,
+    vision_extra) are repointed by the same call.
+    """
+    global _DATA_DIR, MEMORY_META_FILE, MEMORY_TEXTS_FILE
+    global MEMORY_INDEX_FILE, PLANNER_FILE, REFERENCE_FACE_PATH
+    _DATA_DIR = _resolve_data_dir()
+    MEMORY_META_FILE = _DATA_DIR / "memory_meta.json"
+    MEMORY_TEXTS_FILE = _DATA_DIR / "memory_texts.json"
+    MEMORY_INDEX_FILE = _DATA_DIR / "memory.index"
+    PLANNER_FILE = _DATA_DIR / "nova_tasks.json"
+    REFERENCE_FACE_PATH = _DATA_DIR / "nova_reference_face.jpg"
+    return _DATA_DIR
 NOVA_SCRIPT_PATH    = Path(os.path.abspath(__file__))
 NOVA_DIR            = NOVA_SCRIPT_PATH.parent
 EMBED_MODEL         = "./nova_embedder" if Path("./nova_embedder").exists() else "all-MiniLM-L6-v2"
@@ -2548,6 +2591,18 @@ def _start_ambient_intelligence(meta: dict):
         text = (text or "").strip()
         if not text:
             return
+        # One gate for every unprompted utterance: proactive notices, heartbeat
+        # nudges and planner reminders all arrive here. While sign-in,
+        # verification or onboarding is unfinished, NOVA says nothing --
+        # including a session that was already running when the gate closed.
+        try:
+            import nova_runtime as _nr
+            allowed, _stage = _nr.assistant_allowed()
+            if not allowed:
+                log.info("[PROACTIVE] held: setup is not finished")
+                return
+        except Exception:
+            pass                              # no gate module: terminal build
         try:
             from desk import live_session as _live
             mgr = _live.get_live_manager()
@@ -2567,6 +2622,15 @@ def _start_ambient_intelligence(meta: dict):
         notification so it reaches someone who has NOVA minimised. Reminders
         used to go to print() in the desktop app -- set, confirmed, and never
         delivered."""
+        # A Windows toast carries its own chime, so this is unsolicited audio
+        # too. Nothing due reaches the person while setup is unfinished.
+        try:
+            import nova_runtime as _nr
+            if not _nr.assistant_allowed()[0]:
+                log.info("[REMINDER] held: setup is not finished")
+                return
+        except Exception:
+            pass
         log.info("[REMINDER] delivered: %s (notification=%s)", text[:120], toast)
         _speak(text)
         try:

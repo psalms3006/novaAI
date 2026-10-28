@@ -33,8 +33,11 @@ services:
         value: support@omniel.com.ng
       - key: ADMIN_EMAIL
         value: admin@omniel.com.ng
+      # Verification and reset links point at this host, so it must be one that
+      # actually serves this app. api.nova.omniel.com.ng does not resolve to a
+      # live origin; api.omniel.com.ng is the host the desktop already targets.
       - key: APP_BASE_URL
-        value: https://api.nova.omniel.com.ng
+        value: https://api.omniel.com.ng
 
       # Prompted in the dashboard, never stored in the repository.
       - key: DATABASE_URL

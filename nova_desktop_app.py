@@ -211,6 +211,11 @@ def main() -> int:
     first_run = nova_lifecycle.is_first_run()
     nova_lifecycle.ensure_installation(APP_VERSION)
     os.environ["NOVA_FIRST_RUN"] = "1" if first_run else "0"
+    # Arm the gate before asking it. `assistant_allowed()` reads this
+    # variable, and in a fresh process it is not set yet -- asking with it
+    # unset answers "allowed", which would start the assistant behind the
+    # setup screens of an account that signed in but never finished them.
+    os.environ["NOVA_AUTH_GATE"] = "1"
     auth_gate = False
     try:
         import nova_account
@@ -220,6 +225,13 @@ def main() -> int:
                 info = nova_lifecycle.activate_account(acct.user_id)
                 _log(f"Account {acct.user_id[:8]}… active"
                      + (f"; adopted {len(info['adopted'])} existing item(s)" if info["adopted"] else ""))
+                # Signed in is not the whole gate: an account that has not
+                # finished verification and onboarding gets the setup
+                # screens, never a running assistant behind them.
+                allowed, stage = nova_runtime.assistant_allowed()
+                if not allowed:
+                    auth_gate = True
+                    _log(f"Assistant held at the setup gate ({stage}); brain deferred")
             else:
                 # Sign-in is required on a build with an account server. The
                 # window opens on sign-in; the brain starts after it.

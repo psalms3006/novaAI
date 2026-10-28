@@ -14,6 +14,8 @@ Two rules the endpoints follow:
 """
 from __future__ import annotations
 
+import hmac
+import logging
 import os
 import threading
 import time
@@ -22,6 +24,8 @@ from flask import jsonify, request
 
 import nova_account
 from . import settings as desk_settings
+
+log = logging.getLogger("nova.desk.account")
 
 # Preferences that live in the account rather than on the machine. Mirrors the
 # backend's SYNCED_KEYS; a key absent from both stays device-local.
@@ -35,6 +39,102 @@ SYNCED_KEYS = {
 
 _sync_lock = threading.Lock()
 _last_pull = 0.0
+
+
+# ── Google sign-in handoff ────────────────────────────────────────────────────
+#
+# Google sends the browser back to the cloud (its registered redirect URI).
+# The cloud cannot finish a desktop sign-in by itself: the session has to be
+# adopted by the app, with this machine's device identity. So the flow is:
+#
+#   1. this process asks the cloud to start, passing its own loopback
+#      callback; the cloud signs that address into the OAuth state;
+#   2. Google returns the browser to the cloud, which redirects it to the
+#      signed loopback address with the code;
+#   3. the browser lands here, this process exchanges the code through the
+#      cloud's POST callback, adopts the session, and the SPA's poll sees
+#      `signed_in`.
+#
+# The loopback route cannot carry the desk token (a navigation sends no
+# headers), so the state is its credential: one flow, ten minutes, one use.
+
+_GOOGLE_FLOW_TTL_S = 600
+_google_flow_lock = threading.Lock()
+_google_flow: dict | None = None       # {"state": str, "issued_at": float}
+_google_outcome: dict | None = None    # {"ok": bool, "message": str}
+
+
+def _start_google_flow(state: str) -> None:
+    global _google_flow, _google_outcome
+    with _google_flow_lock:
+        _google_flow = {"state": state, "issued_at": time.time()}
+        _google_outcome = None
+
+
+def _consume_google_flow(state: str) -> bool:
+    """Accept the return trip once, and only for the flow this process began.
+
+    A rejected attempt leaves the real flow alone: a stray request (a
+    reloaded tab, a probe) must not be able to cancel the sign-in the
+    person is in the middle of.
+    """
+    global _google_flow
+    if not state:
+        return False
+    with _google_flow_lock:
+        flow = _google_flow
+        if not flow or time.time() - flow["issued_at"] > _GOOGLE_FLOW_TTL_S:
+            return False
+        if not hmac.compare_digest(str(flow.get("state") or ""), state):
+            return False
+        _google_flow = None
+        return True
+
+
+def _google_flow_pending() -> bool:
+    with _google_flow_lock:
+        return bool(_google_flow) and (
+            time.time() - _google_flow["issued_at"] <= _GOOGLE_FLOW_TTL_S)
+
+
+def _record_google_outcome(ok: bool, message: str) -> None:
+    global _google_outcome
+    with _google_flow_lock:
+        _google_outcome = {"ok": ok, "message": message}
+
+
+def _google_client_error() -> dict | None:
+    """The failure the popup saw, for the SPA that cannot read the popup."""
+    with _google_flow_lock:
+        out = _google_outcome
+        if not out or out.get("ok"):
+            return None
+        return {"message": out.get("message") or "Google sign-in failed."}
+
+
+def _google_page(title: str, message: str, status: int,
+                 autoclose: bool = False):
+    """The last thing the person sees in the sign-in window."""
+    from flask import Response
+    from html import escape
+    script = ("<script>setTimeout(function(){try{window.close()}catch(e){}},"
+              "1200)</script>") if autoclose else ""
+    body = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{escape(title)} - NOVA</title>
+<style>
+ body{{margin:0;min-height:100vh;display:grid;place-items:center;
+      background:#0b0d12;color:#e8eaf0;
+      font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}}
+ main{{max-width:30rem;padding:2rem;text-align:center}}
+ h1{{font-size:1.25rem;font-weight:600;margin:0 0 .6rem}}
+ p{{margin:0;color:#a6adbb}}
+</style></head>
+<body><main><h1>{escape(title)}</h1><p>{escape(message)}</p></main>
+{script}</body></html>"""
+    return Response(body, status=status, mimetype="text/html",
+                    headers={"Cache-Control": "no-store"})
 
 
 def _acct() -> nova_account.NovaAccount:
@@ -159,10 +259,18 @@ def register(app, require_token, meta: dict) -> None:
         # than let the next person inherit a live copy of someone else.
         import nova_lifecycle
         import nova_runtime
+        # Silence first: if the relaunch does not happen (or takes a moment),
+        # nobody should hear the previous account's NOVA finishing a sentence.
+        nova_runtime.silence_voice()
         restarting = bool(nova_lifecycle.active_account_id())
         nova_lifecycle.deactivate()
         if restarting and not _NO_RELAUNCH:
             nova_runtime.relaunch()
+        else:
+            # Not restarting (no brain to unload, or a harness): at least
+            # stop pointing at the folder we just left. Refuses while a
+            # brain is live, which is exactly when a restart is required.
+            nova_runtime.rebind_data_dir()
         return jsonify({"ok": True, "restarting": restarting, **_status_payload()})
 
     @app.post("/api/account/verify/resend")
@@ -173,6 +281,27 @@ def register(app, require_token, meta: dict) -> None:
         except nova_account.Offline:
             return jsonify({"ok": False, "error": "offline",
                             "message": "Sending a new link needs a connection."}), 503
+        except nova_account.AccountError as e:
+            return jsonify({"ok": False, "error": e.code, "message": e.message}), 400
+
+    @app.post("/api/account/email/verify_code")
+    @require_token
+    def api_account_verify_code():
+        """Redeem the 6-digit code from the verification email.
+
+        The UI offers this for people whose mail client will not open the
+        link (or whose link expired). The code is checked by the cloud, which
+        is the only place that may mark the account verified.
+        """
+        body = request.get_json(silent=True) or {}
+        try:
+            j = _acct().verify_code(body.get("code") or "")
+            # The caller needs the refreshed account to know the gate opened:
+            # the cloud's own reply carries only a human message.
+            return jsonify({**j, "ok": True, **_status_payload()})
+        except nova_account.Offline:
+            return jsonify({"ok": False, "error": "offline",
+                            "message": "Checking the code needs a connection."}), 503
         except nova_account.AccountError as e:
             return jsonify({"ok": False, "error": e.code, "message": e.message}), 400
 
@@ -189,7 +318,29 @@ def register(app, require_token, meta: dict) -> None:
 
     # -- Google OAuth -----------------------------------------------------------
     # These endpoints are called by the frontend during first-run setup.
-    # They proxy to the nova_cloud backend which handles the actual OAuth flow.
+    # They proxy to the nova_cloud backend, which holds the Google client
+    # secret and performs the token exchange. This process receives the
+    # session because the cloud sends the browser back to the loopback
+    # address it signed into the state (see the flow notes above).
+
+    def _adopt_google_session(data: dict) -> bool:
+        """Make a Google sign-in this machine's session, exactly as a
+        password sign-in would."""
+        acct = _acct()
+        # The session payload from the cloud, adopted without a second round
+        # trip -- the cloud has already verified the account.
+        acct._adopt(data)
+        email = ((data.get("user") or {}).get("email") or "").strip()
+        if email:
+            # The device identity was created before we knew who they were;
+            # move it onto the account so this machine is not a stranger to
+            # its own next launch.
+            nova_account.adopt_device_identity(email)
+        restarting = bind_signed_in_account(acct)
+        _adopt_identity(acct, meta)
+        pull_preferences_async()
+        acct.emit("USER_LOGIN", surface="desktop", method="google_oauth")
+        return restarting
 
     @app.get("/api/account/google/start")
     @require_token
@@ -197,22 +348,144 @@ def register(app, require_token, meta: dict) -> None:
         """Get the Google OAuth authorization URL."""
         try:
             import requests
+            from urllib.parse import urlsplit
             from nova_version import cloud_base_url
             cloud = cloud_base_url()
             if not cloud:
                 return jsonify({"ok": False, "error": "not_configured",
                                 "message": "NOVA Cloud is not configured."}), 503
-            # Forward to the cloud backend
-            resp = requests.get(f"{cloud}/v1/auth/google/start", timeout=10)
-            return jsonify(resp.json()), resp.status_code
+            base = request.host_url.rstrip("/")
+            host = (urlsplit(base).hostname or "").lower()
+            if host not in ("127.0.0.1", "localhost", "::1"):
+                # Only the local window may finish a sign-in; anything else
+                # would hand our session to whoever asked.
+                return jsonify({"ok": False, "error": "not_supported",
+                                "message": "Google sign-in needs the NOVA "
+                                           "window. Sign in with email and "
+                                           "password instead."}), 503
+            callback = f"{base}/api/account/google/callback"
+            resp = requests.get(f"{cloud}/v1/auth/google/start",
+                                params={"client_redirect": callback}, timeout=10)
+            if resp.status_code == 404:
+                # The deployment predates this endpoint. Say that plainly
+                # instead of surfacing "path → 404" to a person trying to sign in.
+                return jsonify({"ok": False, "error": "not_supported",
+                                "message": "Google sign-in is not available on this "
+                                           "NOVA Cloud deployment yet. Use your email "
+                                           "and password."}), 503
+            try:
+                data = resp.json()
+            except ValueError:
+                # A proxy/edge error page is not JSON; report it as the cloud
+                # problem it is instead of raising a 500 inside the handler.
+                return jsonify({"ok": False, "error": "bad_response",
+                                "message": "NOVA Cloud returned an unexpected "
+                                           "response. Try again shortly."}), 502
+            if (resp.status_code >= 500
+                    and data.get("error") == "oauth_not_configured"):
+                # The deployment has the routes but no Google client. Its
+                # message names environment variables; that is for the log,
+                # not for the person trying to sign in.
+                log.warning("[DESK] cloud cannot start Google sign-in: %s",
+                            data.get("message") or "oauth_not_configured")
+                return jsonify({
+                    "ok": False, "error": "not_configured",
+                    "message": "Google sign-in is not set up on NOVA Cloud "
+                               "yet. Use your email and password for now.",
+                }), 503
+            if resp.status_code == 200 and data.get("ok") and data.get("state"):
+                _start_google_flow(data["state"])
+            return jsonify(data), resp.status_code
         except requests.RequestException as e:
             return jsonify({"ok": False, "error": "offline",
                             "message": f"NOVA Cloud unreachable: {e}"}), 503
 
+    @app.get("/api/account/google/callback")
+    def api_google_oauth_loopback():
+        """The browser lands here after the cloud redirects Google's answer.
+
+        This route cannot carry the desk token -- a browser navigation sends
+        no headers -- so the one-time state from the flow this process
+        started is the credential. Everything else is refused.
+        """
+        state = request.args.get("state") or ""
+        if not _consume_google_flow(state):
+            return _google_page(
+                "Sign-in expired",
+                "This sign-in is no longer valid. Close this window and try "
+                "again from NOVA.", 400)
+
+        error = request.args.get("error") or ""
+        if error:
+            msg = ("Sign-in was cancelled."
+                   if error == "access_denied"
+                   else "Google could not complete the sign-in.")
+            _record_google_outcome(False, msg)
+            return _google_page("Sign-in cancelled", msg, 400, autoclose=True)
+
+        code = request.args.get("code") or ""
+        if not code:
+            _record_google_outcome(False, "Google did not return a code.")
+            return _google_page(
+                "Sign-in failed",
+                "Google did not send a sign-in code. Close this window and "
+                "try again from NOVA.", 400)
+
+        try:
+            import requests
+            from nova_version import cloud_base_url
+            cloud = cloud_base_url()
+            if not cloud:
+                _record_google_outcome(
+                    False, "NOVA Cloud is not configured on this build.")
+                return _google_page(
+                    "Sign-in unavailable",
+                    "This build is not connected to NOVA Cloud.", 503)
+            resp = requests.post(
+                f"{cloud}/v1/auth/google/callback",
+                json={"code": code, "state": state,
+                      **nova_account.device_descriptor()},
+                headers={"Content-Type": "application/json"},
+                timeout=15,
+            )
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+            if resp.status_code == 200 and data.get("ok"):
+                _adopt_google_session(data)
+                _record_google_outcome(True, "")
+                return _google_page(
+                    "Signed in",
+                    "NOVA is signing you in. This window will close on its own.",
+                    200, autoclose=True)
+            msg = (data.get("message")
+                   or "Google sign-in could not be completed.")
+            _record_google_outcome(False, msg)
+            status = 400 if 400 <= resp.status_code < 500 else 502
+            return _google_page("Sign-in failed", msg, status)
+        except requests.RequestException:
+            msg = ("NOVA Cloud could not be reached. Check your connection "
+                   "and try again.")
+            _record_google_outcome(False, msg)
+            return _google_page("Sign-in failed", msg, 503)
+
+    @app.get("/api/account/google/status")
+    @require_token
+    def api_google_oauth_status():
+        """What the window's own poll needs to know: still waiting, or why
+        the popup it opened ended in failure."""
+        return jsonify({"ok": True, "pending": _google_flow_pending(),
+                        "error": _google_client_error()})
+
     @app.post("/api/account/google/callback")
     @require_token
     def api_google_oauth_callback():
-        """Handle Google OAuth callback from the frontend."""
+        """Exchange a code the window obtained itself.
+
+        The desktop loopback route above is the path a browser can follow;
+        this remains for a caller that holds the code and the desk token.
+        """
         body = request.get_json(silent=True) or {}
         try:
             import requests
@@ -228,19 +501,17 @@ def register(app, require_token, meta: dict) -> None:
                 headers={"Content-Type": "application/json"},
                 timeout=15,
             )
-            if resp.status_code == 200:
-                # The cloud backend returned tokens - bind the signed-in account
+            try:
                 data = resp.json()
-                if data.get("ok"):
-                    acct = _acct()
-                    # Manually adopt the session from the cloud response
-                    acct._adopt(data)
-                    restarting = bind_signed_in_account(acct)
-                    _adopt_identity(acct, meta)
-                    pull_preferences_async()
-                    acct.emit("USER_LOGIN", surface="desktop", method="google_oauth")
-                    return jsonify({"ok": True, "restarting": restarting, **_status_payload()})
-            return jsonify(resp.json()), resp.status_code
+            except ValueError:
+                return jsonify({"ok": False, "error": "bad_response",
+                                "message": "NOVA Cloud returned an unexpected "
+                                           "response. Try again shortly."}), 502
+            if resp.status_code == 200 and data.get("ok"):
+                restarting = _adopt_google_session(data)
+                return jsonify({"ok": True, "restarting": restarting,
+                                **_status_payload()})
+            return jsonify(data), resp.status_code
         except requests.RequestException as e:
             return jsonify({"ok": False, "error": "offline",
                             "message": f"NOVA Cloud unreachable: {e}"}), 503
@@ -310,7 +581,14 @@ def register(app, require_token, meta: dict) -> None:
             return inst
         try:
             return acct.instance()
-        except nova_account.AccountError:
+        except nova_account.AccountError as e:
+            # A deployment that requires verification refuses every authenticated
+            # route, this one included. That refusal is the clearest statement
+            # that this account has to verify first -- and unlike the session
+            # flag it also works against a server older than this client, which
+            # never sent the flag at all.
+            if e.status in (401, 403) and "verify" in (e.message or "").lower():
+                return {"verification_required": True}
             return {}
 
     def lifecycle_payload() -> dict:
@@ -331,7 +609,8 @@ def register(app, require_token, meta: dict) -> None:
         inst = _instance(acct)
         instance_done = bool(inst.get("onboarding_completed"))
         device_done = nova_lifecycle.device_setup_completed()
-        if st["verification_required"] and not st["email_verified"]:
+        if ((st["verification_required"] or inst.get("verification_required"))
+                and not st["email_verified"]):
             nxt = "verify_email"
         elif not instance_done:
             nxt = "profile"
@@ -339,6 +618,14 @@ def register(app, require_token, meta: dict) -> None:
             nxt = "device_setup"
         else:
             nxt = "none"
+            # Setup is genuinely finished and this is not a local-only run:
+            # this is the one place that knows it. Ask only when the brain
+            # is not already running (start_brain is guarded anyway; this
+            # keeps repeat lifecycle polls from re-invoking it).
+            if not nova_runtime.brain_state().get("started"):
+                allowed, stage = nova_runtime.assistant_allowed()
+                if allowed:
+                    nova_runtime.start_brain()
         return {**base, "next": nxt, "signed_in": True, "online": st["online"],
                 "email_verified": st["email_verified"],
                 "instance": inst, "instance_onboarding_completed": instance_done,
@@ -430,7 +717,10 @@ def register(app, require_token, meta: dict) -> None:
                                   "pending_sync": True})
             steps.append({"id": "instance", "label": "Your NOVA is ready", "ok": True,
                           "detail": "will sync when you are online"})
-        return jsonify({"ok": True, "steps": steps, **lifecycle_payload()})
+        # Setup just finished: lifecycle_payload below discovers next=="none"
+        # and starts the assistant (guarded, once). Nothing extra to call.
+        return jsonify({"ok": True, "steps": steps,
+                        **lifecycle_payload()})
 
     @app.post("/api/account/sync")
     @require_token
@@ -471,13 +761,48 @@ def bind_signed_in_account(acct: nova_account.NovaAccount) -> bool:
             nova_runtime.relaunch()
         return True
     nova_lifecycle.activate_account(uid)
-    os.environ["NOVA_AUTH_GATE"] = "0"
+    # This process started before anyone signed in, so nova -- imported when
+    # the desk server came up -- fixed its memory paths to the machine-wide
+    # folder. Without this, the brain started below reads the previous
+    # person's living memory and greets the new account by the old name.
+    # Repoint before the brain starts; if it cannot (a brain is already
+    # running), restart rather than mix two people.
+    if not nova_runtime.rebind_data_dir():
+        if not _NO_RELAUNCH:
+            nova_runtime.relaunch()
+        return True
     try:
         from . import creds
         creds.apply_runtime()                  # this account's key / managed model
     except Exception:
         pass
-    nova_runtime.start_brain()
+    # The brain is the assistant: it listens, talks, runs tools. Starting it
+    # here would give a half-onboarded account a live assistant behind the
+    # setup screens, so the gate decides -- sign-in alone is not enough.
+    # A fresh account has no cached instance; an empty cache reads as
+    # "allowed", so fetch it now (the signup/sign-in request just proved the
+    # backend is reachable) and fail closed when that is impossible.
+    if not acct.cached_instance():
+        try:
+            acct.instance()
+        except Exception:
+            log.info("[DESK] instance unavailable at bind; deferring the "
+                     "brain until the lifecycle check")
+    # (The gate reads NOVA_AUTH_GATE, so it is consulted BEFORE this endpoint
+    # touches the variable: clearing it first would disarm the check.)
+    allowed, stage = nova_runtime.assistant_allowed()
+    if os.environ.get("NOVA_DEBUG_BIND"):
+        log.info("[BIND-DEBUG] cached=%r allowed=%r stage=%r",
+                 acct.cached_instance(), allowed, stage)
+    if allowed:
+        os.environ["NOVA_AUTH_GATE"] = "0"
+        nova_runtime.start_brain()
+    else:
+        os.environ["NOVA_AUTH_GATE"] = "1"
+        # A session that was already talking when this account was bound must
+        # not keep speaking behind the setup screens.
+        nova_runtime.silence_voice()
+        log.info("[DESK] brain deferred (%s): setup is not finished", stage)
     return False
 
 

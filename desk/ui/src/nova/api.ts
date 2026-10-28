@@ -38,7 +38,17 @@ export async function api(path: string, init: RequestInit & { timeoutMs?: number
 
 export async function getJSON<T = unknown>(path: string, timeoutMs?: number): Promise<T> {
   const r = await api(path, { timeoutMs });
-  if (!r.ok) throw new ApiError(`${path} → ${r.status}`, r.status);
+  if (!r.ok) {
+    // Prefer the sentence the server wrote for a person; the path-and-status
+    // form is a debugging string that leaked into the sign-in screen.
+    let data: { error?: string; message?: string } | null = null;
+    try {
+      data = (await r.json()) as { error?: string; message?: string };
+    } catch {
+      /* not JSON */
+    }
+    throw new ApiError(data?.message || data?.error || `${path} → ${r.status}`, r.status);
+  }
   return (await r.json()) as T;
 }
 

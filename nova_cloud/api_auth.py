@@ -18,12 +18,15 @@ without a second call.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac as _hmac
 import logging
 import secrets
 import time
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode, urlsplit
 
-from flask import Blueprint, current_app, g, jsonify, request
+from flask import Blueprint, current_app, g, jsonify, redirect, request
 from sqlalchemy import select
 
 import requests
@@ -155,9 +158,26 @@ def _sent_state(mc) -> dict:
     return {**_delivery_state(mc), "sent": False}
 
 
+#: Account mail is awaited inside the request, so it gets a shorter leash than
+#: the background sender. Long enough for a healthy provider, short enough that
+#: sign-up does not hang on a degraded one.
+_AUTH_EMAIL_TIMEOUT_S = 6.0
+
+
 def _deliver(mc, address: str, template, token: str, kind: str,
              wrap_key: str | None = "email_delivery") -> dict:
     """Send one account email and report truthfully what happened.
+
+    Delivery is synchronous and bounded, because the point of the return value
+    is to tell a human whether a message was actually accepted. A queued send
+    cannot answer that: it returns before the provider has ruled on the
+    message, so `sent` would mean "handed to the queue", and the UI would say
+    "check your inbox" for a message that was silently refused.
+
+    There is deliberately no re-enqueue after a failure. A timeout can expire
+    *after* the provider accepted the message, so a hidden retry risks a
+    duplicate email; the caller is told the truth and the resend endpoint is
+    one click away.
 
     When nothing is configured NOVA does not pretend: no "check your inbox",
     and outside production the token is handed back so a developer can finish
@@ -170,13 +190,28 @@ def _deliver(mc, address: str, template, token: str, kind: str,
     if mc.configured:
         try:
             subject, text, html_body = template(mc.cfg, token)
-            mc.send(address, subject, text, html_body, kind=kind)
+            mc.send_now(address, subject, text, html_body,
+                        timeout=_AUTH_EMAIL_TIMEOUT_S)
             state["sent"] = True
-        except Exception:
-            # Queued delivery already retries; a failure here means the message
-            # never even got queued.
+        except mail.EmailRejected as e:
+            # The provider understood the message and refused it. Retrying the
+            # identical message cannot help; say so instead of implying success.
             state["sent"] = False
-            state["error"] = "delivery_unavailable"
+            state["error"] = "delivery_rejected"
+            if e.status:
+                state["provider_status"] = int(e.status)
+            log.warning("[AUTH] %s email rejected by provider (status %s)",
+                        kind, e.status or "4xx")
+        except mail.EmailNotConfigured:
+            state["sent"] = False
+            state["error"] = "not_configured"
+        except Exception as e:
+            state["sent"] = False
+            state["error"] = "delivery_failed"
+            # Type only: the message can quote the recipient address, and the
+            # address is what we are trying not to log.
+            log.warning("[AUTH] %s email failed to send: %s",
+                        kind, type(e).__name__)
     else:
         state["sent"] = False
         if not cfg.is_production:
@@ -295,8 +330,11 @@ def signup():
                 expires_at=now() + 86400,
                 code_expires_at=now() + 600,  # 10 minutes for code
             ))
+            # Separate key: `email_delivery` must keep describing the link
+            # email, since that is the message the UI says was sent.
             payload.update(_deliver(mc, user.email, mail.verification_code_email,
-                                    code, "verify_email_code"))
+                                    code, "verify_email_code",
+                                    wrap_key="email_code_delivery"))
         else:
             # Always say what the server can and cannot do, so a client never
             # has to guess whether an email is coming.
@@ -307,6 +345,7 @@ def signup():
 
 @bp.post("/login")
 def login():
+    cfg = current_app.config["NOVA_CFG"]
     body = request.get_json(silent=True) or {}
     email = sec.normalise_email(body.get("email", ""))
     password = body.get("password") or ""
@@ -357,7 +396,7 @@ def login():
             _notify_new_device(user.email, device)
 
         prof = s.get(Profile, user.id)
-        return jsonify({
+        payload = {
             "ok": True,
             "user": {"id": user.id, "email": user.email,
                      "display_name": prof.display_name if prof else "",
@@ -365,7 +404,46 @@ def login():
                      "created_at": user.created_at},
             "device": {"id": device.id, "name": device.name},
             **tokens,
-        })
+        }
+
+        # Signing in on an unverified account is where most people first learn
+        # that verification is required -- and it used to be the one entry point
+        # that never said so and never sent the mail. The client was told
+        # nothing, sent the user to the profile step, and the account guard then
+        # refused with "Verify your email address to continue." while no message
+        # existed to act on. Both facts belong in this response.
+        mc = mail.mailer()
+        # The account guard refuses every authenticated route for an unverified
+        # account, whatever this policy says -- so verification is "required"
+        # whenever the user could actually complete it. Sending and telling the
+        # client use the same condition, which is what keeps them consistent.
+        payload["verification_required"] = bool(cfg.require_email_verification
+                                                or mc.configured)
+        payload["email_delivery"] = _sent_state(mc)
+        pending = None
+        if not user.email_verified and (cfg.require_email_verification or mc.configured):
+            token = _issue_email_token(s, user.id, "verify_email", 86400)
+            code = sec.new_verification_code()
+            s.add(EmailToken(
+                user_id=user.id,
+                kind="verify_email",
+                token_hash="code:" + sec.hash_code(code),
+                code_hash=sec.hash_code(code),
+                expires_at=now() + 86400,
+                code_expires_at=now() + 600,
+            ))
+            pending = (user.email, token, code)
+
+    # Sent after the transaction commits, and outside it: a six-second provider
+    # timeout must not hold a pooled database connection open. A failed send
+    # does not fail the sign-in -- the user is signed in and can press Resend.
+    if pending:
+        address, token, code = pending
+        payload.update(_deliver(mc, address, mail.verification_email, token,
+                                "verify_email"))
+        payload.update(_deliver(mc, address, mail.verification_code_email, code,
+                                "verify_email_code", wrap_key="email_code_delivery"))
+    return jsonify(payload)
 
 
 @bp.post("/refresh")
@@ -567,6 +645,11 @@ def _consume_email_token(token: str, kind: str) -> tuple[bool, str]:
         if kind == "verify_email":
             user.email_verified = True
             record_event(s, "EMAIL_VERIFIED", user_id=user.id)
+            # The authorisation cache keeps the pre-verification flag for up to
+            # ten seconds. Without this, someone who has just clicked the link
+            # is still refused with "Verify your email address to continue."
+            from .auth_guard import invalidate_auth_cache
+            invalidate_auth_cache(user.id)
             return True, ("Your email address is confirmed. You can return to "
                           "NOVA and carry on.")
         return True, "Token accepted."
@@ -633,8 +716,11 @@ def resend_verification():
         ))
         mc = mail.mailer()
         return jsonify({"ok": True,
-                        **_deliver(mc, user.email, mail.verification_email, token, "verify_email"),
-                        **_deliver(mc, user.email, mail.verification_code_email, code, "verify_email_code")})
+                        **_deliver(mc, user.email, mail.verification_email,
+                                   token, "verify_email"),
+                        **_deliver(mc, user.email, mail.verification_code_email,
+                                   code, "verify_email_code",
+                                   wrap_key="email_code_delivery")})
 
 
 @bp.post("/email/verify_code")
@@ -647,6 +733,16 @@ def verify_email_code():
     if not code.isdigit() or len(code) != 6:
         return _fail("Verification code must be a 6-digit number.", 400, "invalid_code")
     with session_scope() as s:
+        # A six-digit code is only 10^6 possibilities and lives for ten
+        # minutes, so unlimited attempts from one host is a guessing window,
+        # not a formality.
+        try:
+            rate_limit(s, f"verify_code:ip:{sec.hash_ip(_client_ip())}",
+                       limit=20, window_s=3600)
+        except RateLimited as e:
+            resp = _fail("Too many attempts. Ask for a new code in a little "
+                         "while.", 429, "rate_limited")
+            return resp[0], resp[1], {"Retry-After": str(e.retry_after)}
         row = s.scalar(select(EmailToken).where(
             EmailToken.code_hash == sec.hash_code(code),
             EmailToken.kind == "verify_email"))
@@ -659,6 +755,10 @@ def verify_email_code():
         row.used_at = now()
         user.email_verified = True
         record_event(s, "EMAIL_VERIFIED", user_id=user.id)
+        # Same reason as the link path: a cached "unverified" must not survive
+        # the verification it contradicts.
+        from .auth_guard import invalidate_auth_cache
+        invalidate_auth_cache(user.id)
         return jsonify({"ok": True, "message": "Your email address is confirmed. You can return to NOVA and carry on."})
 
 
@@ -722,42 +822,232 @@ def _google_oauth_configured() -> tuple[bool, str]:
     return True, ""
 
 
-def _google_oauth_state() -> str:
-    """Generate a secure OAuth state parameter."""
-    return secrets.token_urlsafe(32)
+#: The state parameter is how the callback proves the code came from an
+#: authorization flow *we* started. It used to be generated, attached, and
+#: then never checked -- which is the login-CSRF classic: an attacker sends
+#: the victim a callback carrying the attacker's code, and the victim's
+#: device signs into the attacker's account. The state is now signed with
+#: the server's own key and carries its issue time, so the callback verifies
+#: both authorship and freshness without a shared session store.
+_GOOGLE_STATE_TTL_S = 600
+
+
+#: Where the browser may be sent after Google answers. The desktop is the
+#: only client that can finish a sign-in (it must exchange the code and adopt
+#: the session), so the only address this service will ever navigate to is
+#: the desktop's own loopback callback. Anything else -- https, a LAN address,
+#: a different path, embedded credentials -- is refused before it is signed.
+_DESKTOP_CALLBACK_PATH = "/api/account/google/callback"
+
+
+def _loopback_redirect(value: str) -> str:
+    """The redirect if it is a loopback address for the desktop, else "".
+
+    This value comes from a client and later becomes a browser navigation
+    carrying an authorization code, so it is allow-listed by *shape*, not
+    trusted: an open redirect here would hand a code to whoever asked.
+    """
+    raw = (value or "").strip()
+    if not raw or len(raw) > 300:
+        return ""
+    try:
+        u = urlsplit(raw)
+    except ValueError:
+        return ""
+    if u.scheme != "http" or u.hostname not in ("127.0.0.1", "localhost", "::1"):
+        return ""
+    if u.port is None or u.username or u.password or u.query or u.fragment:
+        return ""
+    if u.path != _DESKTOP_CALLBACK_PATH:
+        return ""
+    return raw
+
+
+def _google_oauth_state(redirect_to: str = "") -> str:
+    """Issue a signed OAuth state: `<v>.<ts>.<nonce>.<redirect64>.<hmac>`.
+
+    The nonce makes every issued state unique even within one second, so a
+    captured state cannot be replayed by racing a second flow. The redirect
+    (empty when the flow was not started by the desktop) is signed with the
+    rest of the state, which is what lets the browser-facing GET callback
+    send the code home without becoming an open redirect.
+    """
+    ts = str(int(time.time()))
+    nonce = secrets.token_urlsafe(8)
+    r64 = base64.urlsafe_b64encode(
+        (redirect_to or "").encode("utf-8")).decode("ascii").rstrip("=")
+    key = current_app.config["NOVA_CFG"].secret_key.encode("utf-8")
+    sig = _hmac.new(key, f"v1.{ts}.{nonce}.{r64}".encode("utf-8"),
+                    hashlib.sha256).hexdigest()[:32]
+    return f"v1.{ts}.{nonce}.{r64}.{sig}"
+
+
+def _google_state_parts(state: str) -> tuple[str, str] | None:
+    """`(timestamp, redirect64)` when the state's signature and age hold."""
+    try:
+        version, ts_s, nonce, r64, sig = (state or "").split(".", 4)
+        ts = int(ts_s)
+    except (ValueError, AttributeError):
+        return None
+    if version != "v1" or not nonce or not sig:
+        return None
+    if time.time() - ts > _GOOGLE_STATE_TTL_S:
+        return None
+    key = current_app.config["NOVA_CFG"].secret_key.encode("utf-8")
+    expect = _hmac.new(key, f"v1.{ts_s}.{nonce}.{r64}".encode("utf-8"),
+                       hashlib.sha256).hexdigest()[:32]
+    if not _hmac.compare_digest(sig, expect):
+        return None
+    return ts_s, r64
+
+
+def _google_state_valid(state: str) -> bool:
+    return _google_state_parts(state) is not None
+
+
+def _google_state_redirect(state: str) -> str:
+    """The desktop callback signed into this state, re-validated on the way out."""
+    parts = _google_state_parts(state)
+    if not parts:
+        return ""
+    r64 = parts[1]
+    try:
+        raw = base64.urlsafe_b64decode(
+            r64 + "=" * (-len(r64) % 4)).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    return _loopback_redirect(raw)
+
+
+def _oauth_page(title: str, message: str, status: int = 200):
+    """A small, script-free page for the browser that Google sent back.
+
+    It is the last thing a person sees before returning to NOVA, so it says
+    what happened in their words. Nothing from the query string is echoed:
+    the code and state are credentials, and an error page is not the place
+    to reflect them.
+    """
+    from flask import Response
+    from html import escape
+    body = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{escape(title)} - NOVA</title>
+<style>
+ body{{margin:0;min-height:100vh;display:grid;place-items:center;
+      background:#0b0d12;color:#e8eaf0;
+      font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}}
+ main{{max-width:30rem;padding:2rem;text-align:center}}
+ h1{{font-size:1.25rem;font-weight:600;margin:0 0 .6rem}}
+ p{{margin:0;color:#a6adbb}}
+</style></head>
+<body><main><h1>{escape(title)}</h1><p>{escape(message)}</p></main></body></html>"""
+    return Response(body, status=status, mimetype="text/html",
+                    headers={"Cache-Control": "no-store"})
 
 
 @bp.get("/google/start")
 def google_oauth_start():
-    """Start Google OAuth flow. Returns authorization URL for the desktop to open in browser."""
+    """Start Google OAuth flow. Returns authorization URL for the desktop to open in browser.
+
+    Scope is deliberately the minimum sign-in set (who you are, nothing
+    else). Gmail, Calendar and Drive are separate, individually-granted
+    connections -- signing in grants none of them.
+    """
     configured, err = _google_oauth_configured()
     if not configured:
         return _fail(err, 503, "oauth_not_configured")
 
     cfg = current_app.config["NOVA_CFG"]
-    state = _google_oauth_state()
 
-    # Store state in session (we use a simple in-memory cache with short TTL)
-    # In production with multiple workers, this would need Redis or database storage.
-    # For now, we encode the state in the URL and verify it on callback.
-    from urllib.parse import urlencode
+    # The desktop passes its own loopback callback so Google's browser
+    # redirect can come home to the app that started the flow. A plain
+    # browser client passes nothing and gets a state with no redirect; the
+    # GET callback then explains that sign-in has to be started from NOVA.
+    body = request.get_json(silent=True) or {}
+    requested = (request.args.get("client_redirect")
+                 or body.get("client_redirect") or "").strip()
+    redirect_to = ""
+    if requested:
+        redirect_to = _loopback_redirect(requested)
+        if not redirect_to:
+            return _fail("The desktop's sign-in address is not valid.", 400,
+                         "invalid_redirect")
+    state = _google_oauth_state(redirect_to)
+
     params = {
         "client_id": cfg.google_oauth_client_id,
         "redirect_uri": cfg.google_oauth_redirect_uri,
         "response_type": "code",
         "scope": " ".join(GOOGLE_SCOPES),
         "state": state,
-        "access_type": "offline",
-        "prompt": "consent",
+        # No access_type=offline: basic sign-in does not need a refresh
+        # token, and asking for one muddles "who are you" with "let me act
+        # when you are absent". Service connections request their own.
+        "prompt": "select_account",
     }
     auth_url = f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
     return jsonify({"ok": True, "auth_url": auth_url, "state": state})
+
+
+@bp.get("/google/callback")
+def google_oauth_get_callback():
+    """Google's browser redirect for a desktop sign-in.
+
+    Google navigates the browser here (a GET) with the code. The code is
+    only useful to the client that holds the secret, so it is not exchanged
+    here: the signed state carries the desktop's loopback address, and the
+    browser is sent straight back to the app that started the flow. That app
+    then calls the POST callback, which exchanges the code and issues the
+    session. Keeping the exchange in one place is also what keeps the
+    login-CSRF check there authoritative.
+    """
+    denied = (request.args.get("error") or "").strip()
+    if denied:
+        message = ("Google sign-in was cancelled."
+                   if denied == "access_denied"
+                   else "Google sign-in was not completed.")
+        return _oauth_page("Sign-in cancelled", message, 400)
+
+    state = (request.args.get("state") or "").strip()
+    if not _google_state_valid(state):
+        # Forged, replayed, stale -- or a flow started before the desktop
+        # handoff existed. None of those may navigate anywhere.
+        return _oauth_page(
+            "Sign-in expired",
+            "This sign-in attempt has expired. Return to NOVA and try again.",
+            400)
+
+    target = _google_state_redirect(state)
+    if not target:
+        return _oauth_page(
+            "Open NOVA to finish",
+            "This sign-in was not started by the NOVA app. Open NOVA and "
+            "choose Continue with Google there.",
+            400)
+
+    code = (request.args.get("code") or "").strip()
+    if not code:
+        return _oauth_page(
+            "Sign-in failed", "Google did not return a sign-in code.", 400)
+
+    sep = "&" if "?" in target else "?"
+    return redirect(f"{target}{sep}code={quote(code, safe='')}"
+                    f"&state={quote(state, safe='')}", code=302)
 
 
 @bp.post("/google/callback")
 def google_oauth_callback():
     """Handle Google OAuth callback. Exchanges code for tokens, creates or links account."""
     body = request.get_json(silent=True) or {}
+    # Google itself may deliver the outcome of a declined consent. Fail
+    # safely and clearly rather than falling into "missing code".
+    denied = (body.get("error") or "").strip()
+    if denied:
+        return _fail(
+            "Google sign-in was not completed"
+            + (" (access was denied on the consent screen)." if denied == "access_denied" else "."),
+            400, "authorization_denied" if denied == "access_denied" else "oauth_error")
     code = (body.get("code") or "").strip()
     state = (body.get("state") or "").strip()
     device_id = (body.get("device_id") or "").strip()[:36]
@@ -770,6 +1060,10 @@ def google_oauth_callback():
         return _fail("Authorization code is required", 400, "missing_code")
     if not state:
         return _fail("OAuth state is required", 400, "missing_state")
+    if not _google_state_valid(state):
+        # Forged, replayed, or stale. Never proceed on it.
+        return _fail("This sign-in attempt has expired. Start again.", 400,
+                     "invalid_state")
 
     configured, err = _google_oauth_configured()
     if not configured:

@@ -21,6 +21,20 @@ _SessionLocal = None
 _lock = threading.Lock()
 
 
+def _int_env(name: str, default: int) -> int:
+    """A positive integer from the environment, or the default.
+
+    Capacity limits are tuned per deployment, so they must not require a code
+    change and a rebuild to adjust. A malformed value falls back rather than
+    breaking startup.
+    """
+    try:
+        value = int(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 def engine():
     global _engine, _SessionLocal
     with _lock:
@@ -40,7 +54,13 @@ def engine():
                     "refusing to open a non-SQLite database from a test run "
                     f"({url.split('://')[0]}://...). Set DATABASE_URL to a "
                     "sqlite:// path in the fixture.")
-            kw: dict = {"future": True, "pool_pre_ping": True}
+            # A pooled connection that cannot be obtained within a few seconds
+            # must fail fast. The previous default (30 s) meant a saturated
+            # pool turned into 30-second waits for every caller, which looks
+            # like the whole service hanging rather than one dependency being
+            # full. The handler in app.py turns this into a 503 + Retry-After.
+            kw: dict = {"future": True, "pool_pre_ping": True,
+                        "pool_timeout": _int_env("NOVA_DB_POOL_TIMEOUT", 5)}
 
             if url.startswith("postgresql"):
                 from sqlalchemy.engine import make_url
@@ -61,11 +81,24 @@ def engine():
                     kw["connect_args"] = {"prepare_threshold": None}
                     # Transaction pooling also makes a large client-side pool
                     # pointless: the pooler is the pool.
-                    kw["pool_size"] = 5
-                    kw["max_overflow"] = 5
-                    kw["pool_recycle"] = 300
+                    kw["pool_size"] = _int_env("NOVA_DB_POOL_SIZE", 5)
+                    kw["max_overflow"] = _int_env("NOVA_DB_MAX_OVERFLOW", 5)
+                    kw["pool_recycle"] = _int_env("NOVA_DB_POOL_RECYCLE", 300)
                     log.info("[DB] transaction pooler detected; prepared "
                              "statements disabled")
+                else:
+                    # Direct Postgres: SQLAlchemy's defaults (5 + 10) are not a
+                    # decision anybody made, and an unlimited recycle lets
+                    # dead connections accumulate. Size it explicitly so the
+                    # number of connections per process is a known quantity:
+                    # workers x (pool_size + max_overflow) must fit inside the
+                    # database's own connection limit.
+                    kw["pool_size"] = _int_env("NOVA_DB_POOL_SIZE", 10)
+                    kw["max_overflow"] = _int_env("NOVA_DB_MAX_OVERFLOW", 10)
+                    kw["pool_recycle"] = _int_env("NOVA_DB_POOL_RECYCLE", 1800)
+                    # Reuse the most recently returned connection first, so
+                    # idle connections are the ones the database times out.
+                    kw["pool_use_lifo"] = True
 
             if url.startswith("sqlite"):
                 # SQLite needs WAL to tolerate concurrent readers alongside the

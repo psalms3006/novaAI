@@ -193,6 +193,57 @@ Same templates, same flows. Nothing else changes.
 
 ---
 
+## Google sign-in (optional)
+
+The desktop's **Continue with Google** button is finished on the client side,
+but it can only work once this server serves the two endpoints it depends on.
+Two things have to be true, and either one missing produces the same red line
+in the app ("Google sign-in is not available on this NOVA Cloud deployment
+yet" — which is what a server too old to know the routes returns, a 404).
+
+**1. The server runs a build that has them.** `GET /v1/auth/google/start`,
+`GET /v1/auth/google/callback` and `POST /v1/auth/google/callback` were added
+in the same change as the desktop button. A deployment older than that answers
+404 for all three however well it is configured:
+
+```bash
+API=https://api.omniel.com.ng
+curl -s -o /dev/null -w '%{http_code}\n' $API/v1/auth/google/start   # 503 expected, 404 = too old
+```
+
+503 `oauth_not_configured` is the *good* answer here: the route exists and is
+telling you the credentials below are missing. Redeploy, then re-check.
+
+**2. Google has a client for it.** In Google Cloud Console → API & Services →
+Credentials → **Create credentials → OAuth client ID**:
+
+* Application type **Web application** — not "Desktop app". The exchange
+  happens on this server, and only a web client can carry a hosted redirect.
+* Authorised redirect URI, exactly:
+  `<APP_BASE_URL>/v1/auth/google/callback`
+  (for this deployment: `https://api.omniel.com.ng/v1/auth/google/callback`).
+  A trailing slash or `http://` is a different URI and fails with
+  `redirect_uri_mismatch`.
+
+Then set on the API (and nowhere else — the secret never goes to the desktop):
+
+```
+NOVA_GOOGLE_OAUTH_CLIENT_ID=...apps.googleusercontent.com
+NOVA_GOOGLE_OAUTH_CLIENT_SECRET=...
+NOVA_GOOGLE_OAUTH_REDIRECT_URI=https://api.omniel.com.ng/v1/auth/google/callback
+```
+
+On the EC2 deployment these go in `~/project-nova/deploy/nova-cloud/.env`
+(gitignored, next to `env.production.example`) and take effect on
+`docker compose up -d` — `docker compose restart` re-reads the file too, but a
+rebuild is what brings the new routes.
+
+The consent screen asks for `openid email profile` and nothing else: signing
+in never grants Gmail, Drive or Calendar. If the app is still in **Testing**
+mode on the consent screen, only the accounts listed as test users can sign in.
+
+---
+
 ## 4. DNS for NOVA
 
 Subdomains keep NOVA isolated from the company website. An outage or
@@ -325,9 +376,10 @@ which is otherwise invisible until someone complains.
 
 ## 9. What is deliberately not here
 
-* **No OAuth yet.** The schema does not assume password-only; adding an
-  `identities(provider, subject, user_id)` table is the intended path for
-  Google/Apple/Microsoft/GitHub.
+* **Google sign-in only (no other providers).** Google is implemented as a
+  second way to prove the same address; the account is still NOVA's own.
+  Apple/Microsoft/GitHub would each need their own client and callback, and an
+  `identities(provider, subject, user_id)` table is the intended path for them.
 * **No cloud memory sync.** Conversations and NOVA's memory stay on the
   device. There is no column for them in the schema and no endpoint returns
   them.

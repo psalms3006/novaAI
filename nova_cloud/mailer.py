@@ -43,6 +43,19 @@ class EmailNotConfigured(RuntimeError):
     """No provider is configured. Never swallowed into a fake success."""
 
 
+class EmailRejected(RuntimeError):
+    """The provider understood the message and refused it (4xx).
+
+    Distinct from a transient failure because retrying an identical message
+    cannot help: a bad recipient, an unverified sending domain or a revoked
+    key will be refused every time. Callers must not report success.
+    """
+
+    def __init__(self, message: str, status: int = 0):
+        super().__init__(message)
+        self.status = status
+
+
 @dataclass
 class EmailConfig:
     provider: str
@@ -125,7 +138,8 @@ def _ensure_tls() -> None:
 
 
 def _send_resend(cfg: EmailConfig, to: str, subject: str,
-                 text: str, html_body: str) -> None:
+                 text: str, html_body: str,
+                 timeout: float = _SEND_TIMEOUT_S) -> None:
     _ensure_tls()
     import requests
     r = requests.post(
@@ -134,15 +148,28 @@ def _send_resend(cfg: EmailConfig, to: str, subject: str,
                  "Content-Type": "application/json"},
         json={"from": cfg.from_address, "to": [to], "subject": subject,
               "text": text, "html": html_body},
-        timeout=_SEND_TIMEOUT_S,
+        timeout=timeout,
     )
     if r.status_code >= 400:
-        # Include the status, never the API key.
-        raise RuntimeError(f"resend rejected the message ({r.status_code})")
+        # Include the status, never the API key or the provider's response body
+        # (which can quote the recipient address).
+        if 400 <= r.status_code < 500 and r.status_code not in (408, 429):
+            raise EmailRejected(
+                f"resend refused the message ({r.status_code})", r.status_code)
+        raise RuntimeError(f"resend could not deliver the message ({r.status_code})")
+    # The id is the only handle for asking the provider what became of the
+    # message. It identifies no person and no credential.
+    try:
+        message_id = str((r.json() or {}).get("id") or "")
+    except Exception:
+        message_id = ""
+    if message_id:
+        log.info("[MAIL:resend] accepted id=%s", message_id)
 
 
 def _send_smtp(cfg: EmailConfig, to: str, subject: str,
-               text: str, html_body: str) -> None:
+               text: str, html_body: str,
+               timeout: float = _SEND_TIMEOUT_S) -> None:
     msg = EmailMessage()
     msg["From"] = cfg.from_address
     msg["To"] = to
@@ -151,11 +178,9 @@ def _send_smtp(cfg: EmailConfig, to: str, subject: str,
     msg.add_alternative(html_body, subtype="html")
 
     if cfg.smtp_port == 465:
-        server = smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port,
-                                  timeout=_SEND_TIMEOUT_S)
+        server = smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port, timeout=timeout)
     else:
-        server = smtplib.SMTP(cfg.smtp_host, cfg.smtp_port,
-                              timeout=_SEND_TIMEOUT_S)
+        server = smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=timeout)
     try:
         if cfg.smtp_port != 465 and cfg.smtp_starttls:
             server.starttls()
@@ -170,7 +195,8 @@ def _send_smtp(cfg: EmailConfig, to: str, subject: str,
 
 
 def _send_console(cfg: EmailConfig, to: str, subject: str,
-                  text: str, html_body: str) -> None:
+                  text: str, html_body: str,
+                  timeout: float = _SEND_TIMEOUT_S) -> None:
     log.info("[MAIL:console] to=%s subject=%s\n%s", to, subject, text)
 
 
@@ -344,12 +370,19 @@ class Mailer:
             log.error("[MAIL] queue full; dropped %s to %s", kind, _mask(to))
             _record_failure(kind, "queue_full")
 
-    def send_now(self, to: str, subject: str, text: str, html_body: str) -> None:
-        """Synchronous send. Used by the operator CLI to test configuration,
-        where a caller genuinely wants the error."""
+    def send_now(self, to: str, subject: str, text: str, html_body: str,
+                 *, timeout: float = _SEND_TIMEOUT_S) -> None:
+        """Send synchronously and let the caller see the truth.
+
+        Used by the operator CLI to test configuration, and by the account
+        flows where the response tells a human whether a verification message
+        was actually accepted -- a queued send cannot answer that question.
+        Raises EmailNotConfigured or EmailRejected; any other failure is
+        transient and left to the caller to report."""
         if not self.configured:
             raise EmailNotConfigured("No email provider configured")
-        _PROVIDERS[self.cfg.provider](self.cfg, to, subject, text, html_body)
+        _PROVIDERS[self.cfg.provider](self.cfg, to, subject, text, html_body,
+                                      timeout=timeout)
         self.sent += 1
 
     def flush(self, timeout: float = 20.0) -> None:
@@ -436,6 +469,6 @@ def reset_mailer() -> None:
         _mailer = None
 
 
-__all__ = ["Mailer", "EmailConfig", "EmailNotConfigured", "email_config",
-           "mailer", "reset_mailer", "verification_email", "reset_email",
-           "new_device_email"]
+__all__ = ["Mailer", "EmailConfig", "EmailNotConfigured", "EmailRejected",
+           "email_config", "mailer", "reset_mailer", "verification_email",
+           "verification_code_email", "reset_email", "new_device_email"]

@@ -241,12 +241,21 @@ for _pkg in ("actions", "capabilities", "core", "orchestrator", "memory",
              "nova_extensions",
              # Self-extending skills, deferred tools, hooks and error classes:
              # reached through try/except and function-local imports.
-             "nova_skills", "nova_tools", "nova_core", "nova_learning"):
+             "nova_skills", "nova_tools", "nova_core", "nova_learning",
+             # The comms registry/notifications and the identity record are
+             # imported inside functions too. The artifact test found both
+             # absent from the last bundle: the features worked from source
+             # and silently reported themselves missing in the EXE.
+             "nova_comms"):
     try:
         hidden += [m for m in collect_submodules(_pkg)
                    if not m.endswith(("._init_", ".__main__", "._smoke_test"))]
     except Exception:
         pass
+# collect_submodules returns *submodules*, so a single-file package with none
+# contributes nothing at all. This one has to be named directly, or the sweep
+# above looks like it covers it while the bundle still lacks it.
+hidden.append("nova_self_identity")
 # Only submodules that actually exist in the installed google-genai. Listing
 # names that do not exist made PyInstaller emit "ERROR: Hidden import not
 # found" for each, which hid real build failures in the noise.

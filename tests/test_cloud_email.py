@@ -8,6 +8,7 @@ implies success.
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import uuid
 
@@ -23,7 +24,7 @@ class FakeProvider:
         self.messages: list[dict] = []
         self.fail = fail
 
-    def __call__(self, cfg, to, subject, text, html_body):
+    def __call__(self, cfg, to, subject, text, html_body, timeout=None):
         if self.fail:
             raise RuntimeError("provider is down")
         self.messages.append({"to": to, "subject": subject, "text": text,
@@ -155,6 +156,58 @@ def test_signup_sends_a_verification_email(env, monkeypatch):
     link_msgs = [m for m in fake.messages
                  if "https://nova.omniel.com.ng/verify?token=" in m["text"]]
     assert len(link_msgs) == 1, "exactly one message carries the link"
+
+
+def test_login_on_an_unverified_account_sends_a_usable_code(env, monkeypatch):
+    """The exact trap a real user hit: sign in, be told to verify, get nothing.
+
+    Login used to answer `email_verified: false` without `verification_required`
+    and without sending any mail. The client therefore skipped the verify screen,
+    the account guard refused the profile step with "Verify your email address to
+    continue.", and the only message that arrived was the new-device notice.
+    """
+    fake = configure_email(monkeypatch)
+    from nova_cloud import mailer
+    j = signup(env).get_json()
+    mailer.mailer().flush(timeout=10)
+    fake.messages.clear()
+    _unverify(j["user"]["id"])
+
+    r = env.post("/v1/auth/login", json={
+        "email": "sam@example.com", "password": PASSWORD, **device("b")})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["user"]["email_verified"] is False
+    assert body["verification_required"] is True, \
+        "login must tell the client that verification blocks setup"
+    assert body["email_delivery"]["sent"] is True
+
+    mailer.mailer().flush(timeout=10)
+    codes = [m for m in fake.messages if "verification code" in m["subject"].lower()]
+    assert codes, "signing in to an unverified account sent no verification code"
+    code = re.search(r"code is: (\d{6})", codes[0]["text"]).group(1)
+
+    # The code that arrived in the mail must actually finish the flow.
+    ok = env.post("/v1/auth/email/verify_code", json={"code": code})
+    assert ok.status_code == 200, ok.get_json()
+    me = env.get("/v1/auth/me", headers=auth(body["access_token"])).get_json()
+    assert me["user"]["email_verified"] is True
+
+
+def test_login_on_a_verified_account_sends_no_verification_mail(env, monkeypatch):
+    fake = configure_email(monkeypatch)
+    from nova_cloud import mailer
+    signup(env)
+    mailer.mailer().flush(timeout=10)
+    fake.messages.clear()
+
+    r = env.post("/v1/auth/login", json={
+        "email": "sam@example.com", "password": PASSWORD, **device("b")})
+    assert r.status_code == 200
+    mailer.mailer().flush(timeout=10)
+    assert not [m for m in fake.messages
+                if "verification" in m["subject"].lower()], \
+        "a verified account was sent verification mail"
 
 
 def test_the_verification_link_actually_verifies(env, monkeypatch):
@@ -457,6 +510,34 @@ def test_a_bad_verification_token_explains_itself(env):
     assert r.status_code == 400
     body = r.get_data(as_text=True)
     assert "no longer valid" in body
+
+
+def test_an_expired_verification_token_is_rejected(env, monkeypatch):
+    """A link from last week opens a page that says so, and verifies
+    nothing."""
+    fake = configure_email(monkeypatch)
+    from nova_cloud import mailer
+    j = signup(env).get_json()
+    mailer.mailer().flush(timeout=10)
+    _unverify(j["user"]["id"])
+    token = fake.messages[0]["text"].split("token=")[1].split()[0].strip()
+
+    from nova_cloud.db import session_scope
+    from nova_cloud.models import EmailToken
+    from nova_cloud.security import token_hash
+    with session_scope() as s:
+        row = s.query(EmailToken).filter_by(
+            token_hash=token_hash(token)).one()
+        row.expires_at = __import__("time").time() - 60   # a minute ago
+
+    r = env.get(f"/verify?token={token}")
+    assert r.status_code == 400
+    from nova_cloud.db import session_scope as ss
+    from nova_cloud.models import User
+    with ss() as s:
+        user = s.get(User, j["user"]["id"])
+        assert user.email_verified is False, \
+            "an expired link verified an account"
 
 
 def test_the_verification_page_escapes_its_message(env):

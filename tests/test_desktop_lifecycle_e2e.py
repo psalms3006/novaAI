@@ -91,6 +91,9 @@ class Desktop:
         import nova_lifecycle
         import nova_runtime
         mp.setattr(nova_runtime, "start_brain", self._start_brain)
+        # A restart is a fresh process: nothing is running yet.
+        nova_runtime._state.update({"started": False, "ready": False,
+                                    "error": "", "started_at": 0.0})
         from desk import account_api
         mp.setattr(account_api, "_NO_RELAUNCH", True)
 
@@ -98,10 +101,19 @@ class Desktop:
         first = nova_lifecycle.is_first_run()
         nova_lifecycle.ensure_installation("1.0.0")
         mp.setenv("NOVA_FIRST_RUN", "1" if first else "0")
+        # The launcher arms the gate before it asks it (nova_desktop_app.main).
+        # Without this the harness was not exercising the gate at all: an
+        # unset variable answers "allowed" to every account.
+        mp.setenv("NOVA_AUTH_GATE", "1")
         acct = nova_account.account()
         if acct.signed_in:
             nova_lifecycle.activate_account(acct.user_id)
-            self._start_brain()
+            # Mirror the real launch: the gate decides, sign-in alone does
+            # not start the assistant.
+            allowed, _stage = nova_runtime.assistant_allowed()
+            mp.setenv("NOVA_AUTH_GATE", "0" if allowed else "1")
+            if allowed:
+                self._start_brain()
 
         app = Flask(__name__)
         app.config["TESTING"] = True
@@ -109,7 +121,17 @@ class Desktop:
         self.http = app.test_client()
 
     def _start_brain(self):
+        # Mirror the real guard: a second start is refused, and the state it
+        # leaves is what the lifecycle payload checks before asking again.
+        import nova_runtime
+        if nova_runtime._state.get("started"):
+            return False
+        nova_runtime._state.update({"started": True, "ready": False, "error": "",
+                                    "started_at": 0.0})
         self.brain_starts += 1
+        import traceback
+        self.starts_trace = getattr(self, 'starts_trace', [])
+        self.starts_trace.append(''.join(traceback.format_stack()[-4:-1]))
         return True
 
     def restart(self):
@@ -149,7 +171,11 @@ def test_the_whole_lifecycle(backend, tmp_path, monkeypatch):
     assert pc.brain_starts == 0
 
     pc.sign_up("psalms@example.com")
-    assert pc.brain_starts == 1
+    # Onboarding isolation: signup alone must not wake the assistant --
+    # verification and setup are still ahead of this account.
+    if pc.brain_starts != 0:
+        print("START TRACE:", getattr(pc, "starts_trace", None))
+    assert pc.brain_starts == 0
     assert pc.lifecycle()["next"] == "profile"
 
     pc.profile(preferred_name="Psalms", role="developer", about="I build NOVA.")

@@ -615,6 +615,23 @@ NON_BLOCKING_TOOLS = frozenset({
 })
 
 
+def _setup_gate_closed() -> bool:
+    """True while sign-in, email verification or onboarding is unfinished.
+
+    The HTTP routes refuse to start voice in that state, but a session can
+    also be started by the supervisor after a crash, and proactive notices
+    reach the model through `send_text`. Asking here means every door is
+    covered by one answer. Fails open only when the gate module is absent
+    (terminal/local builds), never when it says "not yet".
+    """
+    try:
+        import nova_runtime
+        allowed, _stage = nova_runtime.assistant_allowed()
+        return not allowed
+    except Exception:
+        return False
+
+
 def _interrupt_preference() -> bool:
     """The user's "interrupt NOVA's speech" preference (on by default)."""
     try:
@@ -1365,6 +1382,9 @@ class LiveManager:
     # ── public API ────────────────────────────────────────────────────────
 
     def start(self) -> dict:
+        if _setup_gate_closed():
+            _log("[LIVE] setup is not finished; voice stays off")
+            return {"ok": False, "reason": "setup_incomplete"}
         with self._state_lock:
             if self._state in (LiveState.CONNECTING, LiveState.CONNECTED, LiveState.STREAMING):
                 return {"ok": True, "message": "already running"}
@@ -1448,6 +1468,10 @@ class LiveManager:
         return {"ok": True, "message": "stopped"}
 
     def send_text(self, text: str) -> dict:
+        if _setup_gate_closed():
+            # Proactive notices and reminders come through here; during setup
+            # they are not wanted and would make NOVA speak unprompted.
+            return {"ok": False, "reason": "setup_incomplete"}
         with self._state_lock:
             if self._state not in (LiveState.CONNECTED, LiveState.STREAMING):
                 return {"ok": False, "reason": "not connected"}
@@ -2991,6 +3015,12 @@ class LiveManager:
         """
         if not speaker_ok:
             _log("[LIVE] no speaker; skipping the greeting")
+            return
+        if _setup_gate_closed():
+            # The gate can close after the session connected (sign-out, an
+            # expired session, verification withdrawn). Greeting behind the
+            # setup screens is exactly what must not happen.
+            _log("[LIVE] setup is not finished; skipping the greeting")
             return
         if not await self._await_surface():
             _log("[LIVE] no interface attached after %.0fs; greeting anyway",

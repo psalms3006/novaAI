@@ -18,6 +18,9 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import os
+import threading
+import time
 from typing import Callable
 
 from flask import Blueprint, Response, current_app, g, jsonify, request, stream_with_context
@@ -55,12 +58,175 @@ genai_client_factory: Callable = _default_genai_client
 forward: Callable = _default_forward
 
 
+# -- concurrency governance ----------------------------------------------------
+#
+# The process can already hold eight requests open at once (2 workers x 4
+# threads), and each of those may keep an upstream call alive for up to five
+# minutes. That ceiling was never chosen -- it is whatever the thread pool
+# happened to allow -- so one client opening many streams can consume all of
+# it, and every caller waits on the same per-key quota. These bounds are
+# explicit, per process, and adjustable without a rebuild.
+#
+# They are deliberately counters behind a lock rather than one semaphore per
+# user: a dict of semaphores would grow with the number of users who have ever
+# been seen. An entry exists only while that user has a call in flight.
+
+class _Saturated(Exception):
+    """This process (or this account) is already at its concurrency ceiling."""
+
+    status = 429
+
+    def __init__(self, scope: str = "user"):
+        super().__init__(
+            "Too many requests at once for this account; retry shortly."
+            if scope == "user" else
+            "NOVA is handling as many requests as it can right now; retry shortly.")
+        self.retry_after = 1
+
+
+class _ProviderOpen(Exception):
+    """The upstream is failing; calls are refused instead of queued."""
+
+    status = 503
+
+    def __init__(self, retry_after: int = 5):
+        super().__init__("NOVA's model service is briefly unavailable; retry shortly.")
+        self.retry_after = max(1, retry_after)
+
+
+_GOV_LOCK = threading.Lock()
+_GOV = {"active": 0, "rejected": 0, "failures": 0, "open_until": 0.0,
+        "probing": False}
+_USER_ACTIVE: dict[str, int] = {}
+
+
+def _limit(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, "").strip() or default))
+    except ValueError:
+        return default
+
+
+def _global_limit() -> int:
+    return _limit("NOVA_GATEWAY_GLOBAL_CONCURRENCY", 32)
+
+
+def _user_limit() -> int:
+    return _limit("NOVA_GATEWAY_USER_CONCURRENCY", 4)
+
+
+def _breaker_threshold() -> int:
+    return _limit("NOVA_GATEWAY_BREAKER_THRESHOLD", 5)
+
+
+def _breaker_cooldown() -> int:
+    return _limit("NOVA_GATEWAY_BREAKER_COOLDOWN", 30)
+
+
+def activate(user_id: str) -> Callable[[], None]:
+    """Take one concurrency slot, or raise telling the caller to retry.
+
+    Returns an idempotent release callable. It has to be idempotent because a
+    streamed response releases it twice: once when the relay generator ends and
+    once from `call_on_close`, which also runs when the client disconnects
+    before reading a single byte.
+    """
+    now = time.time()
+    with _GOV_LOCK:
+        open_until = _GOV["open_until"]
+        if open_until:
+            if now < open_until:
+                raise _ProviderOpen(retry_after=int(open_until - now) + 1)
+            # Half-open: exactly one probe may go through. A single failure
+            # re-opens the breaker; a success closes it.
+            if _GOV["probing"]:
+                raise _ProviderOpen(retry_after=1)
+            _GOV["probing"] = True
+            _GOV["open_until"] = 0.0
+            _GOV["failures"] = _breaker_threshold() - 1
+        if _GOV["active"] >= _global_limit():
+            _GOV["rejected"] += 1
+            raise _Saturated("global")
+        if _USER_ACTIVE.get(user_id, 0) >= _user_limit():
+            _GOV["rejected"] += 1
+            raise _Saturated("user")
+        _GOV["active"] += 1
+        _USER_ACTIVE[user_id] = _USER_ACTIVE.get(user_id, 0) + 1
+
+    done = threading.Event()
+
+    def release() -> None:
+        if done.is_set():
+            return
+        done.set()
+        with _GOV_LOCK:
+            _GOV["active"] = max(0, _GOV["active"] - 1)
+            n = _USER_ACTIVE.get(user_id, 1) - 1
+            if n <= 0:
+                _USER_ACTIVE.pop(user_id, None)    # idle users are forgotten
+            else:
+                _USER_ACTIVE[user_id] = n
+
+    return release
+
+
+def _note_success() -> None:
+    with _GOV_LOCK:
+        _GOV["failures"] = 0
+        _GOV["open_until"] = 0.0
+        _GOV["probing"] = False
+
+
+def _note_failure() -> None:
+    """Count one upstream failure, opening the breaker at the threshold.
+
+    Google answering 429 counts: it means the shared per-key quota is already
+    spent, and continuing to ask makes every caller slower.
+    """
+    with _GOV_LOCK:
+        _GOV["probing"] = False
+        _GOV["failures"] += 1
+        if _GOV["failures"] >= _breaker_threshold():
+            _GOV["open_until"] = time.time() + _breaker_cooldown()
+            _GOV["failures"] = 0
+
+
+def metrics_snapshot() -> dict:
+    """Gateway numbers for /metrics. No user identifiers, ever."""
+    now = time.time()
+    with _GOV_LOCK:
+        open_until = _GOV["open_until"]
+        return {
+            "active": _GOV["active"],
+            "active_users": len(_USER_ACTIVE),
+            "rejected_total": _GOV["rejected"],
+            "consecutive_failures": _GOV["failures"],
+            "breaker_open": bool(open_until and now < open_until),
+            "breaker_retry_in_s": max(0, int(open_until - now)) if open_until else 0,
+            "limits": {"global": _global_limit(), "per_user": _user_limit()},
+        }
+
+
+def reset_governor() -> None:
+    """Test hook: forget all counters, as a fresh process would."""
+    with _GOV_LOCK:
+        _GOV.update(active=0, rejected=0, failures=0, open_until=0.0, probing=False)
+        _USER_ACTIVE.clear()
+
+
 # -- quota ---------------------------------------------------------------------
 
 def _google_error(status: int, message: str, reason: str):
     """Errors in Google's own shape, so google-genai raises a readable
     ClientError in the desktop instead of a parse failure."""
     return jsonify({"error": {"code": status, "message": message, "status": reason}}), status
+
+
+def _throttled(exc: Exception, reason: str):
+    """A refusal with the standard shape plus a Retry-After the client honours."""
+    resp, status = _google_error(exc.status, str(exc), reason)
+    resp.headers["Retry-After"] = str(exc.retry_after)
+    return resp, status
 
 
 def _charge(kind: str):
@@ -112,6 +278,13 @@ def live_token():
     now = _dt.datetime.now(tz=_dt.timezone.utc)
     expires = now + _dt.timedelta(minutes=minutes)
     try:
+        release = activate(g.user_id)
+    except (_Saturated, _ProviderOpen) as e:
+        resp = jsonify({"ok": False, "error": "busy", "message": str(e)})
+        resp.status_code = e.status
+        resp.headers["Retry-After"] = str(e.retry_after)
+        return resp
+    try:
         client = genai_client_factory(cfg.gemini_api_key)
         token = client.auth_tokens.create(config={
             # Enough uses for NOVA's session resumption and reconnects inside
@@ -126,9 +299,13 @@ def live_token():
             "lock_additional_fields": [],
         })
     except Exception as e:
+        _note_failure()
         log.error("live token mint failed: %s: %s", type(e).__name__, e)
         return jsonify({"ok": False, "error": "model_unavailable",
                         "message": "Could not start a voice session right now."}), 502
+    finally:
+        release()
+    _note_success()
     return jsonify({"ok": True, "token": token.name, "model": cfg.live_model,
                     "expires_at": expires.isoformat(), "expires_in": minutes * 60,
                     "api_version": "v1alpha"})
@@ -183,10 +360,24 @@ def gateway(path: str):
     headers = {"Content-Type": "application/json", "x-goog-api-key": cfg.gemini_api_key}
     streaming = method == "streamGenerateContent"
     try:
+        release = activate(g.user_id)
+    except _Saturated as e:
+        return _throttled(e, "RESOURCE_EXHAUSTED")
+    except _ProviderOpen as e:
+        return _throttled(e, "UNAVAILABLE")
+
+    try:
         upstream = forward("POST", url, headers, request.get_data(), streaming)
     except Exception as e:
+        release()
+        _note_failure()
         log.error("gateway upstream error: %s", type(e).__name__)
         return _google_error(502, "The model service could not be reached.", "UNAVAILABLE")
+
+    if upstream.status_code >= 500 or upstream.status_code == 429:
+        _note_failure()
+    else:
+        _note_success()
 
     ctype = upstream.headers.get("Content-Type", "application/json")
     if streaming:
@@ -197,9 +388,16 @@ def gateway(path: str):
                         yield chunk
             finally:
                 upstream.close()
-        return Response(stream_with_context(relay()), status=upstream.status_code,
+                release()
+        resp = Response(stream_with_context(relay()), status=upstream.status_code,
                         content_type=ctype)
+        # A client that disconnects before reading a byte never runs relay().
+        # call_on_close releases the slot there; release() is idempotent, so
+        # the normal path releasing it twice is harmless.
+        resp.call_on_close(release)
+        return resp
 
+    release()
     body = upstream.content
     if upstream.status_code == 200 and kind == "generate":
         try:
@@ -209,4 +407,5 @@ def gateway(path: str):
     return Response(body, status=upstream.status_code, content_type=ctype)
 
 
-__all__ = ["bp", "FORWARDABLE_METHODS", "GATEWAY_MAX_BYTES"]
+__all__ = ["bp", "FORWARDABLE_METHODS", "GATEWAY_MAX_BYTES", "metrics_snapshot",
+           "reset_governor"]

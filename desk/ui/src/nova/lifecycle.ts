@@ -65,8 +65,6 @@ export const cancelOfflineDownload = () => accountCall<{ ok: boolean; state: Off
 export const startGoogleAuth = () =>
   getJSON<{ auth_url: string; state: string }>('/api/account/google/start', 10000);
 
-export const cancelOfflineDownload = () => accountCall<{ ok: boolean; state: OfflineState }>('/api/offline-model/cancel', 'POST');
-
 export const verifyEmailCode = (code: string) =>
   accountCall<{ ok: boolean; message?: string }>('/api/account/email/verify_code', 'POST', { code });
 

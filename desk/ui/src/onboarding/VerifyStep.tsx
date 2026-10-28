@@ -7,8 +7,12 @@ export const VerifyStep: React.FC<{ onDone: (st: { restarting?: boolean }) => vo
   const { theme } = useNova();
   const [acct, setAcct] = useState<AccountState | null>(null);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // `ok` distinguishes "sent" from "could not send": both are shown in the
+  // same place, but only one may be green.
+  const [note, setNote] = useState<{ text: string; ok: boolean } | null>(null);
   const [code, setCode] = useState('');
+
+  const say = (text: string) => setNote({ text, ok: false });
 
   useEffect(() => {
     accountCall<AccountState>('/api/account').then(setAcct).catch(() => undefined);
@@ -16,13 +20,13 @@ export const VerifyStep: React.FC<{ onDone: (st: { restarting?: boolean }) => vo
 
   const checkStatus = async () => {
     setBusy(true);
-    setError(null);
+    setNote(null);
     try {
       const st = await accountCall<AccountState>('/api/account/refresh', 'POST');
       if (!st.email_verified) throw new Error("Email not verified yet. Please check your inbox.");
       onDone({});
     } catch (e) {
-      setError((e as Error).message);
+      say((e as Error).message);
     } finally {
       setBusy(false);
     }
@@ -30,20 +34,20 @@ export const VerifyStep: React.FC<{ onDone: (st: { restarting?: boolean }) => vo
 
   const verifyWithCode = async () => {
     if (!code.trim() || code.length !== 6 || !/^\d{6}$/.test(code)) {
-      setError("Please enter a valid 6-digit code.");
+      say("Please enter a valid 6-digit code.");
       return;
     }
     setBusy(true);
-    setError(null);
+    setNote(null);
     try {
       const st = await accountCall<AccountState & { message?: string }>('/api/account/email/verify_code', 'POST', { code: code.trim() });
       if (st.email_verified) {
         onDone({});
       } else {
-        setError(st.message || "Verification failed.");
+        say(st.message || "Verification failed.");
       }
     } catch (e) {
-      setError((e as Error).message);
+      say((e as Error).message);
     } finally {
       setBusy(false);
     }
@@ -51,21 +55,36 @@ export const VerifyStep: React.FC<{ onDone: (st: { restarting?: boolean }) => vo
 
   const resend = async () => {
     setBusy(true);
-    setError(null);
+    setNote(null);
     try {
-      await accountCall('/api/account/verify/resend', 'POST');
-      setError("Verification link and code sent! Please check your email.");
+      const j = await accountCall<{ email_delivery?: { sent?: boolean }; message?: string }>('/api/account/verify/resend', 'POST');
+      if (j.email_delivery?.sent) {
+        setNote({ text: 'Sent. Check your inbox (and spam) for the link and the 6-digit code.', ok: true });
+      } else {
+        // The provider refused, or there is no provider configured. Saying
+        // "sent" here is the exact lie this flow exists to prevent.
+        say(j.message || 'NOVA could not send the email. Try again later, or enter a code if one arrived.');
+      }
     } catch (e) {
-      setError((e as Error).message);
+      say((e as Error).message);
     } finally {
       setBusy(false);
     }
   };
 
+  // Only claim an email went out when the server could confirm it did.
+  const delivered = acct?.email_delivery?.sent;
+  const address = acct?.user?.email || 'your email';
+  const subtitle = delivered === true
+    ? `We've sent a confirmation link and a 6-digit code to ${address}. Use either to continue.`
+    : delivered === false
+      ? `We could not confirm that an email reached ${address}. Try "Resend" below, or enter a 6-digit code if one arrived.`
+      : `Verify ${address} to continue.`;
+
   return (
-    <OnboardingLayout 
-      title="Verify your email" 
-      subtitle={`We've sent a confirmation link and a 6-digit code to ${acct?.user?.email || 'your email'}. Use either to continue.`}
+    <OnboardingLayout
+      title="Verify your email"
+      subtitle={subtitle}
     >
       <div className="flex flex-col items-center space-y-6 pt-2">
         <div 
@@ -75,9 +94,9 @@ export const VerifyStep: React.FC<{ onDone: (st: { restarting?: boolean }) => vo
           <i className="fa-solid fa-envelope-open-text text-2xl" style={{ color: theme.palette.accent }} />
         </div>
 
-        {error && (
-          <p className={`text-xs text-center px-4 ${error.includes('sent') ? 'text-green-500' : 'text-red-500'}`}>
-            {error}
+        {note && (
+          <p className={`text-xs text-center px-4 ${note.ok ? 'text-green-500' : 'text-red-500'}`}>
+            {note.text}
           </p>
         )}
 

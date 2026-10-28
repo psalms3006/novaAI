@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { OnboardingLayout, OnboardingButton, OnboardingInput } from './OnboardingLayout';
 import { accountCall, type AccountState } from '../nova/account';
 import { startGoogleAuth, type Lifecycle } from '../nova/lifecycle';
@@ -39,30 +39,55 @@ export const AccountStep: React.FC<{ lc: Lifecycle; onDone: (st: { restarting?: 
     }
   };
 
+  // Google sign-in finishes in this window's own loopback route; the popup
+  // only carries the browser. Polling tells us how it ended -- success is a
+  // signed-in account, failure is the reason the route recorded.
+  const pollToken = useRef({ stop: false });
+  useEffect(() => () => { pollToken.current.stop = true; }, []);
+
   const handleGoogleSignIn = async () => {
     setBusy(true);
     setError(null);
+    let authWindow: Window | null = null;
     try {
       const { auth_url } = await startGoogleAuth();
-      const authWindow = window.open(auth_url, 'google_auth', 'width=500,height=600');
+      authWindow = window.open(auth_url, 'google_auth', 'width=500,height=600');
       if (!authWindow) throw new Error('Popup blocked. Please allow popups.');
-
-      const checkAuth = setInterval(async () => {
-        try {
-          const acct = await accountCall<AccountState>('/api/account');
-          if (acct.signed_in) {
-            clearInterval(checkAuth);
-            authWindow.close();
-            onDone({ restarting: false });
-          }
-        } catch { /* ignore */ }
-      }, 1000);
-      setTimeout(() => clearInterval(checkAuth), 5 * 60 * 1000);
     } catch (e) {
       setError((e as Error).message);
-    } finally {
       setBusy(false);
+      return;
     }
+
+    const token = { stop: false };
+    pollToken.current = token;
+    const deadline = Date.now() + 5 * 60 * 1000;
+    while (!token.stop && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1000));
+      if (token.stop) break;
+      try {
+        const st = await accountCall<{ ok: boolean; pending: boolean; error: { message: string } | null }>('/api/account/google/status');
+        if (st.error) {
+          authWindow?.close();
+          setError(st.error.message);
+          setBusy(false);
+          return;
+        }
+      } catch { /* older backend without the status route: signed-in is enough */ }
+      try {
+        const acct = await accountCall<AccountState>('/api/account');
+        if (acct.signed_in) {
+          authWindow?.close();
+          setBusy(false);
+          onDone({ restarting: false });
+          return;
+        }
+      } catch { /* keep waiting */ }
+    }
+    if (token.stop) return;
+    authWindow?.close();
+    setError('Google sign-in did not finish. Please try again.');
+    setBusy(false);
   };
 
   return (

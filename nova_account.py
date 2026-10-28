@@ -95,6 +95,27 @@ def forget_device_identity(email: str) -> None:
         store.set_json(_K_DEVICES, table)
 
 
+def adopt_device_identity(email: str) -> None:
+    """Attach the pre-sign-in device identity to the account it became.
+
+    Google sign-in cannot know the account's email until the provider
+    answers, so the identity used for that call is created under the
+    anonymous key. Moving it here means the next password sign-in on this
+    machine reuses the same device row instead of registering a second,
+    permanently orphaned one.
+    """
+    key = _account_key(email)
+    if not key:
+        return
+    table = store.get_json(_K_DEVICES) or {}
+    if table.get(key):
+        return                        # this account already has its own row
+    entry = table.pop("", None)
+    if isinstance(entry, dict) and entry.get("device_id") and entry.get("secret"):
+        table[key] = entry
+        store.set_json(_K_DEVICES, table)
+
+
 def device_descriptor(email: str = "") -> dict:
     """What this device tells the backend about itself."""
     ident = device_identity(email)
@@ -368,6 +389,30 @@ class NovaAccount:
         if not tok:
             raise Offline()
         return self._request("POST", "/v1/auth/email/resend", token=tok)
+
+    def verify_code(self, code: str) -> dict:
+        """Redeem the 6-digit code from the verification email.
+
+        The code itself is the proof, so the backend does not require a
+        session -- but we send the access token when we have one so the
+        verification is attributed to this device.
+        """
+        code = str(code or "").strip()
+        if not code:
+            raise AccountError("Enter the 6-digit code from the email.",
+                               "missing_code")
+        tok = self.ensure_access_token()
+        if not tok:
+            raise Offline()
+        j = self._request("POST", "/v1/auth/email/verify_code",
+                          body={"code": code}, token=tok)
+        # The account is verified server-side now; pull the fresh copy so the
+        # setup gate opens. A refresh failure must not undo the success.
+        try:
+            self.refresh_identity()
+        except (Offline, AccountError):
+            pass
+        return j
 
     def refresh_identity(self) -> dict:
         """Re-read the account from the backend.
@@ -680,7 +725,7 @@ def account() -> NovaAccount:
 
 __all__ = ["NovaAccount", "AccountError", "Offline", "account",
            "device_identity", "device_descriptor", "installation_identity",
-           "forget_device_identity", "APP_VERSION",
+           "forget_device_identity", "adopt_device_identity", "APP_VERSION",
            "emit", "emit_model_call", "emit_agent_run", "emit_error", "shutdown"]
 
 
