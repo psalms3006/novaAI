@@ -95,14 +95,18 @@ def _silero_vad():
 
 _buildinfo = _build_stamp()
 
-# Auto-detect Python shared library (portable across machines)
-_python_dll = os.path.join(os.path.dirname(sys.executable), "python311.dll")
+# Auto-detect Python shared library (portable across machines).
+# The name follows the interpreter doing the build: it used to be hardcoded
+# to python311.dll, so a 3.13 build warned that the bundle was broken while
+# shipping python313.dll correctly.
+_python_dll_name = f"python{sys.version_info.major}{sys.version_info.minor}.dll"
+_python_dll = os.path.join(os.path.dirname(sys.executable), _python_dll_name)
 if not os.path.exists(_python_dll):
     # Try common Python installations
     for candidate in [
-        os.path.join(os.path.dirname(sys.executable), "python311.dll"),
-        os.path.join(sys.base_prefix, "python311.dll"),
-        os.path.join(sys.prefix, "python311.dll"),
+        _python_dll,
+        os.path.join(sys.base_prefix, _python_dll_name),
+        os.path.join(sys.prefix, _python_dll_name),
     ]:
         if os.path.exists(candidate):
             _python_dll = candidate
@@ -111,7 +115,7 @@ _binaries = []
 if os.path.exists(_python_dll):
     _binaries = [(_python_dll, '.')]
 else:
-    print("WARNING: python311.dll not found; build may fail on target machines")
+    print(f"WARNING: {_python_dll_name} not found; build may fail on target machines")
 
 hidden = [
     # web stack
